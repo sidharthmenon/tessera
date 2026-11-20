@@ -3,7 +3,7 @@
 import { ask, open, save } from '@tauri-apps/plugin-dialog';
 import * as api from './api';
 import type { CueRef, EngineInfo, Live } from './api';
-import { copyScene, cueAt, findLayer, firstEmptySlot, newCue, newLayer, sameRef, withLayer, withScreen } from './logic';
+import { copyScene, cueAt, findLayer, firstEmptySlot, losesPicture, newCue, newLayer, sameRef, withLayer, withScreen } from './logic';
 import type { Cue } from '$lib/bindings/Cue';
 import type { FromEngine } from '$lib/bindings/FromEngine';
 import type { Layer } from '$lib/bindings/Layer';
@@ -228,12 +228,19 @@ export const addToPvw = action(async (source: Source, name: string, screen?: Scr
   ui.selected = { screenId: screen.id, layerId: layer.id };
 });
 
-/** Change (or with null, remove) a layer of the cue on the canvas bus. */
+/** Change (or with null, remove) a layer of the cue on the canvas bus. Removing or hiding picture
+ *  on the cue that is on air (PGM tab, or PVW while LIVE) asks first: it changes Program at once. */
 export const editLayer = action(async (sel: LayerRef, f: (l: Layer) => Layer | null) => {
   const ref = ui.editRef;
   const cue = ui.editCue;
   const next = cue && withLayer(cue, sel.screenId, sel.layerId, f);
-  if (ref && next && next !== cue) await setCue(ref, next);
+  if (!ref || !cue || !next || next === cue) return;
+  if (sameRef(ref, ui.live.lastTaken) && losesPicture(cue, next)) {
+    const name = findLayer(cue.layersByScreen, sel.screenId, sel.layerId)?.name || 'this layer';
+    const yes = await confirmAsk(`Cue ${cue.slot + 1} “${cue.name}” is on air. This takes “${name}” off Program now.`, 'Change Program');
+    if (!yes) return;
+  }
+  await setCue(ref, next);
 });
 
 export const editCue = action(async (ref: CueRef, f: (c: Cue) => Cue) => {

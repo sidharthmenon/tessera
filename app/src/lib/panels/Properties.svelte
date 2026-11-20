@@ -21,25 +21,29 @@
     return Number.isFinite(n) ? n : null;
   };
 
-  function set(patch: Partial<Layer>) {
-    if (ui.selected) editLayer(ui.selected, (l) => ({ ...l, ...patch }));
+  async function set(patch: Partial<Layer>) {
+    if (ui.selected) await editLayer(ui.selected, (l) => ({ ...l, ...patch }));
   }
-  function setNum(e: Event, f: (v: number) => Partial<Layer>) {
+  /** Commit a number; afterwards the control shows the layer's actual value again (an on-air
+   *  confirm may have been declined). */
+  async function setNum(e: Event, f: (v: number) => Partial<Layer>, current: () => number) {
+    const el = e.currentTarget as HTMLInputElement;
     const v = num(e);
-    if (v !== null) set(f(v));
+    if (v !== null) await set(f(v));
+    el.value = String(current());
   }
 </script>
 
 {#snippet slider(label: string, value: number, min: number, max: number, f: (v: number) => Partial<Layer>)}
   <label class="row">
     <span>{label}</span>
-    <input type="range" {min} {max} step="0.01" {value} onchange={(e) => setNum(e, f)} />
+    <input type="range" {min} {max} step="0.01" {value} onchange={(e) => setNum(e, f, () => value)} />
     <span class="val">{value.toFixed(2)}</span>
   </label>
 {/snippet}
 
 {#snippet field(label: string, value: number, f: (v: number) => Partial<Layer>)}
-  <label class="cell"><span>{label}</span><input type="number" {value} onchange={(e) => setNum(e, f)} /></label>
+  <label class="cell"><span>{label}</span><input type="number" {value} onchange={(e) => setNum(e, f, () => value)} /></label>
 {/snippet}
 
 <section class="panel props">
@@ -133,7 +137,16 @@
             </select>
           </label>
         {/if}
-        <label class="row"><span>Visible</span><input type="checkbox" checked={layer.visible} onchange={(e) => set({ visible: e.currentTarget.checked })} /></label>
+        <label class="row"><span>Visible</span><input
+            type="checkbox"
+            checked={layer.visible}
+            onchange={async (e) => {
+              const el = e.currentTarget;
+              await set({ visible: el.checked });
+              el.checked = ui.layer?.visible ?? el.checked; // a declined on-air confirm leaves it as it was
+            }}
+          /></label
+        >
       {/if}
     {:else}
       <p class="muted">{ui.canvasTab === 'pvw' ? 'Load a cue into Preview (click a cue), or drag media onto the canvas.' : 'No taken cue to edit.'}</p>

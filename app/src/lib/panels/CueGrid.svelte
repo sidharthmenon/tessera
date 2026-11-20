@@ -35,6 +35,21 @@
     fire(ref(slot));
   }
 
+  /** Runs `run` at once, unless `cue` is the one on air: then only after the operator agrees. */
+  async function onAir(cue: Cue, message: string, okLabel: string, run: () => void) {
+    if (!sameRef(ui.live.lastTaken, ref(cue.slot)) || (await confirmAsk(`Cue ${cue.slot + 1} “${cue.name}” is on air. ${message}`, okLabel))) run();
+  }
+  const deleteCue = (cue: Cue) =>
+    onAir(cue, 'Deleting removes it from the show, not from air: Program keeps showing it until the next GO. (Undo brings it back.)', 'Delete', () =>
+      op({ op: 'DeleteCue', groupId: group?.id ?? '', slot: cue.slot }),
+    );
+  const clearScreen = (cue: Cue, s: { id: string; name: string }) =>
+    onAir(cue, `${s.name} goes black on Program now.`, 'Clear on air', () => editCue(ref(cue.slot), (c) => withScreen(c, s.id, [])));
+  const leaveScreen = (cue: Cue, s: { id: string; name: string }) =>
+    onAir(cue, `Program keeps ${s.name} as it is now; from the next GO this cue leaves ${s.name} untouched.`, 'Leave untouched', () =>
+      editCue(ref(cue.slot), (c) => withScreen(c, s.id, null)),
+    );
+
   async function renameCue(cue: Cue) {
     const name = await promptText(`Rename cue ${cue.slot + 1}`, cue.name);
     if (name) editCue(ref(cue.slot), (c) => ({ ...c, name }));
@@ -113,14 +128,15 @@
 {#if menu}
   {@const cue = menu.cue}
   <div class="menu" class:up={menu.y > innerHeight / 2} class:left={menu.x > innerWidth - 240} style:left="{menu.x}px" style:top="{menu.y}px">
+    {#if sameRef(ui.live.lastTaken, ref(cue.slot))}<div class="air"><span class="badge live">ON AIR</span> cue {cue.slot + 1} is on Program</div>{/if}
     <button onclick={() => renameCue(cue)}>Rename…</button>
     <button onclick={() => group && op({ op: 'DuplicateCue', groupId: group.id, from: cue.slot, to: firstEmptySlot(group, cue.slot) })}>Duplicate</button>
-    <button onclick={() => op({ op: 'DeleteCue', groupId: group?.id ?? '', slot: cue.slot })}>Delete</button>
+    <button onclick={() => deleteCue(cue)}>Delete</button>
     {#each ui.show?.screens ?? [] as s (s.id)}
       <hr />
-      <button onclick={() => editCue(ref(cue.slot), (c) => withScreen(c, s.id, []))}>Clear {s.name} (black)</button>
+      <button onclick={() => clearScreen(cue, s)}>Clear {s.name} (black)</button>
       {#if s.id in cue.layersByScreen}
-        <button onclick={() => editCue(ref(cue.slot), (c) => withScreen(c, s.id, null))}>Leave {s.name} untouched</button>
+        <button onclick={() => leaveScreen(cue, s)}>Leave {s.name} untouched</button>
       {/if}
     {/each}
   </div>
@@ -231,6 +247,12 @@
   }
   .menu.left {
     translate: -100% 0;
+  }
+  .air {
+    padding: 3px 8px 5px;
+    color: #ffb4ae;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 3px;
   }
   .menu button {
     background: none;

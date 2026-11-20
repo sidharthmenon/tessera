@@ -56,6 +56,21 @@ eq(L.withScreen(c, 'b', null).layersByScreen, {}, 'released screen');
 eq(L.withLayer(c, 'a', layer.id, () => null) === c && L.withLayer(c, 'b', 'other', () => null) === c, true, 'foreign layer: cue unchanged');
 eq(L.findLayer(c.layersByScreen, 'b', layer.id)?.id === layer.id && !L.findLayer(c.layersByScreen, 'a', layer.id), true, 'findLayer');
 eq(Object.keys(L.withScreen(c, 'a', []).layersByScreen).sort(), ['a', 'b'], 'cleared screen is defined');
+// Review fix: which edits take picture off the on-air cue (and so ask first).
+{
+  const hit = (f: (c: Cue) => Cue) => L.losesPicture(c, f(c));
+  const lay = (patch: object) => (x: Cue) => L.withLayer(x, 'b', layer.id, (l) => ({ ...l, ...patch }));
+  eq(
+    [hit((x) => L.withLayer(x, 'b', layer.id, () => null)), hit(lay({ visible: false })), hit(lay({ opacity: 0 })), hit((x) => L.withScreen(x, 'b', [])), hit((x) => L.withScreen(x, 'a', []))],
+    [true, true, true, true, true], 'remove, hide, opacity 0, clear, black a new screen',
+  );
+  const hidden = lay({ visible: false })(c);
+  eq(
+    [hit((x) => L.withScreen(x, 'b', null)), hit(lay({ rect: { x: 5, y: 5, w: 10, h: 10 } })), hit(lay({ opacity: 0.5, name: 'x' })), hit((x) => ({ ...x, name: 'renamed' })),
+      hit((x) => L.withScreen(x, 'b', [...x.layersByScreen.b, L.newLayer({ type: 'Pattern', pattern: { type: 'Grid' } }, b, 'Grid')])), L.losesPicture(hidden, c), L.losesPicture(hidden, L.withLayer(hidden, 'b', layer.id, () => null))],
+    [false, false, false, false, false, false, false], 'leave screen, move, dim, rename, add, unhide, remove an already hidden layer',
+  );
+}
 eq(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(L.uuid()), true, 'uuid v4');
 
 // Hotkeys, and when they're off.

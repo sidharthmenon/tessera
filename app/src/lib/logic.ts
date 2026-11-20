@@ -115,6 +115,18 @@ export function mediaOf(show: Show | null, layer: Layer | undefined): MediaItem 
   return src?.type === 'Media' ? show?.media.find((m) => m.id === src.mediaId) : undefined;
 }
 
+/** Whether `after` shows less than `before`: a layer that was showing is removed, hidden or at
+ *  opacity 0, or a screen the cue didn't define becomes explicit black. On the cue that is on air
+ *  such an edit changes Program at once (SetProgram), so the UI asks first. A screen dropped from
+ *  the cue (`withScreen(…, null)`) loses nothing: Program keeps what it shows there. */
+export function losesPicture(before: Cue, after: Cue): boolean {
+  const shown = (c: Cue, s: string) => (c.layersByScreen[s] ?? []).filter((l) => l.visible && l.opacity > 0).map((l) => l.id);
+  return Object.entries(after.layersByScreen).some(([s, layers]) => {
+    const now = new Set(shown(after, s));
+    return shown(before, s).some((id) => !now.has(id)) || (!layers.length && !(s in before.layersByScreen));
+  });
+}
+
 /** `http://127.0.0.1:<port><path>?token=…`, or null while the engine is disconnected. */
 export function engineUrl(e: EngineInfo | null, path: string): string | null {
   return e ? `http://127.0.0.1:${e.port}${path}?token=${encodeURIComponent(e.token)}` : null;
