@@ -1,3 +1,5 @@
+use std::sync::mpsc;
+
 use anyhow::Context;
 use wgpu::util::DeviceExt;
 
@@ -86,28 +88,69 @@ fn extent(width: u32, height: u32) -> wgpu::Extent3d {
     wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 }
 }
 
-/// Blocking readback of a 4-byte-per-pixel texture (needs `COPY_SRC`), rows tightly packed.
-pub fn read_rgba(gpu: &Gpu, texture: &wgpu::Texture) -> Vec<u8> {
-    let row = texture.width() * 4;
-    let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-    let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: (padded * texture.height()) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut enc = gpu.device.create_command_encoder(&Default::default());
-    enc.copy_texture_to_buffer(
-        texture.as_image_copy(),
-        wgpu::TexelCopyBufferInfo {
-            buffer: &buffer,
-            layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: None },
-        },
-        texture.size(),
-    );
-    gpu.queue.submit([enc.finish()]);
-    buffer.map_async(wgpu::MapMode::Read, .., |r| r.expect("map readback buffer"));
-    gpu.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll");
-    let mapped = buffer.get_mapped_range(..).expect("readback buffer mapped");
-    mapped.chunks(padded as usize).flat_map(|r| &r[..row as usize]).copied().collect()
+/// Copies a 4-byte-per-pixel texture (needs `COPY_SRC`) into a mappable buffer without waiting
+/// for the GPU: `start` it, keep polling the device (`PollType::Poll`), `try_take` the pixels.
+pub struct Readback {
+    buffer: wgpu::Buffer,
+    size: (u32, u32),
+    padded: u32,
+    mapped: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
+impl Readback {
+    pub fn start(gpu: &Gpu, texture: &wgpu::Texture) -> Readback {
+        let padded = (texture.width() * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        // ponytail: a new buffer per readback (≤ 2 MB at 15 fps per watched preview); keep a spare if it shows up in a profile.
+        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: (padded * texture.height()) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: None },
+            },
+            texture.size(),
+        );
+        gpu.queue.submit([enc.finish()]);
+        let (tx, mapped) = mpsc::channel();
+        buffer.map_async(wgpu::MapMode::Read, .., move |r| _ = tx.send(r));
+        Readback { buffer, size: (texture.width(), texture.height()), padded, mapped }
+    }
+
+    /// Width and height in pixels.
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// The pixels (rows tightly packed) once the GPU has copied them; `None` while it hasn't.
+    pub fn try_take(&mut self) -> Option<anyhow::Result<Vec<u8>>> {
+        let mapped = match self.mapped.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!("readback already taken or dropped")),
+            Ok(r) => r.context("map readback buffer"),
+        };
+        Some(mapped.and_then(|()| {
+            let row = self.size.0 as usize * 4;
+            let data = self.buffer.get_mapped_range(..).context("readback buffer not mapped")?;
+            let mut pixels = Vec::with_capacity(row * self.size.1 as usize);
+            for line in data.chunks(self.padded as usize) {
+                pixels.extend_from_slice(&line[..row]); // a memcpy per row, even in debug builds
+            }
+            drop(data);
+            self.buffer.unmap();
+            Ok(pixels)
+        }))
+    }
+}
+
+/// Blocking readback (tests, diagnostics): `Readback` plus a wait for the GPU.
+pub fn read_rgba(gpu: &Gpu, texture: &wgpu::Texture) -> anyhow::Result<Vec<u8>> {
+    let mut readback = Readback::start(gpu, texture);
+    gpu.device.poll(wgpu::PollType::wait_indefinitely()).context("GPU poll")?;
+    readback.try_take().context("readback not done after waiting for the GPU")?
 }

@@ -1,6 +1,6 @@
 //! PVW/PGM buses over a refcounted player pool, Take with transitions.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,6 +35,8 @@ pub trait Media {
     fn take_error(&mut self) -> Option<String>;
     fn take_dropped(&mut self) -> u64;
     fn audio(&self) -> Option<AudioTap>;
+    /// Playback position; `None` for media without a timeline (stills).
+    fn position_ms(&self, now: Instant) -> Option<u64>;
 }
 
 /// Opens a layer's media. The `Err` message names the path (or the unknown media id).
@@ -300,6 +302,13 @@ impl<O: Opener> Buses<O> {
         std::mem::take(&mut self.events)
     }
 
+    /// Position (ms) of every PVW and PGM media layer that has a player, by layer id; PGM's wins
+    /// where both buses use one layer id.
+    pub fn positions(&self, now: Instant) -> BTreeMap<Uuid, u64> {
+        let players = [&self.pvw, &self.pgm].into_iter().flat_map(|bus| &bus.players);
+        players.filter_map(|(id, h)| Some((*id, lock(h).media.position_ms(now)?))).collect()
+    }
+
     /// Frames skipped or repeated since the last call.
     pub fn take_dropped(&mut self) -> u64 {
         std::mem::take(&mut self.dropped)
@@ -470,6 +479,13 @@ impl Media for FileMedia {
             FileMedia::Image(_) => None,
         }
     }
+
+    fn position_ms(&self, now: Instant) -> Option<u64> {
+        match self {
+            FileMedia::Video { player, .. } => Some(player.position_ms(now)),
+            FileMedia::Image(_) => None,
+        }
+    }
 }
 
 /// Opens config media: videos as `Player`s (audio resampled to the mixer's format), images as
@@ -505,7 +521,7 @@ impl Opener for FileOpener {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::Weak;
 
     use tessera_show::{Pattern, Rect, TransitionKind};
@@ -550,6 +566,9 @@ mod tests {
         }
         fn audio(&self) -> Option<AudioTap> {
             Some(self.tap.clone())
+        }
+        fn position_ms(&self, _: Instant) -> Option<u64> {
+            Some(self.playing as u64) // 1: playing, 0: paused
         }
     }
 
@@ -967,5 +986,17 @@ mod tests {
         b.set_preview(Scene::from([(a, vec![pvw_only.clone()])]));
         b.gains(t0 + ms(1000));
         assert_eq!(gain(&b, &pvw(&b, &pvw_only)), [0.], "PVW is silent");
+    }
+
+    #[test]
+    fn positions_cover_pgm_and_pvw_media_layers() {
+        let [a, m1, m2] = ids();
+        let t0 = Instant::now();
+        let mut b = buses();
+        let (live, cued) = (clip(m1), clip(m2));
+        b.set_program(Scene::from([(a, vec![live.clone(), bars()])]), t0);
+        b.set_preview(Scene::from([(a, vec![cued.clone()])]));
+        let want = BTreeMap::from([(live.id, 1), (cued.id, 0)]);
+        assert_eq!(b.positions(t0), want, "PGM's (playing) and PVW's (paused) media layers; patterns have none");
     }
 }

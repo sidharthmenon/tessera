@@ -1,20 +1,21 @@
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Sender, SyncSender};
 use std::time::{Duration, Instant};
 
 use tessera_show::{Bus, EngineConfig, FromEngine, Layer, Mapping, Output, OutputState, Pattern, Rect, Screen, Source, ToEngine};
 use uuid::Uuid;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
 
-use crate::audio::{AudioTap, Mixer};
+use crate::audio::{AudioTap, Mixer, lock};
 use crate::buses::{Buses, FileOpener};
 use crate::compositor::{Compositor, ScreenSlot};
 use crate::frame_clock::FrameClock;
-use crate::gpu::Gpu;
+use crate::gpu::{Gpu, Readback};
+use crate::net::Previews;
 use crate::outputs::{Outputs, monitors};
 
 const MONITOR_POLL: Duration = Duration::from_secs(2);
@@ -22,6 +23,10 @@ const IDENTIFY: Duration = Duration::from_secs(3);
 /// Loop tick when no Fifo surface is pacing it (no windows, or all occluded).
 const IDLE_TICK: Duration = Duration::from_millis(16);
 const STATS: Duration = Duration::from_secs(1);
+const POSITIONS: Duration = Duration::from_millis(200);
+/// At most 15 preview frames a second per bus.
+const PREVIEW_PERIOD: Duration = Duration::from_nanos(1_000_000_000 / 15);
+const PREVIEW_WIDTH: u32 = 960;
 /// Frame clock period when no monitor reports a refresh rate.
 const FALLBACK_MHZ: u32 = 60_000;
 
@@ -32,12 +37,17 @@ pub enum UserEvent {
 
 /// Cloneable, thread-safe way to send the engine commands.
 #[derive(Clone)]
-pub struct EngineHandle(EventLoopProxy<UserEvent>);
+pub struct EngineHandle(Arc<dyn Fn(ToEngine) -> bool + Send + Sync>);
 
 impl EngineHandle {
+    /// Commands go to `send`, which returns false once the engine is gone (tests: a stub engine).
+    pub fn new(send: impl Fn(ToEngine) -> bool + Send + Sync + 'static) -> EngineHandle {
+        EngineHandle(Arc::new(send))
+    }
+
     /// False once the engine's event loop has exited.
     pub fn send(&self, command: ToEngine) -> bool {
-        self.0.send_event(UserEvent::Command(command)).is_ok()
+        (self.0)(command)
     }
 }
 
@@ -50,7 +60,9 @@ pub fn event_loop() -> anyhow::Result<(EventLoop<UserEvent>, EngineHandle)> {
         builder.with_activation_policy(ActivationPolicy::Accessory);
     }
     let event_loop = builder.build()?;
-    let handle = EngineHandle(event_loop.create_proxy());
+    // The Mutex makes it Sync on Windows, whose proxy is only Send.
+    let proxy = Mutex::new(event_loop.create_proxy());
+    let handle = EngineHandle::new(move |command| lock(&proxy).send_event(UserEvent::Command(command)).is_ok());
     Ok((event_loop, handle))
 }
 
@@ -73,6 +85,12 @@ pub struct App {
     presented: u32,
     dropped: u64,
     stats_since: Instant,
+    next_positions: Instant,
+    previews: Arc<Previews>,
+    /// Indexed by `Bus as usize`.
+    captures: [Capture; 2],
+    /// To the JPEG thread: (bus, width, height, RGBA).
+    encoder: SyncSender<(Bus, u32, u32, Vec<u8>)>,
     /// `None`: no usable output device, the engine runs silent.
     mixer: Option<Mixer>,
     // Per-frame scratch, reused so the render path doesn't allocate.
@@ -81,8 +99,16 @@ pub struct App {
     taps: Vec<(AudioTap, f32)>,
 }
 
+/// A bus's preview: the readback in flight, and when the next one may start.
+struct Capture {
+    pending: Option<Readback>,
+    next: Instant,
+}
+
 impl App {
-    pub fn new(events: Sender<FromEngine>) -> anyhow::Result<App> {
+    /// Replies go out through `events`; previews of the buses `previews` says are watched are
+    /// encoded (on a thread of its own) into it.
+    pub fn new(events: Sender<FromEngine>, previews: Arc<Previews>) -> anyhow::Result<App> {
         // Surfaces are created later from this device's instance (Metal/DX12 need no display handle).
         let gpu = Gpu::new_headless()?;
         // A live show must not die on a GPU validation error (the default handler panics).
@@ -99,6 +125,15 @@ impl App {
                 None
             }
         };
+        let (encoder, frames) = mpsc::sync_channel::<(Bus, u32, u32, Vec<u8>)>(2);
+        let jpegs = previews.clone();
+        std::thread::Builder::new().name("preview jpeg".into()).spawn(move || {
+            for (bus, width, height, rgba) in frames {
+                if let Err(e) = jpegs.publish_rgba(bus, width, height, rgba) {
+                    eprintln!("preview {bus:?}: {e:#}");
+                }
+            }
+        })?;
         let now = Instant::now();
         Ok(App {
             compositor: Compositor::new(&gpu),
@@ -116,6 +151,10 @@ impl App {
             presented: 0,
             dropped: 0,
             stats_since: now,
+            next_positions: now,
+            previews,
+            captures: [(); 2].map(|()| Capture { pending: None, next: now }),
+            encoder,
             mixer,
             views: HashMap::new(),
             mappings: vec![],
@@ -154,7 +193,7 @@ impl App {
                     eprintln!("identify: unknown output {output_id}");
                 }
             }
-            ToEngine::Probe { .. } => eprintln!("Probe: unsupported until later task, ignored"),
+            ToEngine::Probe { .. } => eprintln!("probe: answered by the network server (net::serve), ignored here"),
         }
     }
 
@@ -172,8 +211,13 @@ impl App {
         }
     }
 
-    /// Forwards audio output errors; once a second reports presented fps and total dropped frames.
+    /// Forwards audio output errors; 5 times a second reports media positions, once a second
+    /// presented fps and total dropped frames.
     fn report(&mut self, real: Instant) {
+        if real >= self.next_positions {
+            self.next_positions = real + POSITIONS;
+            self.send(FromEngine::Positions { positions: self.buses.positions(self.now) });
+        }
         if let Some(message) = self.mixer.as_ref().and_then(Mixer::take_error) {
             self.send(FromEngine::Error { message });
         }
@@ -216,11 +260,36 @@ impl App {
         self.outputs.render(&self.gpu, &mut self.compositor, &self.config.outputs, mappings, &self.views)
     }
 
-    /// `bus`'s screens at their layout positions, `width` px wide, for the controller's preview
-    /// (Task 10). Rendered only when asked: PVW is never drawn otherwise.
-    pub fn render_preview(&mut self, bus: Bus, width: u32) -> wgpu::TextureView {
-        self.render_screens(bus);
-        self.compositor.render_layout(&self.gpu, &self.config.screens, &self.views, width)
+    /// For each bus an MJPEG client watches, at most 15 times a second: its screens at their
+    /// layout positions, `PREVIEW_WIDTH` px wide, read back for the JPEG thread. Never waits on the
+    /// GPU: a readback started on one frame is collected on a later one, one in flight per bus.
+    /// PVW is drawn only here, so only while watched.
+    fn preview(&mut self, real: Instant) {
+        let _ = self.gpu.device.poll(wgpu::PollType::Poll); // runs finished readbacks' callbacks
+        // PGM first: it reuses the screens this frame drew for the outputs (`views`).
+        for bus in [Bus::Pgm, Bus::Pvw] {
+            let capture = &mut self.captures[bus as usize];
+            if let Some(readback) = &mut capture.pending {
+                match readback.try_take() {
+                    None => continue,
+                    Some(Ok(rgba)) => {
+                        let (width, height) = readback.size();
+                        let _ = self.encoder.try_send((bus, width, height, rgba)); // JPEG thread busy: skip it
+                    }
+                    Some(Err(e)) => eprintln!("preview {bus:?}: {e:#}"),
+                }
+                capture.pending = None;
+            }
+            if real < capture.next || !self.previews.watched(bus) {
+                continue;
+            }
+            capture.next = real + PREVIEW_PERIOD;
+            if bus == Bus::Pvw || self.outputs.is_empty() {
+                self.render_screens(bus);
+            }
+            let view = self.compositor.render_layout(&self.gpu, &self.config.screens, &self.views, PREVIEW_WIDTH);
+            self.captures[bus as usize].pending = Some(Readback::start(&self.gpu, view.texture()));
+        }
     }
 }
 
@@ -294,6 +363,7 @@ impl ApplicationHandler<UserEvent> for App {
             mixer.set_taps(self.taps.drain(..));
         }
         self.paced = self.render();
+        self.preview(real);
         self.report(real);
         let flow = if self.paced { ControlFlow::Poll } else { ControlFlow::WaitUntil(real + IDLE_TICK) };
         event_loop.set_control_flow(flow);

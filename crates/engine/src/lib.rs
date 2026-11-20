@@ -4,6 +4,8 @@ pub mod buses;
 pub mod compositor;
 pub mod frame_clock;
 pub mod gpu;
+pub mod net;
 pub mod outputs;
 pub mod player;
+pub mod probe;
 pub mod video_decode;

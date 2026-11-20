@@ -29,7 +29,7 @@ fn render(gpu: &Gpu, tex: LayerTexture) -> Vec<u8> {
     let screen = Screen { id: Uuid::new_v4(), name: "S".into(), width: 64, height: 64, layout_x: 0, layout_y: 0 };
     let layer = Layer::new(Source::Media { media_id: Uuid::new_v4() }, Rect { x: 0., y: 0., w: 64., h: 64. });
     let view = Compositor::new(gpu).render_screen(gpu, ScreenSlot::Pgm, &screen, &[(layer, Some(tex))]);
-    read_rgba(gpu, view.texture())
+    read_rgba(gpu, view.texture()).unwrap()
 }
 
 fn px(data: &[u8], x: usize, y: usize) -> [u8; 4] {

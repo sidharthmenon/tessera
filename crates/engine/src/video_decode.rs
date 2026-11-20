@@ -198,49 +198,56 @@ impl Decoder {
                 f if f == AV_PIX_FMT_P010LE as i32 => PixelFormatKind::P010,
                 f if f == AV_PIX_FMT_AYUV64LE as i32 => PixelFormatKind::Ayuv64,
                 _ => {
-                    frame = self.sws_rgba(&frame, full_range)?;
+                    frame = sws(&mut self.sws, &frame, ff::format::Pixel::RGBA, (frame.width(), frame.height()), full_range)?;
                     PixelFormatKind::Rgba
                 }
             };
             Ok(Frame { pts, kind, hardware, full_range, frame })
         }
     }
+}
 
-    /// Software fallback: `sws_scale` to straight-alpha RGBA8 with BT.709 coefficients (the YUV
-    /// shader path's matrix, so both paths match).
-    fn sws_rgba(&mut self, f: &ff::frame::Video, full_range: bool) -> anyhow::Result<ff::frame::Video> {
-        // SAFETY: `f` is a decoded frame (valid format, planes, strides); `out` is allocated by
-        // FFmpeg at the size the context converts to.
-        unsafe {
-            let p = f.as_ptr();
-            let key = ((*p).format, (*p).width, (*p).height, full_range);
-            if self.sws.as_ref().is_none_or(|s| s.key != key) {
-                self.sws = None;
-                // The format came from FFmpeg, so it is a valid AVPixelFormat.
-                let format = std::mem::transmute::<i32, ffi::AVPixelFormat>(key.0);
-                let rgba = ffi::AVPixelFormat::AV_PIX_FMT_RGBA;
-                let flags = ffi::SwsFlags::SWS_BILINEAR as i32;
-                let ctx = ffi::sws_getContext(key.1, key.2, format, key.1, key.2, rgba, flags, ptr::null_mut(), ptr::null_mut(), ptr::null());
-                ensure!(!ctx.is_null(), "no software conversion from pixel format {}", pix_name(format));
-                let bt709 = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709);
-                ffi::sws_setColorspaceDetails(ctx, bt709, full_range as i32, bt709, 1, 0, 1 << 16, 1 << 16);
-                self.sws = Some(Sws { ctx, key });
-            }
-            let ctx = self.sws.as_ref().map_or(ptr::null_mut(), |s| s.ctx);
-            let mut out = ff::frame::Video::new(ff::format::Pixel::RGBA, key.1 as u32, key.2 as u32);
-            let o = out.as_mut_ptr();
-            let src = (*p).data.as_ptr() as *const *const u8;
-            let rows = ffi::sws_scale(ctx, src, (*p).linesize.as_ptr(), 0, key.2, (*o).data.as_ptr(), (*o).linesize.as_ptr());
-            ensure!(rows > 0, "software conversion to RGBA failed");
-            Ok(out)
+/// `f` converted by `sws_scale` to `out` at `size` (straight alpha kept) with BT.709 coefficients,
+/// the YUV shader path's matrix, so both paths match. The software fallback (RGBA8) and probe
+/// thumbnails (RGB24) use it; `cache` keeps the context while the conversion stays the same.
+pub(crate) fn sws(
+    cache: &mut Option<Sws>,
+    f: &ff::frame::Video,
+    out: ff::format::Pixel,
+    size: (u32, u32),
+    full_range: bool,
+) -> anyhow::Result<ff::frame::Video> {
+    // SAFETY: `f` is a decoded frame (valid format, planes, strides); `frame` is allocated by
+    // FFmpeg at the size the context converts to.
+    unsafe {
+        let p = f.as_ptr();
+        let to: ffi::AVPixelFormat = out.into();
+        let key = ((*p).format, (*p).width, (*p).height, full_range, to as i32, size.0 as i32, size.1 as i32);
+        if cache.as_ref().is_none_or(|s| s.key != key) {
+            *cache = None;
+            // The format came from FFmpeg, so it is a valid AVPixelFormat.
+            let from = std::mem::transmute::<i32, ffi::AVPixelFormat>(key.0);
+            let flags = ffi::SwsFlags::SWS_BILINEAR as i32;
+            let ctx = ffi::sws_getContext(key.1, key.2, from, key.5, key.6, to, flags, ptr::null_mut(), ptr::null_mut(), ptr::null());
+            ensure!(!ctx.is_null(), "no software conversion from pixel format {}", pix_name(from));
+            let bt709 = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709);
+            ffi::sws_setColorspaceDetails(ctx, bt709, full_range as i32, bt709, 1, 0, 1 << 16, 1 << 16);
+            *cache = Some(Sws { ctx, key });
         }
+        let ctx = cache.as_ref().map_or(ptr::null_mut(), |s| s.ctx);
+        let mut frame = ff::frame::Video::new(out, size.0, size.1);
+        let o = frame.as_mut_ptr();
+        let src = (*p).data.as_ptr() as *const *const u8;
+        let rows = ffi::sws_scale(ctx, src, (*p).linesize.as_ptr(), 0, key.2, (*o).data.as_ptr(), (*o).linesize.as_ptr());
+        ensure!(rows > 0, "software conversion to {out:?} failed");
+        Ok(frame)
     }
 }
 
-struct Sws {
+pub(crate) struct Sws {
     ctx: *mut ffi::SwsContext,
-    /// Source format, width, height, full range.
-    key: (i32, i32, i32, bool),
+    /// Source format, width, height, full range; output format, width, height.
+    key: (i32, i32, i32, bool, i32, i32, i32),
 }
 
 impl Drop for Sws {
@@ -250,7 +257,7 @@ impl Drop for Sws {
     }
 }
 
-fn init() {
+pub(crate) fn init() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = ff::init();

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use tessera_engine::compositor::{Compositor, LayerTexture, Planes, ScreenSlot};
-use tessera_engine::gpu::{Gpu, read_rgba};
+use tessera_engine::gpu::{Gpu, Readback, read_rgba};
 use tessera_show::{Layer, Mapping, Output, OutputTarget, Pattern, Rect, Screen, Source, TransitionKind};
 use uuid::Uuid;
 use wgpu::TextureFormat;
@@ -56,7 +56,7 @@ fn assert_near(got: [u8; 4], want: [u8; 4], tol: u8) {
 /// Renders `layers` onto `s` and reads the screen texture back.
 fn render(gpu: &Gpu, c: &mut Compositor, s: &Screen, layers: &[(Layer, Option<LayerTexture>)]) -> Vec<u8> {
     let view = c.render_screen(gpu, ScreenSlot::Pgm, s, layers);
-    read_rgba(gpu, view.texture())
+    read_rgba(gpu, view.texture()).unwrap()
 }
 
 const RED: [f32; 4] = [1., 0., 0., 1.];
@@ -187,8 +187,8 @@ fn slots_do_not_alias() {
     let full = r(0., 0., 10., 10.);
     let pgm = c.render_screen(&gpu, ScreenSlot::Pgm, &s, &[solid(RED, full.clone())]);
     let pvw = c.render_screen(&gpu, ScreenSlot::Pvw, &s, &[solid(BLUE, full)]);
-    assert_eq!(px(&read_rgba(&gpu, pgm.texture()), 10, 5, 5), [255, 0, 0, 255]);
-    assert_eq!(px(&read_rgba(&gpu, pvw.texture()), 10, 5, 5), [0, 0, 255, 255]);
+    assert_eq!(px(&read_rgba(&gpu, pgm.texture()).unwrap(), 10, 5, 5), [255, 0, 0, 255]);
+    assert_eq!(px(&read_rgba(&gpu, pvw.texture()).unwrap(), 10, 5, 5), [0, 0, 255, 255]);
 }
 
 #[test]
@@ -199,7 +199,7 @@ fn oversized_screen_does_not_panic() {
     let s = screen(max + 100, 4);
     let view = c.render_screen(&gpu, ScreenSlot::Pgm, &s, &[solid(RED, r(0., 0., (max + 100) as f32, 4.))]);
     assert_eq!((view.texture().width(), view.texture().height()), (max, 4), "clamped to the device limit");
-    assert_eq!(px(&read_rgba(&gpu, view.texture()), max, max - 1, 2), [255, 0, 0, 255]);
+    assert_eq!(px(&read_rgba(&gpu, view.texture()).unwrap(), max, max - 1, 2), [255, 0, 0, 255]);
     let tall = Screen { layout_y: i32::MAX, ..screen(1, u32::MAX) };
     c.render_layout(&gpu, &[tall], &HashMap::new(), 100);
 }
@@ -218,7 +218,7 @@ fn screen_split_across_two_outputs() {
     for (o, want) in [(&a, [255, 0, 0, 255]), (&b, [0, 0, 255, 255])] {
         let target = gpu.target(100, 100);
         c.render_output(&gpu, &target.create_view(&Default::default()), o, &mappings, &screens);
-        assert_eq!(px(&read_rgba(&gpu, &target), 100, 50, 50), want);
+        assert_eq!(px(&read_rgba(&gpu, &target).unwrap(), 100, 50, 50), want);
     }
 }
 
@@ -233,7 +233,7 @@ fn mapping_outside_bounds_clips() {
     let draw = |c: &mut Compositor, m: Mapping| {
         let target = gpu.target(100, 100);
         c.render_output(&gpu, &target.create_view(&Default::default()), &o, &[m], &screens);
-        read_rgba(&gpu, &target)
+        read_rgba(&gpu, &target).unwrap()
     };
 
     // dst hangs off the output's bottom-right
@@ -258,7 +258,7 @@ fn brightness_zero_output_black() {
     let full = r(0., 0., 100., 100.);
     let target = gpu.target(100, 100);
     c.render_output(&gpu, &target.create_view(&Default::default()), &o, &[mapping(&s, full.clone(), &o, full)], &HashMap::from([(s.id, view)]));
-    assert_eq!(px(&read_rgba(&gpu, &target), 100, 50, 50), [0, 0, 0, 255]);
+    assert_eq!(px(&read_rgba(&gpu, &target).unwrap(), 100, 50, 50), [0, 0, 0, 255]);
 }
 
 #[test]
@@ -275,7 +275,7 @@ fn layout_places_screens_scaled() {
     // 200×200 layout scaled to 100 px wide
     let view = c.render_layout(&gpu, &[a, b], &views, 100);
     assert_eq!((view.texture().width(), view.texture().height()), (100, 100));
-    let data = read_rgba(&gpu, view.texture());
+    let data = read_rgba(&gpu, view.texture()).unwrap();
     assert_eq!(px(&data, 100, 25, 25), [255, 0, 0, 255]);
     assert_eq!(px(&data, 100, 75, 75), [0, 0, 255, 255]);
     assert_eq!(px(&data, 100, 75, 25), [0, 0, 0, 255]);
@@ -289,7 +289,7 @@ fn transition_mixes_outgoing_into_incoming() {
     let full = r(0., 0., 100., 10.);
     let outgoing = c.render_screen(&gpu, ScreenSlot::Outgoing, &s, &[solid(RED, full.clone())]);
     let incoming = c.render_screen(&gpu, ScreenSlot::Pgm, &s, &[solid(BLUE, full)]);
-    let mut mix = |kind, p| read_rgba(&gpu, c.render_transition(&gpu, &s, &outgoing, &incoming, &kind, p).texture());
+    let mut mix = |kind, p| read_rgba(&gpu, c.render_transition(&gpu, &s, &outgoing, &incoming, &kind, p).texture()).unwrap();
     let fade = mix(TransitionKind::Fade, 0.5);
     assert_near(px(&fade, 100, 50, 5), [128, 0, 128, 255], 2);
     assert_near(px(&mix(TransitionKind::Fade, 0.), 100, 50, 5), [255, 0, 0, 255], 0);
@@ -299,4 +299,41 @@ fn transition_mixes_outgoing_into_incoming() {
     let right = mix(TransitionKind::WipeRight, 0.5);
     assert_eq!((px(&right, 100, 49, 5), px(&right, 100, 50, 5)), ([255, 0, 0, 255], [0, 0, 255, 255]));
     assert_eq!(px(&mix(TransitionKind::WipeLeft, 1.), 100, 99, 5), [0, 0, 255, 255]);
+}
+
+/// The preview readback (Task 10) never waits: it finishes on non-blocking polls alone.
+#[test]
+fn readback_completes_without_waiting() {
+    let gpu = gpu();
+    let mut c = Compositor::new(&gpu);
+    let s = screen(70, 8); // a row of 280 bytes: padded to 512 in the buffer
+    let view = c.render_screen(&gpu, ScreenSlot::Pgm, &s, &[solid(RED, r(0., 0., 35., 8.)), solid(BLUE, r(35., 0., 35., 8.))]);
+    let mut readback = Readback::start(&gpu, view.texture());
+    assert_eq!(readback.size(), (70, 8));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let data = loop {
+        let _ = gpu.device.poll(wgpu::PollType::Poll);
+        if let Some(data) = readback.try_take() {
+            break data.unwrap();
+        }
+        assert!(std::time::Instant::now() < deadline, "readback never finished");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    assert_eq!(data.len(), 70 * 8 * 4, "rows tightly packed");
+    assert_eq!((px(&data, 70, 34, 7), px(&data, 70, 35, 0)), ([255, 0, 0, 255], [0, 0, 255, 255]));
+}
+
+/// The 960 px preview shrinks big screens a lot: 1 px detail (grid lines) must average in, not
+/// fall between the samples (T5 minor: no mips).
+#[test]
+fn layout_downscale_keeps_thin_lines() {
+    let gpu = gpu();
+    let mut c = Compositor::new(&gpu);
+    let s = screen(256, 8);
+    let line = c.render_screen(&gpu, ScreenSlot::Pgm, &s, &[solid([1.; 4], r(64., 0., 1., 8.))]);
+    let view = c.render_layout(&gpu, std::slice::from_ref(&s), &HashMap::from([(s.id, line)]), 64); // 4×
+    let data = read_rgba(&gpu, view.texture()).unwrap();
+    assert_near(px(&data, 64, 16, 1), [64, 64, 64, 255], 4); // texels 64..68: one white of four
+    assert_eq!(px(&data, 64, 15, 1), [0, 0, 0, 255]);
+    assert_eq!(px(&data, 64, 17, 1), [0, 0, 0, 255]);
 }
