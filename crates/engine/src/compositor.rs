@@ -25,6 +25,9 @@ pub enum Planes {
     Nv12 { y: wgpu::TextureView, uv: wgpu::TextureView },
     /// Y `R16Unorm` + half-resolution UV `Rg16Unorm`, 10 bits MSB-aligned.
     P010 { y: wgpu::TextureView, uv: wgpu::TextureView },
+    /// One `Rgba16Unorm` of packed A, Y, Cb, Cr (VideoToolbox ProRes 4444 + alpha, `y416`);
+    /// alpha is straight, so `premultiplied` stays false.
+    Ayuv64(wgpu::TextureView),
 }
 
 /// Which copy of a screen to render: PGM, PVW and a transition's outgoing PGM can all show the
@@ -245,6 +248,10 @@ impl Compositor {
                     Planes::P010 { y, uv } => {
                         (u.kind, u.yuv_scale) = (1, 256.);
                         (y, uv)
+                    }
+                    Planes::Ayuv64(v) => {
+                        (u.kind, u.yuv_scale) = (6, 256.);
+                        (v, &self.blank)
                     }
                 }
             }

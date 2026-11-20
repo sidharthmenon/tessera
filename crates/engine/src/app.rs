@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use tessera_show::{
-    EngineConfig, FromEngine, Layer, Mapping, Output, OutputState, Pattern, Rect, Scene, Screen, Source, ToEngine,
+    EngineConfig, FromEngine, Layer, Mapping, MediaKind, Output, OutputState, Pattern, Rect, Scene, Screen, Source,
+    ToEngine,
 };
 use uuid::Uuid;
 use winit::application::ApplicationHandler;
@@ -13,13 +16,18 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::window::WindowId;
 
 use crate::compositor::{Compositor, LayerTexture, ScreenSlot};
+use crate::frame_clock::FrameClock;
 use crate::gpu::Gpu;
 use crate::outputs::{Outputs, monitors};
+use crate::player::{ImageSource, Player};
 
 const MONITOR_POLL: Duration = Duration::from_secs(2);
 const IDENTIFY: Duration = Duration::from_secs(3);
 /// Loop tick when no Fifo surface is pacing it (no windows, or all occluded).
 const IDLE_TICK: Duration = Duration::from_millis(16);
+const STATS: Duration = Duration::from_secs(1);
+/// Frame clock period when no monitor reports a refresh rate.
+const FALLBACK_MHZ: u32 = 60_000;
 
 #[derive(Debug)]
 pub enum UserEvent {
@@ -50,6 +58,14 @@ pub fn event_loop() -> anyhow::Result<(EventLoop<UserEvent>, EngineHandle)> {
     Ok((event_loop, handle))
 }
 
+/// A media layer's frame source.
+// ponytail: one per program layer id, opened (blocking) on SetProgram; Task 9's player pool
+// (players shared across PVW/PGM by refcount) replaces this map.
+enum Media {
+    Video(Box<Player>),
+    Image(ImageSource),
+}
+
 /// Engine state driven by `event_loop().run_app(&mut app)`; replies go out through `events`.
 pub struct App {
     gpu: Gpu,
@@ -61,6 +77,14 @@ pub struct App {
     status: Vec<OutputState>,
     next_poll: Instant,
     identify: HashMap<Uuid, Instant>,
+    /// Program layer id → (media id, source).
+    media: HashMap<Uuid, (Uuid, Media)>,
+    clock: FrameClock,
+    /// The last frame presented on a Fifo surface (so the next one is one vsync later).
+    paced: bool,
+    presented: u32,
+    dropped: u64,
+    stats_since: Instant,
 }
 
 impl App {
@@ -79,6 +103,12 @@ impl App {
             status: vec![],
             next_poll: Instant::now() + MONITOR_POLL,
             identify: HashMap::new(),
+            media: HashMap::new(),
+            clock: FrameClock::new(period(FALLBACK_MHZ), Instant::now()),
+            paced: false,
+            presented: 0,
+            dropped: 0,
+            stats_since: Instant::now(),
         })
     }
 
@@ -91,8 +121,12 @@ impl App {
             ToEngine::SetConfig { config } => {
                 self.config = config;
                 self.apply(event_loop, true);
+                self.sync_media();
             }
-            ToEngine::SetProgram { scene } => self.program = scene,
+            ToEngine::SetProgram { scene } => {
+                self.program = scene;
+                self.sync_media();
+            }
             ToEngine::ListMonitors => self.send(FromEngine::Monitors { monitors: monitors(event_loop) }),
             ToEngine::Identify { output_id } => {
                 if self.config.outputs.iter().any(|o| o.id == output_id) {
@@ -116,18 +150,92 @@ impl App {
             self.send(FromEngine::OutputStatus { outputs: status.clone() });
         }
         self.status = status;
+        let refresh_mhz = self.outputs.refresh_mhz().unwrap_or(FALLBACK_MHZ);
+        if period(refresh_mhz) != self.clock.period() {
+            eprintln!("frame clock: {:.3} Hz", refresh_mhz as f64 / 1000.);
+            self.clock = FrameClock::new(period(refresh_mhz), Instant::now());
+        }
     }
 
-    /// Composites every screen from `program` (media layers have no frames yet, so they stay
-    /// transparent) and draws all outputs. Returns whether a Fifo present paced this frame.
-    fn render(&mut self) -> bool {
+    /// Opens a source for every program media layer that lacks one and drops the sources of layers
+    /// that are gone. New videos start together once all are open (opening blocks; a late start
+    /// would skip frames). Failures are reported and the layer stays empty.
+    fn sync_media(&mut self) {
+        let wanted: HashMap<Uuid, Uuid> = (self.program.values().flatten())
+            .filter_map(|l| match l.source {
+                Source::Media { media_id } => Some((l.id, media_id)),
+                Source::Pattern { .. } => None,
+            })
+            .collect();
+        self.media.retain(|layer, (media, _)| wanted.get(layer) == Some(media));
+        let mut opened = vec![];
+        for layer in self.program.values().flatten() {
+            let Source::Media { media_id } = layer.source else { continue };
+            if self.media.contains_key(&layer.id) {
+                continue;
+            }
+            match self.open_media(layer, media_id) {
+                Ok(media) => {
+                    self.media.insert(layer.id, (media_id, media));
+                    opened.push(layer.id);
+                }
+                Err(e) => self.send(FromEngine::Error { message: format!("layer {}: {e:#}", layer.id) }),
+            }
+        }
+        let now = Instant::now();
+        for id in opened {
+            if let Some((_, Media::Video(player))) = self.media.get_mut(&id) {
+                player.play(now);
+            }
+        }
+    }
+
+    fn open_media(&self, layer: &Layer, media_id: Uuid) -> anyhow::Result<Media> {
+        let item = self.config.media.iter().find(|m| m.id == media_id).context("unknown media")?;
+        let path = Path::new(&item.path);
+        Ok(match item.kind {
+            MediaKind::Video => Media::Video(Box::new(Player::open(path, layer.playback.clone())?)),
+            MediaKind::Image => Media::Image(ImageSource::open(&self.gpu, path)?),
+        })
+    }
+
+    /// Forwards player errors; once a second reports presented fps and total dropped frames.
+    fn report(&mut self, real: Instant) {
+        for (_, media) in self.media.values_mut() {
+            let Media::Video(player) = media else { continue };
+            self.dropped += player.take_dropped();
+            if let Some(message) = player.take_error() {
+                let _ = self.events.send(FromEngine::Error { message });
+            }
+        }
+        self.presented += self.paced as u32;
+        let elapsed = real - self.stats_since;
+        if elapsed >= STATS {
+            let fps = self.presented as f32 / elapsed.as_secs_f32();
+            self.send(FromEngine::Stats { fps, dropped: self.dropped });
+            (self.presented, self.stats_since) = (0, real);
+        }
+    }
+
+    /// Composites every screen from `program` with each media layer's frame for `now` (frame
+    /// clock time) and draws all outputs. Returns whether a Fifo present paced this frame.
+    fn render(&mut self, now: Instant) -> bool {
         if self.outputs.is_empty() {
             return false;
         }
+        let period = self.clock.period();
         let mut views = HashMap::new();
         for screen in &self.config.screens {
-            let layers: Vec<(Layer, Option<LayerTexture>)> =
-                self.program.get(&screen.id).into_iter().flatten().map(|l| (l.clone(), None)).collect();
+            let layers: Vec<(Layer, Option<LayerTexture>)> = (self.program.get(&screen.id).into_iter().flatten())
+                .map(|l| {
+                    let frame = match self.media.get_mut(&l.id) {
+                        Some((_, Media::Video(player))) if l.visible => player.current_frame(&self.gpu, now, period),
+                        Some((_, Media::Image(image))) => Some(image.texture()),
+                        _ => None,
+                    };
+                    (l.clone(), frame)
+                })
+                .collect();
             views.insert(screen.id, self.compositor.render_screen(&self.gpu, ScreenSlot::Pgm, screen, &layers));
         }
         let mut mappings = self.config.mappings.clone();
@@ -170,13 +278,20 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let now = Instant::now();
-        if now >= self.next_poll {
-            self.next_poll = now + MONITOR_POLL;
+        let real = Instant::now();
+        if real >= self.next_poll {
+            self.next_poll = real + MONITOR_POLL;
             self.apply(event_loop, false);
         }
-        self.identify.retain(|_, until| *until > now);
-        let paced = self.render();
-        event_loop.set_control_flow(if paced { ControlFlow::Poll } else { ControlFlow::WaitUntil(now + IDLE_TICK) });
+        self.identify.retain(|_, until| *until > real);
+        let now = self.clock.tick(real, self.paced);
+        self.paced = self.render(now);
+        self.report(real);
+        let flow = if self.paced { ControlFlow::Poll } else { ControlFlow::WaitUntil(real + IDLE_TICK) };
+        event_loop.set_control_flow(flow);
     }
+}
+
+fn period(refresh_mhz: u32) -> Duration {
+    Duration::from_secs_f64(1000. / refresh_mhz.max(1) as f64)
 }

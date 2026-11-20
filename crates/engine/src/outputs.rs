@@ -41,8 +41,7 @@ impl Outputs {
 
     /// Opens, recreates and closes windows to match `config`. Window targets get a decorated
     /// window at `x,y` with a `width×height` physical inner size; bound Display targets go
-    /// borderless fullscreen on their monitor; unbound ones get no window. The first windowed
-    /// output (config order) presents with Fifo and paces the loop.
+    /// borderless fullscreen on their monitor; unbound ones get no window.
     pub fn apply_config(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -89,13 +88,8 @@ impl Outputs {
                 Place::Window { .. } => None,
             });
             states.push(OutputState { output_id: output.id, bound: window.is_some(), monitor });
-            if let Some(mut w) = window {
+            if let Some(w) = window {
                 w.window.set_title(&output.name);
-                let present_mode = present_mode(&w.surface, gpu, self.windows.is_empty());
-                if w.config.present_mode != present_mode {
-                    w.config.present_mode = present_mode;
-                    w.surface.configure(&gpu.device, &w.config);
-                }
                 self.windows.insert(output.id, w);
             }
         }
@@ -105,9 +99,14 @@ impl Outputs {
         states
     }
 
+    /// Slowest refresh rate among the windows' monitors: the single render loop runs at that rate.
+    pub fn refresh_mhz(&self) -> Option<u32> {
+        self.windows.values().filter_map(|w| w.window.current_monitor()?.refresh_rate_millihertz()).min()
+    }
+
     /// Draws each windowed output from `screens` through `mappings` and presents it. Returns
-    /// whether a Fifo surface presented (i.e. this frame waited for vsync). Never panics on
-    /// surface errors: Outdated reconfigures, Lost recreates the surface, the rest skip a frame.
+    /// whether anything presented (all surfaces are Fifo, so that frame waited for vsync). Never
+    /// panics on surface errors: Outdated reconfigures, Lost recreates the surface, the rest skip.
     pub fn render(
         &mut self,
         gpu: &Gpu,
@@ -141,7 +140,7 @@ impl Outputs {
             compositor.render_output(gpu, &view, output, mappings, screens);
             w.window.pre_present_notify();
             gpu.queue.present(frame);
-            paced |= w.config.present_mode == wgpu::PresentMode::Fifo;
+            paced = true;
             if !w.presented {
                 w.presented = true;
                 eprintln!("output '{}': first frame presented ({:?})", output.name, w.config.present_mode);
@@ -189,6 +188,10 @@ fn open(
     } else {
         caps.alpha_modes[0]
     };
+    // ponytail: every output Fifo in one render loop (R18): Immediate tears on LED walls and Metal
+    // has no Mailbox. Ceiling: the loop runs at the slowest display's rate and one output's hitch
+    // stalls all. Upgrade (spike FINDINGS): a render thread per output plus one device-wide lock
+    // around every queue.submit and Surface::configure.
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format,
@@ -230,15 +233,6 @@ fn fullscreen(event_loop: &ActiveEventLoop, attrs: WindowAttributes, monitor: &M
     use winit::window::{Fullscreen, WindowLevel};
     let attrs = attrs.with_window_level(WindowLevel::AlwaysOnTop);
     Ok(event_loop.create_window(attrs.with_fullscreen(Some(Fullscreen::Borderless(Some(monitor.clone())))))?)
-}
-
-/// Primary: Fifo (paces the loop at vsync). Others must not block on their own vsync.
-fn present_mode(surface: &wgpu::Surface, gpu: &Gpu, primary: bool) -> wgpu::PresentMode {
-    let modes = surface.get_capabilities(&gpu.adapter).present_modes;
-    [wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate]
-        .into_iter()
-        .find(|m| !primary && modes.contains(m))
-        .unwrap_or(wgpu::PresentMode::Fifo)
 }
 
 pub fn monitor_info(m: &MonitorHandle) -> MonitorInfo {

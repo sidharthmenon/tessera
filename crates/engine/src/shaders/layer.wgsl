@@ -4,7 +4,7 @@ struct U {
     rect: vec4<f32>,    // layer rect in screen px (x, y, w, h)
     color: vec4<f32>,   // Solid pattern, straight alpha
     screen: vec2<f32>,  // screen size in px
-    kind: u32,          // 0 rgba, 1 yuv (nv12/p010), 2 bars, 3 grid, 4 gradient, 5 solid
+    kind: u32,          // 0 rgba, 1 yuv (nv12/p010), 2 bars, 3 grid, 4 gradient, 5 solid, 6 ayuv64
     flags: u32,         // bit 0 premultiplied, bit 1 full range
     opacity: f32,
     brightness: f32,
@@ -29,17 +29,17 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     return o;
 }
 
-// BT.709 Y'CbCr → R'G'B'; limited range is Y 16–235, CbCr 16–240.
-fn yuv(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
-    var y = a.r;
-    var cb = b.r - 0.5;
-    var cr = b.g - 0.5;
+// BT.709 Y'CbCr (normalized samples) → R'G'B'; limited range is Y 16–235, CbCr 16–240.
+fn yuv(ys: f32, cbs: f32, crs: f32) -> vec3<f32> {
+    var y = ys;
+    var cb = cbs - 0.5;
+    var cr = crs - 0.5;
     if (u.flags & 2u) == 0u {
-        y = (a.r * u.yuv_scale - 16.0) / 219.0;
-        cb = (b.r * u.yuv_scale - 128.0) / 224.0;
-        cr = (b.g * u.yuv_scale - 128.0) / 224.0;
+        y = (ys * u.yuv_scale - 16.0) / 219.0;
+        cb = (cbs * u.yuv_scale - 128.0) / 224.0;
+        cr = (crs * u.yuv_scale - 128.0) / 224.0;
     }
-    return vec4(y + 1.5748 * cr, y - 0.1873 * cb - 0.4681 * cr, y + 1.8556 * cb, 1.0);
+    return vec3(y + 1.5748 * cr, y - 0.1873 * cb - 0.4681 * cr, y + 1.8556 * cb);
 }
 
 // 8 full-intensity bars in SMPTE order.
@@ -64,7 +64,8 @@ fn grid(pos: vec2<f32>) -> vec4<f32> {
     var c: vec4<f32>;
     switch u.kind {
         case 0u: { c = a; }
-        case 1u: { c = yuv(a, b); }
+        case 1u: { c = vec4(yuv(a.r, b.r, b.g), 1.0); }
+        case 6u: { c = vec4(yuv(a.g, a.b, a.a), a.r); } // packed A Y Cb Cr, straight alpha
         case 2u: { c = bars(v.uv.x); }
         case 3u: { c = grid(v.pos.xy); }
         case 4u: { c = vec4(vec3(v.uv.x), 1.0); }
