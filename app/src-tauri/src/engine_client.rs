@@ -26,6 +26,42 @@ const MAX_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_CONNECT_FAILURES: u32 = 3;
 const STALE: Duration = Duration::from_secs(5);
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(10);
+/// An engine that dies this soon after its resync counts toward the crash-loop breaker...
+const QUICK_DEATH: Duration = Duration::from_secs(10);
+/// ...and one that ran this long resets it.
+const STABLE: Duration = Duration::from_secs(60);
+
+/// Crash-loop breaker (I5). An engine killed by what it is asked to play (a clip that crashes the
+/// decoder) dies right after every resync, and each death is a blackout. After two deaths within
+/// `QUICK_DEATH` of their resync, the next resync leaves PGM's media out.
+#[derive(Debug, Default)]
+pub struct Breaker {
+    resynced: Option<std::time::Instant>,
+    quick: u32,
+}
+
+impl Breaker {
+    pub fn resynced(&mut self, now: std::time::Instant) {
+        self.resynced = Some(now);
+    }
+
+    pub fn died(&mut self, now: std::time::Instant) {
+        match self.resynced.take().map(|t| now.saturating_duration_since(t)) {
+            Some(up) if up < QUICK_DEATH => self.quick += 1,
+            Some(up) if up >= STABLE => self.quick = 0,
+            _ => {}
+        }
+    }
+
+    /// Whether this resync must leave media out; true once per trip.
+    pub fn trip(&mut self) -> bool {
+        let tripped = self.quick >= 2;
+        if tripped {
+            self.quick = 0;
+        }
+        tripped
+    }
+}
 
 /// Where the frontend finds the engine's previews and thumbnails, and what it may do with it.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -111,6 +147,7 @@ pub struct Engine {
     stopping: AtomicBool,
     /// `engine.json`
     file: PathBuf,
+    breaker: Mutex<Breaker>,
 }
 
 impl Engine {
@@ -124,6 +161,7 @@ impl Engine {
             hold: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             file,
+            breaker: Mutex::new(Breaker::default()),
         };
         (engine, rx)
     }
@@ -199,6 +237,22 @@ impl Engine {
         true
     }
 
+    /// The current engine was adopted from an earlier controller (we don't know its PGM).
+    pub fn adopted(&self) -> bool {
+        self.adopted.load(Ordering::SeqCst)
+    }
+
+    /// App exit that keeps the outputs running (C1): spawn no other engine, leave this one and
+    /// `engine.json`, so the next controller adopts it.
+    pub fn detach(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        log!("engine: left running for the next controller to adopt");
+    }
+
+    fn breaker(&self) -> std::sync::MutexGuard<'_, Breaker> {
+        self.breaker.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Graceful app exit: stop the engine, forget it, spawn no other.
     pub fn shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
@@ -218,11 +272,13 @@ pub async fn supervise(app: AppHandle, mut rx: mpsc::UnboundedReceiver<ToEngine>
     let file = app.state::<Engine>().file.clone();
     if let Some(rec) = adoptable(&file, |port, token| async move { connect(port, &token).await }).await {
         let (_, why) = adopt(&app, &mut rx, rec).await;
+        app.state::<Engine>().breaker().died(std::time::Instant::now());
         restarting(&app, &why);
     }
     let mut delay = MIN_BACKOFF;
     while !app.state::<Engine>().stopping.load(Ordering::SeqCst) {
         let (connected, why) = run_engine(&app, &mut rx).await;
+        app.state::<Engine>().breaker().died(std::time::Instant::now());
         restarting(&app, &why);
         // A crash loop (e.g. the binary can't start) backs off to one try per 2 s.
         delay = if connected { MIN_BACKOFF } else { (delay * 2).min(MAX_BACKOFF) };
@@ -409,7 +465,10 @@ async fn session(
 ) -> End {
     let engine = app.state::<Engine>();
     let (mut sink, mut stream) = ws.split();
-    let resync: Vec<_> = crate::resync(app, rx).into_iter().filter(|m| engine.allowed(m)).collect();
+    let safe = engine.breaker().trip();
+    let resync: Vec<_> = crate::resync(app, rx, safe).into_iter().filter(|m| engine.allowed(m)).collect();
+    // Before sending: an engine that dies of the resync itself must count.
+    engine.breaker().resynced(std::time::Instant::now());
     let mut deadline = Instant::now() + STALE;
     for msg in &resync {
         if let Err(end) = send(&mut sink, msg, deadline).await {
@@ -508,6 +567,40 @@ mod tests {
         engine.release_hold();
         assert!(engine.allowed(&preview));
         assert!(!engine.allowed(&program), "never rewrite an adopted engine's PGM");
+    }
+
+    /// I5: two deaths within 10 s of their resync trip the breaker for one resync; a death after a
+    /// minute up resets the count; a death before any resync doesn't count.
+    #[test]
+    fn crash_loop_breaker() {
+        use std::time::Instant;
+        let t0 = Instant::now();
+        let s = |n: u64| t0 + Duration::from_secs(n);
+        let mut b = Breaker::default();
+        b.died(s(0));
+        assert!(!b.trip(), "died before it was ever resynced");
+        b.resynced(s(1));
+        b.died(s(3));
+        assert!(!b.trip(), "one quick death");
+        b.resynced(s(4));
+        b.died(s(6));
+        assert!(b.trip(), "two quick deaths: this resync leaves media out");
+        assert!(!b.trip(), "once per trip");
+        // 30 s up neither counts nor resets; a minute up resets.
+        b.resynced(s(10));
+        b.died(s(12));
+        b.resynced(s(13));
+        b.died(s(43));
+        b.resynced(s(44));
+        b.died(s(46));
+        assert!(b.trip(), "quick, 30 s, quick");
+        b.resynced(s(50));
+        b.died(s(52));
+        b.resynced(s(53));
+        b.died(s(120));
+        b.resynced(s(121));
+        b.died(s(123));
+        assert!(!b.trip(), "a stable minute in between resets the count");
     }
 
     #[test]

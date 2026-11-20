@@ -2,15 +2,19 @@
 //! method returns the messages that bring the engine in line; nothing here knows
 //! about Tauri or sockets.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tessera_show::{
-    EngineConfig, MediaItem, MediaKind, ProbeInfo, Scene, Show, ShowOp, ToEngine, next_cue_slot, take_merge,
+    Bus, EngineConfig, MediaItem, MediaKind, Playback, ProbeInfo, Scene, Show, ShowOp, Source, ToEngine, TransportAction,
+    next_cue_slot, resolve_shared, take_merge,
 };
 use uuid::Uuid;
 
 const UNDO_CAP: usize = 100;
+/// A Once clip this close to its end (or past it) at the last position report counts as ended.
+const ENDED_SLACK_MS: u64 = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +45,13 @@ pub struct Controller {
     pub pvw_scene: Scene,
     /// Edits to this cue go live (R32).
     pub last_taken: Option<CueRef>,
+    /// The show changed since it was last written (autosave or save).
+    pub dirty: bool,
+    /// The last Pause or Stop of each PGM media layer still on air (I4): a restarted engine plays
+    /// every clip, so the resync repeats them.
+    held: HashMap<Uuid, TransportAction>,
+    /// The engine's last reported position (ms) of each PGM layer.
+    positions: BTreeMap<Uuid, u64>,
 }
 
 fn scene_of(show: &Show, cue: Option<CueRef>) -> Option<&Scene> {
@@ -64,6 +75,11 @@ impl Controller {
 
     pub fn live(&self) -> Live {
         Live { pvw: self.pvw, last_taken: self.last_taken, program: self.pgm.clone() }
+    }
+
+    /// Something is on the outputs: a cue was taken, or PGM shows a layer.
+    pub fn on_air(&self) -> bool {
+        self.last_taken.is_some() || self.pgm.values().any(|layers| !layers.is_empty())
     }
 
     /// The show's render setup. Media paths are absolute: every path that enters is
@@ -92,6 +108,7 @@ impl Controller {
         };
         let before = self.show.clone();
         self.show.apply(op)?;
+        self.dirty = true;
         self.undo.push(before);
         if self.undo.len() > UNDO_CAP {
             self.undo.remove(0);
@@ -113,6 +130,7 @@ impl Controller {
             None => self.last_taken = None,
             Some(scene) if Some(scene) != taken.as_ref() => {
                 self.pgm = take_merge(&self.pgm, scene);
+                self.forget_gone();
                 out.push(ToEngine::SetProgram { scene: self.pgm.clone() });
             }
             Some(_) => {}
@@ -143,6 +161,7 @@ impl Controller {
             Some(prev) => {
                 let cur = std::mem::replace(&mut self.show, prev);
                 self.redo.push(cur);
+                self.dirty = true;
                 self.history_moved()
             }
             None => vec![],
@@ -154,6 +173,7 @@ impl Controller {
             Some(next) => {
                 let cur = std::mem::replace(&mut self.show, next);
                 self.undo.push(cur);
+                self.dirty = true;
                 self.history_moved()
             }
             None => vec![],
@@ -181,14 +201,96 @@ impl Controller {
     /// PVW cue to PGM with its transition; the PVW cue stays loaded.
     pub fn take(&mut self) -> Vec<ToEngine> {
         let Some(cue) = self.pvw else { return vec![] };
-        let Some(c) = self.show.groups.iter().find(|g| g.id == cue.group_id)
+        let Some(transition) = self.show.groups.iter().find(|g| g.id == cue.group_id)
             .and_then(|g| g.cues.iter().find(|c| c.slot == cue.slot))
+            .map(|c| c.transition.clone())
         else {
             return vec![];
         };
+        // Players PVW shares with PGM stay as they are (paused, stopped) under the new layer ids.
+        for (incoming, live) in resolve_shared(&self.pgm, &self.pvw_scene) {
+            if let Some(&action) = self.held.get(&live) {
+                self.held.insert(incoming, action);
+            }
+        }
         self.pgm = take_merge(&self.pgm, &self.pvw_scene);
+        self.forget_gone();
         self.last_taken = Some(cue);
-        vec![ToEngine::Take { transition: c.transition.clone() }]
+        vec![ToEngine::Take { transition }]
+    }
+
+    /// A transport command, remembered for PGM (I4): Pause/Stop until Play/Restart.
+    pub fn transport(&mut self, bus: Bus, layer: Option<Uuid>, action: TransportAction) -> Vec<ToEngine> {
+        if bus == Bus::Pgm {
+            let all: Vec<Uuid> = match layer {
+                Some(id) => vec![id],
+                None => self.pgm.values().flatten().filter(|l| matches!(l.source, Source::Media { .. })).map(|l| l.id).collect(),
+            };
+            for id in all {
+                match action {
+                    TransportAction::Pause | TransportAction::Stop => _ = self.held.insert(id, action),
+                    TransportAction::Play | TransportAction::Restart => _ = self.held.remove(&id),
+                }
+            }
+        }
+        vec![ToEngine::Transport { bus, layer, action }]
+    }
+
+    /// The engine's `Positions` report: kept for PGM layers (a layer it no longer plays keeps its
+    /// last position).
+    pub fn positions(&mut self, positions: &BTreeMap<Uuid, u64>) {
+        let on_pgm = |id: &Uuid| self.pgm.values().flatten().any(|l| l.id == *id);
+        let report: Vec<_> = positions.iter().filter(|(id, _)| on_pgm(id)).map(|(id, ms)| (*id, *ms)).collect();
+        self.forget_gone();
+        self.positions.extend(report);
+    }
+
+    /// Drops transport and position state of layers no longer on PGM.
+    fn forget_gone(&mut self) {
+        let ids: std::collections::HashSet<Uuid> = self.pgm.values().flatten().map(|l| l.id).collect();
+        self.held.retain(|id, _| ids.contains(id));
+        self.positions.retain(|id, _| ids.contains(id));
+    }
+
+    /// PGM as a restarted engine should get it: without Once clips that had ended (they'd play
+    /// again on air); everything else starts from its first frame.
+    fn resync_program(&self) -> Scene {
+        let ended = |l: &tessera_show::Layer| {
+            let Source::Media { media_id } = l.source else { return false };
+            let duration = self.show.media.iter().find(|m| m.id == media_id).and_then(|m| m.duration_ms);
+            l.playback == Playback::Once
+                && duration.zip(self.positions.get(&l.id)).is_some_and(|(d, &pos)| pos + ENDED_SLACK_MS >= d)
+        };
+        self.pgm.iter().map(|(s, layers)| (*s, layers.iter().filter(|l| !ended(l)).cloned().collect())).collect()
+    }
+
+    /// Crash-loop fallback (I5): PGM keeps only its pattern layers, PVW empties (its cue may be
+    /// what kills the engine, and a Take must not put a stripped copy on air). Returns what was
+    /// dropped, for the operator.
+    pub fn drop_media(&mut self) -> Vec<String> {
+        let show = &self.show;
+        let describe = |l: &tessera_show::Layer, media_id: Uuid| {
+            let path = show.media.iter().find(|m| m.id == media_id).map_or("missing media", |m| m.path.as_str());
+            if l.name.is_empty() { path.to_string() } else { format!("“{}” ({path})", l.name) }
+        };
+        let mut dropped = vec![];
+        for layers in self.pgm.values_mut() {
+            layers.retain(|l| match l.source {
+                Source::Media { media_id } => {
+                    dropped.push(format!("PGM {}", describe(l, media_id)));
+                    false
+                }
+                Source::Pattern { .. } => true,
+            });
+        }
+        for l in self.pvw_scene.values().flatten() {
+            if let Source::Media { media_id } = l.source {
+                dropped.push(format!("PVW {}", describe(l, media_id)));
+            }
+        }
+        (self.pvw, self.pvw_scene) = (None, Scene::new());
+        self.forget_gone();
+        dropped
     }
 
     /// The next occupied slot after the PVW cue (first group's first cue when PVW is empty).
@@ -204,14 +306,20 @@ impl Controller {
         }
     }
 
-    /// Everything a freshly (re)started engine needs, in order.
+    /// Everything a freshly (re)started engine needs, in order. Clips restart from their first
+    /// frame; paused and stopped ones are paused/stopped again (a Transport cancels the pending
+    /// start), and ended Once clips stay off (I4).
     pub fn resync_messages(&self) -> Vec<ToEngine> {
-        vec![
-            ToEngine::SetConfig { config: self.engine_config() },
-            ToEngine::SetProgram { scene: self.pgm.clone() },
-            ToEngine::SetPreview { scene: self.pvw_scene.clone() },
-            ToEngine::SetMasterVolume { volume: self.show.master_volume },
-        ]
+        let program = self.resync_program();
+        let on = |id: &Uuid| program.values().flatten().any(|l| l.id == *id);
+        let mut held: Vec<_> = self.held.iter().filter(|(id, _)| on(id)).collect();
+        held.sort_by_key(|(id, _)| **id); // deterministic order
+        let transports = held.into_iter().map(|(id, action)| ToEngine::Transport { bus: Bus::Pgm, layer: Some(*id), action: *action });
+        let mut out = vec![ToEngine::SetConfig { config: self.engine_config() }, ToEngine::SetProgram { scene: program.clone() }];
+        out.extend(transports);
+        out.push(ToEngine::SetPreview { scene: self.pvw_scene.clone() });
+        out.push(ToEngine::SetMasterVolume { volume: self.show.master_volume });
+        out
     }
 
     /// Add media (one undo step) and ask the engine to probe each item.
@@ -244,6 +352,8 @@ impl Controller {
     /// snapshots too, so undoing an unrelated edit doesn't forget it.
     pub fn probed(&mut self, media_id: Uuid, info: ProbeInfo) -> Vec<ToEngine> {
         let config = self.engine_config();
+        // Only a change to the show itself is unsaved work (M1): not one to an undo snapshot.
+        let before = self.show.media.iter().find(|m| m.id == media_id).cloned();
         for show in std::iter::once(&mut self.show).chain(&mut self.undo).chain(&mut self.redo) {
             if let Some(m) = show.media.iter_mut().find(|m| m.id == media_id) {
                 m.kind = info.kind.clone();
@@ -255,12 +365,15 @@ impl Controller {
                 m.thumb = info.thumb.clone();
             }
         }
+        self.dirty |= before.as_ref() != self.show.media.iter().find(|m| m.id == media_id);
         if self.engine_config() == config { vec![] } else { vec![ToEngine::SetConfig { config: self.engine_config() }] }
     }
 
-    /// Replace the show (opened from disk). History and PVW clear; PGM keeps running.
+    /// Replace the show (opened from disk). History and PVW clear; PGM keeps running, and so does
+    /// what the resync must know about it.
     pub fn open(&mut self, show: Show, path: Option<PathBuf>) -> Vec<ToEngine> {
-        *self = Controller { show, path, pgm: std::mem::take(&mut self.pgm), ..Controller::default() };
+        let (pgm, held, positions) = (std::mem::take(&mut self.pgm), std::mem::take(&mut self.held), std::mem::take(&mut self.positions));
+        *self = Controller { show, path, pgm, held, positions, ..Controller::default() };
         vec![
             ToEngine::SetConfig { config: self.engine_config() },
             ToEngine::SetPreview { scene: Scene::new() },
@@ -273,6 +386,15 @@ impl Controller {
 mod tests {
     use super::*;
     use tessera_show::{Layer, MediaKind, Pattern, Rect, Screen, Source, Transition, TransitionKind, Cue};
+
+    fn item(duration_ms: Option<u64>) -> MediaItem {
+        let id = Uuid::new_v4();
+        MediaItem { id, name: "m".into(), path: format!("/media/{id}.mp4"), kind: MediaKind::Video, width: 10, height: 10,
+            duration_ms, has_audio: false, has_alpha: false, thumb: None }
+    }
+    fn clip(media: &MediaItem, playback: Playback) -> Layer {
+        Layer { playback, name: "clip".into(), ..Layer::new(Source::Media { media_id: media.id }, rect()) }
+    }
 
     fn rect() -> Rect { Rect { x: 0., y: 0., w: 10., h: 10. } }
     fn layer() -> Layer { Layer::new(Source::Pattern { pattern: Pattern::Bars }, rect()) }
@@ -484,6 +606,103 @@ mod tests {
             ToEngine::SetPreview { scene: Scene::from([(s.id, vec![])]) },
             ToEngine::SetMasterVolume { volume: 0.5 },
         ]);
+    }
+
+    /// I4: a restarted engine gets PGM as it was: ended Once clips left out, paused and stopped
+    /// clips paused/stopped again; Play/Restart forget it; a player shared across a Take keeps it.
+    #[test]
+    fn resync_restores_transport_state() {
+        let mut c = Controller::new();
+        let s = screen().id;
+        let (short, long) = (item(Some(1000)), item(Some(60_000)));
+        c.apply(ShowOp::AddMedia { items: vec![short.clone(), long.clone()] }).unwrap();
+        let (bg, once, bars) = (clip(&long, Playback::Loop), clip(&short, Playback::Once), layer());
+        set_cue(&mut c, 1, Scene::from([(s, vec![bg.clone(), once.clone(), bars.clone()])]));
+        c.load_cue(at(&c, 1)).unwrap();
+        c.take();
+        let program = |msgs: &[ToEngine]| match &msgs[1] { ToEngine::SetProgram { scene } => scene.clone(), m => panic!("{m:?}") };
+        let transports = |msgs: &[ToEngine]| -> Vec<(Option<Uuid>, TransportAction)> {
+            msgs.iter().filter_map(|m| match m { ToEngine::Transport { bus: Bus::Pgm, layer, action } => Some((*layer, *action)), _ => None }).collect()
+        };
+        c.positions(&BTreeMap::from([(bg.id, 400), (once.id, 950), (Uuid::new_v4(), 7)]));
+        assert_eq!(c.transport(Bus::Pgm, Some(bg.id), TransportAction::Pause), vec![ToEngine::Transport { bus: Bus::Pgm, layer: Some(bg.id), action: TransportAction::Pause }]);
+        c.transport(Bus::Pvw, Some(once.id), TransportAction::Stop); // PVW: not remembered
+        let msgs = c.resync_messages();
+        assert_eq!(program(&msgs), Scene::from([(s, vec![bg.clone(), bars.clone()])]), "the ended Once clip stays off");
+        assert_eq!(transports(&msgs), [(Some(bg.id), TransportAction::Pause)]);
+        assert!(matches!(msgs[2], ToEngine::Transport { .. }) && matches!(msgs[3], ToEngine::SetPreview { .. }), "right after SetProgram");
+        // Opening a show keeps PGM running, and what the resync knows about it.
+        c.open(c.show.clone(), None);
+        assert_eq!(transports(&c.resync_messages()), [(Some(bg.id), TransportAction::Pause)]);
+        // Play on every PGM layer forgets it; a Once clip short of its end comes back.
+        c.transport(Bus::Pgm, None, TransportAction::Play);
+        c.positions(&BTreeMap::from([(once.id, 500)]));
+        let msgs = c.resync_messages();
+        assert_eq!(program(&msgs), c.pgm);
+        assert!(transports(&msgs).is_empty());
+        // Stop everything, then take a cue whose first layer shares bg's player (same screen,
+        // media, index): the stop follows it to the new layer id; the rest left PGM.
+        c.transport(Bus::Pgm, None, TransportAction::Stop);
+        let bg2 = clip(&long, Playback::Loop);
+        set_cue(&mut c, 2, Scene::from([(s, vec![bg2.clone()])]));
+        c.load_cue(at(&c, 2)).unwrap();
+        c.take();
+        assert_eq!(transports(&c.resync_messages()), [(Some(bg2.id), TransportAction::Stop)]);
+        c.transport(Bus::Pgm, Some(bg2.id), TransportAction::Restart);
+        assert!(transports(&c.resync_messages()).is_empty());
+    }
+
+    /// I5: after a crash loop the resync keeps PGM's patterns only, and PVW empties.
+    #[test]
+    fn drop_media_keeps_patterns_and_clears_pvw() {
+        let mut c = Controller::new();
+        let s = screen().id;
+        let m = item(Some(5000));
+        c.apply(ShowOp::AddMedia { items: vec![m.clone()] }).unwrap();
+        let (bg, bars) = (clip(&m, Playback::Loop), layer());
+        set_cue(&mut c, 1, Scene::from([(s, vec![bg.clone(), bars.clone()])]));
+        set_cue(&mut c, 2, Scene::from([(s, vec![clip(&m, Playback::Loop)])]));
+        c.load_cue(at(&c, 1)).unwrap();
+        c.take();
+        c.load_cue(at(&c, 2)).unwrap();
+        c.transport(Bus::Pgm, Some(bg.id), TransportAction::Pause);
+        let dropped = c.drop_media();
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+        assert!(dropped[0].starts_with("PGM “clip”") && dropped[0].contains(&m.path), "{dropped:?}");
+        assert!(dropped[1].starts_with("PVW") && dropped[1].contains(&m.path), "{dropped:?}");
+        assert_eq!((c.pvw, c.pvw_scene.clone(), c.pgm.clone()), (None, Scene::new(), Scene::from([(s, vec![bars])])));
+        assert_eq!(c.resync_messages()[1..3], [ToEngine::SetProgram { scene: c.pgm.clone() }, ToEngine::SetPreview { scene: Scene::new() }]);
+        assert!(c.on_air(), "patterns and the taken cue are still on air");
+    }
+
+    /// M1: only changes to the show are unsaved work.
+    #[test]
+    fn dirty_tracks_show_changes() {
+        let mut c = Controller::new();
+        assert!(!c.dirty && !c.on_air());
+        let info = || ProbeInfo { kind: MediaKind::Video, width: 64, height: 32, duration_ms: Some(1000), has_audio: false,
+            has_alpha: false, thumb: None };
+        c.probed(Uuid::new_v4(), info());
+        assert!(!c.dirty, "a probe of media the show doesn't have");
+        c.import_media(&[PathBuf::from("/shows/a.mov")]).unwrap();
+        assert!(c.dirty);
+        let id = c.show.media[0].id;
+        c.dirty = false;
+        c.probed(id, info());
+        assert!(c.dirty, "a probe that fills in an item");
+        c.dirty = false;
+        c.probed(id, info());
+        assert!(!c.dirty, "the same probe again");
+        set_cue(&mut c, 1, Scene::new());
+        c.dirty = false;
+        c.load_cue(at(&c, 1)).unwrap();
+        c.take();
+        c.transport(Bus::Pgm, None, TransportAction::Pause);
+        assert!(!c.dirty && c.on_air(), "bus moves aren't show changes");
+        c.undo();
+        assert!(c.dirty);
+        c.open(Show::new(), None);
+        assert!(!c.dirty);
     }
 
     #[test]

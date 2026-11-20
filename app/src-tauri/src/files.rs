@@ -76,7 +76,8 @@ pub fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<(), Stri
 
 /// Unsaved work from an earlier session, moved to `<autosave>.prev` so this session's
 /// autosaves can't overwrite it: the untitled autosave, or `<show>.autosave` when it is newer
-/// than the show file. Returns where it went.
+/// than the show file. An older `.prev` is never overwritten (I8): the work goes to
+/// `<autosave>.<unix ms>.prev` then. Returns where it went (the newest).
 pub fn take_recovery(show_path: Option<&Path>, data_dir: &Path) -> Option<PathBuf> {
     let auto = autosave_path(show_path, data_dir);
     let auto_time = std::fs::metadata(&auto).and_then(|m| m.modified()).ok()?;
@@ -86,9 +87,20 @@ pub fn take_recovery(show_path: Option<&Path>, data_dir: &Path) -> Option<PathBu
     if saved_since {
         return None;
     }
-    let prev = suffixed(&auto, ".prev");
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+    let prev = std::iter::once(suffixed(&auto, ".prev"))
+        .chain((0..).map(|n| suffixed(&auto, &if n == 0 { format!(".{ms}.prev") } else { format!(".{ms}-{n}.prev") })))
+        .find(|p| !p.exists())?;
+    // ponytail: exists-then-rename can race another instance; the single-instance guard (I7) rules that out.
     std::fs::rename(&auto, &prev).ok()?;
     Some(prev)
+}
+
+/// An autosave or a kept one (`….autosave`, `….autosave.prev`, `….autosave.<time>.prev`): it opens
+/// as untitled work, never as the show it came from.
+pub fn is_autosave(p: &Path) -> bool {
+    let name = p.file_name().unwrap_or_default().to_string_lossy();
+    name.ends_with(".autosave") || (name.ends_with(".prev") && name.contains(".autosave."))
 }
 
 /// `p` with `.` and `..` resolved lexically (no filesystem access; symlinks are not followed).
@@ -296,6 +308,34 @@ mod tests {
         let prev = take_recovery(None, &data).unwrap();
         assert_eq!(prev, data.join("untitled.tshow.autosave.prev"));
         assert!(!auto.exists() && prev.exists());
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    /// I8: a later session's unsaved work never overwrites an earlier one's: both are kept, the
+    /// newest is the one offered.
+    #[test]
+    fn recovery_never_overwrites_prev() {
+        let data = temp_dir();
+        let auto = autosave_path(None, &data);
+        let mut kept = vec![];
+        for volume in [0.1, 0.2, 0.3] {
+            let mut show = Show::new();
+            show.master_volume = volume;
+            save_atomic(&auto, &show).unwrap();
+            let prev = take_recovery(None, &data).expect("recoverable");
+            assert!(is_autosave(&prev), "{}", prev.display());
+            kept.push((prev, show));
+        }
+        assert_eq!(kept[0].0, data.join("untitled.tshow.autosave.prev"));
+        let name = kept[1].0.file_name().unwrap().to_string_lossy().into_owned();
+        let stamp = name.strip_prefix("untitled.tshow.autosave.").and_then(|n| n.strip_suffix(".prev"));
+        assert!(stamp.is_some_and(|t| t.chars().all(|c| c.is_ascii_digit() || c == '-')), "{name}");
+        for (prev, show) in &kept {
+            assert_eq!(&open(prev).unwrap(), show, "{}", prev.display());
+        }
+        assert_ne!(kept[1].0, kept[2].0);
+        assert!(!is_autosave(Path::new("/s/show.tshow")) && !is_autosave(Path::new("/s/prev.prev")));
+        assert!(is_autosave(Path::new("/s/show.tshow.autosave")));
         std::fs::remove_dir_all(data).unwrap();
     }
 
