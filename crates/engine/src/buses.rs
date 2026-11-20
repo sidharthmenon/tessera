@@ -177,13 +177,16 @@ impl<O: Opener> Buses<O> {
 
     /// Loads PVW. A media layer reuses the PGM player at the same (screen, media, index), so PVW
     /// shows continuity and Take never restarts it; else its own PVW player (kept by layer id
-    /// across PVW edits); else a new player, paused on its first frame until Take.
+    /// across PVW edits) unless that one is live, since after a Take PVW holds PGM's players and a
+    /// live player is shared only by that match; else a new player, paused on its first frame
+    /// until Take.
     pub fn set_preview(&mut self, scene: Scene) {
         let shared = resolve_shared(&self.pgm.scene, &scene);
         let mut players = HashMap::new();
         for layer in scene.values().flatten() {
             let Source::Media { media_id } = layer.source else { continue };
-            let reuse = [shared.get(&layer.id).and_then(|id| self.pgm.players.get(id)), self.pvw.players.get(&layer.id)];
+            let own = self.pvw.players.get(&layer.id).filter(|h| !self.live(h));
+            let reuse = [shared.get(&layer.id).and_then(|id| self.pgm.players.get(id)), own];
             let reuse = reuse.into_iter().flatten().find(|h| fits(h, layer)).cloned();
             if let Some(h) = reuse.or_else(|| self.open(media_id, layer)) {
                 players.insert(layer.id, h);
@@ -327,9 +330,10 @@ impl<O: Opener> Buses<O> {
         Some((o.kind.clone(), o.progress(now)))
     }
 
-    /// PGM's audio, refilled into `out`: each player once, at its layer volume; invisible layers
-    /// muted, PVW silent. During a transition outgoing-only players fade by (1 − p), incoming-only
-    /// by p; shared ones stay at full.
+    /// PGM's audio, refilled into `out`: each player once, at its layer volume. During a transition
+    /// outgoing-only players fade by (1 − p), incoming-only by p; shared ones stay at full. Every
+    /// other player (invisible layers, PVW) is listed at gain 0: silent, but still drained, since a
+    /// playing player's tap left out of the mix fills to 1 s and would come back that far behind.
     pub fn audio_taps(&mut self, now: Instant, out: &mut Vec<(AudioTap, f32)>) {
         self.gains(now);
         out.clear();
@@ -356,6 +360,9 @@ impl<O: Opener> Buses<O> {
                     push_once(&mut self.gains, h, layer.volume * (1. - p));
                 }
             }
+        }
+        for h in &self.pool.players {
+            push_once(&mut self.gains, h, 0.);
         }
     }
 
@@ -507,7 +514,6 @@ mod tests {
 
     const PERIOD: Duration = Duration::from_millis(16);
 
-    #[derive(Default)]
     struct Fake {
         media: Uuid,
         playing: bool,
@@ -515,6 +521,7 @@ mod tests {
         failed: bool,
         error: Option<String>,
         stops: u32,
+        tap: AudioTap,
     }
 
     impl Media for Fake {
@@ -542,7 +549,7 @@ mod tests {
             0
         }
         fn audio(&self) -> Option<AudioTap> {
-            None
+            Some(self.tap.clone())
         }
     }
 
@@ -567,7 +574,8 @@ mod tests {
             }
             let failed = self.broken.contains(&media);
             let error = failed.then(|| format!("{}: decode error", path(media)));
-            Ok(Fake { media, ready: !self.slow.contains(&media), failed, error, ..Fake::default() })
+            let (ready, tap) = (!self.slow.contains(&media), AudioTap::new((48_000, 2)));
+            Ok(Fake { media, playing: false, ready, failed, error, stops: 0, tap })
         }
     }
 
@@ -866,6 +874,67 @@ mod tests {
     }
 
     #[test]
+    fn pvw_edit_never_borrows_live_player() {
+        // After a Take PVW holds PGM's players; a PVW edit that breaks (screen, media, index) must
+        // get its own paused player, not keep the live one under the same layer id.
+        let [a, s, m1, m2] = ids();
+        let t0 = Instant::now();
+        let mut b = buses();
+        let bg = clip(m1);
+        b.set_preview(Scene::from([(a, vec![bg.clone()])]));
+        b.take(&cut(), t0);
+        let live = pgm(&b, &bg);
+        b.set_preview(Scene::from([(a, vec![bg.clone()])]));
+        assert!(Arc::ptr_eq(&pvw(&b, &bg), &live), "unchanged: shared");
+        b.set_preview(Scene::from([(s, vec![bg.clone()])]));
+        assert!(!Arc::ptr_eq(&pvw(&b, &bg), &live) && !playing(&pvw(&b, &bg)), "moved to another screen: new, paused");
+        b.set_preview(Scene::from([(a, vec![bg.clone()])]));
+        assert!(Arc::ptr_eq(&pvw(&b, &bg), &live), "back in place: shared again");
+        b.set_preview(Scene::from([(a, vec![clip(m2), bg.clone()])]));
+        let fresh = pvw(&b, &bg);
+        assert!(!Arc::ptr_eq(&fresh, &live) && !playing(&fresh), "a layer inserted below: new, paused");
+        assert!(playing(&live), "the live one plays on");
+        let old = Arc::downgrade(&live);
+        drop(live);
+        b.take(&cut(), t0 + ms(100));
+        assert!(Arc::ptr_eq(&pgm(&b, &bg), &fresh) && playing(&fresh), "the Take starts it from the top");
+        assert!(old.upgrade().is_none());
+    }
+
+    #[test]
+    fn muted_taps_keep_draining() {
+        // A playing player left out of the mixer's list fills its tap to 1 s and comes back that
+        // far behind, so hidden and PVW-only players are listed at gain 0 (silent, still drained).
+        let [a, m1, m2, m3] = ids();
+        let t0 = Instant::now();
+        let mut b = buses();
+        let (shown, mut hidden, cued) = (clip(m1), clip(m2), clip(m3));
+        hidden.visible = false;
+        b.set_program(Scene::from([(a, vec![shown.clone(), hidden.clone()])]), t0);
+        b.set_preview(Scene::from([(a, vec![cued.clone()])]));
+        b.transport(Bus::Pvw, None, TransportAction::Play, t0);
+        // Tell the taps apart by how much each holds.
+        let taps = [(pgm(&b, &shown), 10), (pgm(&b, &hidden), 20), (pvw(&b, &cued), 30)];
+        for (h, n) in &taps {
+            let fake = lock(h);
+            fake.media.tap.push(0, &vec![0.5; *n]);
+            fake.media.tap.set_playing(true);
+        }
+        let mut out = vec![];
+        b.audio_taps(t0, &mut out);
+        let mut listed: Vec<(usize, f32)> = out.iter().map(|(tap, gain)| (tap.buffered(), *gain)).collect();
+        listed.sort_by_key(|(n, _)| *n);
+        assert_eq!(listed, [(10, 1.), (20, 0.), (30, 0.)], "hidden and PVW-only listed, muted");
+        let mut mix = [0.; 4];
+        for (tap, gain) in &out {
+            tap.mix(&mut mix, *gain);
+        }
+        assert_eq!(mix, [0.5; 4], "only the shown layer is heard");
+        let drained: Vec<usize> = taps.iter().map(|(h, _)| lock(h).media.tap.buffered()).collect();
+        assert_eq!(drained, [6, 16, 26], "every playing tap keeps draining");
+    }
+
+    #[test]
     fn audio_gains_follow_transition() {
         let [a, s, m1, m2, m3, m4, m5] = ids();
         let t0 = Instant::now();
@@ -886,13 +955,17 @@ mod tests {
         assert_eq!(gain(&b, &pgm(&b, &inc)), [0.5 * 0.25], "incoming only: × p");
         assert_eq!(gain(&b, &out_player), [0.8 * 0.75], "outgoing only: × (1 − p)");
         assert_eq!(gain(&b, &pgm(&b, &kept)), [1.], "unchanged screen");
-        assert_eq!(gain(&b, &pgm(&b, &hidden)), [] as [f32; 0], "invisible: muted");
-        assert_eq!(b.gains.len(), 4);
+        assert_eq!(gain(&b, &pgm(&b, &hidden)), [0.], "invisible: muted");
+        assert_eq!(b.gains.len(), 5);
+        // The test's clones would keep it in the pool (`audio_taps` drains `gains` at once).
+        drop(out_player);
+        b.gains.clear();
         b.tick(t0 + ms(1000), PERIOD);
         b.gains(t0 + ms(1000));
-        assert_eq!(b.gains.len(), 3, "the outgoing layer is gone at the end");
-        b.set_preview(Scene::from([(a, vec![clip(Uuid::new_v4())])]));
+        assert_eq!(b.gains.len(), 4, "the outgoing layer is gone at the end");
+        let pvw_only = clip(Uuid::new_v4());
+        b.set_preview(Scene::from([(a, vec![pvw_only.clone()])]));
         b.gains(t0 + ms(1000));
-        assert_eq!(b.gains.len(), 3, "PVW is silent");
+        assert_eq!(gain(&b, &pvw(&b, &pvw_only)), [0.], "PVW is silent");
     }
 }
