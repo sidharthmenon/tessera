@@ -1,156 +1,96 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+  import '../app.css';
+  import { onMount } from 'svelte';
+  import { hotkey, typingIn, type Hotkey } from '$lib/logic';
+  import { init, loadNext, redo, saveShow, take, ui, undo } from '$lib/store.svelte';
+  import Prompt from '$lib/Prompt.svelte';
+  import Canvas from '$lib/panels/Canvas.svelte';
+  import CueGrid from '$lib/panels/CueGrid.svelte';
+  import OutputMonitor from '$lib/panels/OutputMonitor.svelte';
+  import Properties from '$lib/panels/Properties.svelte';
+  import Resources from '$lib/panels/Resources.svelte';
+  import StatusBar from '$lib/panels/StatusBar.svelte';
+  import Toolbar from '$lib/panels/Toolbar.svelte';
+  import Transport from '$lib/panels/Transport.svelte';
+  import ScreenManager from '$lib/screens/ScreenManager.svelte';
 
-  let name = $state("");
-  let greetMsg = $state("");
+  onMount(() => {
+    const ready = init();
+    return () => void ready.then((off) => off());
+  });
 
-  async function greet(event: Event) {
-    event.preventDefault();
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsg = await invoke("greet", { name });
+  const actions: Record<Hotkey, () => unknown> = {
+    take,
+    next: loadNext,
+    undo,
+    redo,
+    save: () => saveShow(),
+    saveAs: () => saveShow(true),
+  };
+
+  function onkeydown(e: KeyboardEvent) {
+    const focus = document.activeElement as HTMLInputElement | null;
+    if (typingIn(focus)) {
+      if (e.key === 'Escape') focus?.blur(); // back to the show keys
+      return;
+    }
+    if (ui.modal) return;
+    const key = hotkey(e);
+    if (!key) return;
+    e.preventDefault(); // also keeps Space from clicking a focused button
+    if (e.repeat && key !== 'undo' && key !== 'redo') return; // a held Space is one GO
+    actions[key]();
   }
 </script>
 
-<main class="container">
-  <h1>Welcome to Tauri + Svelte</h1>
+<svelte:window
+  {onkeydown}
+  ondragover={(e) => e.preventDefault()}
+  ondrop={(e) => e.preventDefault()}
+/>
 
-  <div class="row">
-    <a href="https://vite.dev" target="_blank">
-      <img src="/vite.svg" class="logo vite" alt="Vite Logo" />
-    </a>
-    <a href="https://tauri.app" target="_blank">
-      <img src="/tauri.svg" class="logo tauri" alt="Tauri Logo" />
-    </a>
-    <a href="https://svelte.dev" target="_blank">
-      <img src="/svelte.svg" class="logo svelte-kit" alt="SvelteKit Logo" />
-    </a>
-  </div>
-  <p>Click on the Tauri, Vite, and SvelteKit logos to learn more.</p>
+<div class="app">
+  <Toolbar />
+  <Resources />
+  <Canvas />
+  <aside class="side">
+    <OutputMonitor />
+    <Properties />
+  </aside>
+  <Transport />
+  <CueGrid />
+  <StatusBar />
+</div>
 
-  <form class="row" onsubmit={greet}>
-    <input id="greet-input" placeholder="Enter a name..." bind:value={name} />
-    <button type="submit">Greet</button>
-  </form>
-  <p>{greetMsg}</p>
-</main>
+{#if ui.modal === 'screens'}
+  <ScreenManager onclose={() => (ui.modal = null)} />
+{:else if ui.modal === 'prompt' && ui.prompt}
+  <Prompt />
+{/if}
 
 <style>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.svelte-kit:hover {
-  filter: drop-shadow(0 0 2em #ff3e00);
-}
-
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
-}
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
+  .app {
+    display: grid;
+    height: 100vh;
+    grid-template-columns: 250px minmax(0, 1fr) 300px;
+    grid-template-rows: auto minmax(0, 1fr) auto minmax(150px, 30vh) auto;
+    grid-template-areas:
+      'tool tool tool'
+      'res canvas side'
+      'transport transport transport'
+      'cues cues cues'
+      'status status status';
+    gap: 0;
   }
-
-  a:hover {
-    color: #24c8db;
+  .app > :global(.panel) {
+    margin: 4px;
   }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
+  .side {
+    grid-area: side;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 4px;
+    min-height: 0;
   }
-  button:active {
-    background-color: #0f0f0f69;
-  }
-}
-
 </style>

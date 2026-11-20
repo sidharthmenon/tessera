@@ -4,7 +4,8 @@
 //! - `show-changed`: the full `Show`, after every show mutation
 //! - `live-changed`: `Live { pvw, lastTaken }` (cue refs or null), after every command that may move them
 //! - `engine-event`: every `FromEngine`, plus `Error`s about engine restarts
-//! - `engine-info`: `EngineInfo { port, token }` on connect, `null` on disconnect
+//! - `engine-info`: `EngineInfo { port, token, adopted, held }` on connect and when a show is
+//!   loaded (which releases the hold), `null` on disconnect
 //! - `recovery-available`: path of unsaved work from an earlier session (also `get_recovery`)
 
 /// `eprintln!` that never panics: stderr may be a pipe whose reader is gone (a closed
@@ -182,7 +183,7 @@ fn import_media(app: AppHandle, paths: Vec<PathBuf>) -> Res<()> {
 #[tauri::command]
 fn open_show(app: AppHandle, path: PathBuf) -> Res<()> {
     let show = files::open(&path)?;
-    app.state::<Engine>().release_hold(); // an adopted engine may take this show
+    release_hold(&app);
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let titled = !(name.ends_with(".autosave") || name.ends_with(".autosave.prev"));
     let state = app.state::<AppState>();
@@ -193,6 +194,20 @@ fn open_show(app: AppHandle, path: PathBuf) -> Res<()> {
         let _ = app.emit("recovery-available", prev);
     }
     Ok(())
+}
+
+/// A fresh untitled show. Like `open_show`: history and PVW clear, PGM keeps running.
+#[tauri::command]
+fn new_show(app: AppHandle) -> Res<()> {
+    release_hold(&app);
+    dispatch(&app, Change::Load, |c| Ok(c.open(Show::new(), None)))
+}
+
+/// The operator loaded a show: an adopted engine may take it now (R35). Tell the UI.
+fn release_hold(app: &AppHandle) {
+    let engine = app.state::<Engine>();
+    engine.release_hold();
+    let _ = app.emit("engine-info", engine.info());
 }
 
 /// Unsaved work from an earlier session (`*.autosave.prev`), if any: offer `open_show` on it.
@@ -242,7 +257,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_show, get_live, apply_op, undo, redo, load_cue, take, load_next, transport, list_monitors,
-            identify, import_media, open_show, get_recovery, save_show, engine_info
+            identify, import_media, new_show, open_show, get_recovery, save_show, engine_info
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

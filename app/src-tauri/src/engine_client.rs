@@ -27,11 +27,15 @@ const MAX_CONNECT_FAILURES: u32 = 3;
 const STALE: Duration = Duration::from_secs(5);
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Where the frontend finds the engine's previews and thumbnails.
+/// Where the frontend finds the engine's previews and thumbnails, and what it may do with it.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct EngineInfo {
     pub port: u16,
     pub token: String,
+    /// Adopted from an earlier controller: its PGM is never rewritten (R35). Set by `info()`.
+    pub adopted: bool,
+    /// Adopted and no show opened yet: only requests reach it. Set by `info()`.
+    pub held: bool,
 }
 
 /// 32 random bytes as hex.
@@ -147,7 +151,8 @@ impl Engine {
     }
 
     pub fn info(&self) -> Option<EngineInfo> {
-        self.info.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        let info = self.info.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+        Some(EngineInfo { adopted: self.adopted.load(Ordering::SeqCst), held: self.hold.load(Ordering::SeqCst), ..info })
     }
 
     /// Kill the engine process (if any) and wait for it. `unreaped`: also SIGKILL it by pid
@@ -202,8 +207,8 @@ impl Engine {
     }
 
     fn set_info(&self, app: &AppHandle, info: Option<EngineInfo>) {
-        *self.info.lock().unwrap_or_else(|e| e.into_inner()) = info.clone();
-        let _ = app.emit("engine-info", info);
+        *self.info.lock().unwrap_or_else(|e| e.into_inner()) = info;
+        let _ = app.emit("engine-info", self.info());
     }
 }
 
@@ -309,7 +314,7 @@ async fn drive(
     exited: &mut watch::Receiver<bool>,
 ) -> (bool, String) {
     let engine = app.state::<Engine>();
-    let info = EngineInfo { port, token };
+    let info = EngineInfo { port, token, adopted: false, held: false };
     let (mut failures, mut backoff, mut connected) = (0, MIN_BACKOFF, false);
     loop {
         let attempt = tokio::select! {
