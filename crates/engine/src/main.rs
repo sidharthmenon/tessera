@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use tessera_engine::app::{App, event_loop};
+use tessera_engine::log;
 use tessera_engine::net::{self, Previews};
 use tessera_show::{
     EngineConfig, FromEngine, Layer, Mapping, MediaItem, MediaKind, Output, OutputTarget, Pattern, Rect, Scene, Screen, Source,
@@ -83,7 +84,7 @@ fn main() -> anyhow::Result<()> {
     std::thread::spawn(move || {
         for event in replies {
             if !matches!(event, FromEngine::Positions { .. }) {
-                eprintln!("engine -> {event:?}");
+                log!("engine -> {event:?}");
             }
             let _ = to_clients.send(event); // no clients connected: dropped
         }
@@ -93,9 +94,14 @@ fn main() -> anyhow::Result<()> {
     let listen = SocketAddr::from((Ipv4Addr::LOCALHOST, args.port));
     let addr = net::serve(listen, token.clone(), handle.clone(), clients, previews.clone(), cache.join("thumbs"))?;
     // The controller reads the port from this line.
-    println!("TESSERA_ENGINE_LISTENING {}", addr.port());
+    {
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "TESSERA_ENGINE_LISTENING {}", addr.port());
+        let _ = out.flush();
+    }
     if demo_mode && token == DEV_TOKEN {
-        eprintln!("demo token {DEV_TOKEN}: http://{addr}/preview/pgm.mjpg?token={DEV_TOKEN}");
+        log!("demo token {DEV_TOKEN}: http://{addr}/preview/pgm.mjpg?token={DEV_TOKEN}");
     }
     for command in demo {
         handle.send(command);

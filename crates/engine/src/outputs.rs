@@ -53,7 +53,7 @@ impl Outputs {
         let mut states = vec![];
         for output in &config.outputs {
             if self.windows.contains_key(&output.id) {
-                eprintln!("output {}: duplicate id, ignored", output.id);
+                log!("output {}: duplicate id, ignored", output.id);
                 continue;
             }
             let place = match &output.target {
@@ -68,17 +68,17 @@ impl Outputs {
                 (Some(w), _) => Some(w),
                 (None, Some(place)) => match open(event_loop, gpu, output, place, size) {
                     Ok(w) => {
-                        eprintln!("output '{}': window open {}x{} on {:?}", output.name, size.0, size.1, w.place);
+                        log!("output '{}': window open {}x{} on {:?}", output.name, size.0, size.1, w.place);
                         Some(w)
                     }
                     Err(e) => {
-                        eprintln!("output '{}': no window: {e:#}", output.name);
+                        log!("output '{}': no window: {e:#}", output.name);
                         None
                     }
                 },
                 (None, None) => {
                     if had {
-                        eprintln!("output '{}': monitor gone, window closed", output.name);
+                        log!("output '{}': monitor gone, window closed", output.name);
                     }
                     None
                 }
@@ -94,7 +94,7 @@ impl Outputs {
             }
         }
         for id in old.keys() {
-            eprintln!("output {id}: window closed");
+            log!("output {id}: window closed");
         }
         states
     }
@@ -130,7 +130,7 @@ impl Outputs {
                             s.configure(&gpu.device, &w.config);
                             w.surface = s;
                         }
-                        Err(e) => eprintln!("output '{}': surface lost, recreate failed: {e}", output.name),
+                        Err(e) => log!("output '{}': surface lost, recreate failed: {e}", output.name),
                     }
                     continue;
                 }
@@ -143,7 +143,7 @@ impl Outputs {
             paced = true;
             if !w.presented {
                 w.presented = true;
-                eprintln!("output '{}': first frame presented ({:?})", output.name, w.config.present_mode);
+                log!("output '{}': first frame presented ({:?})", output.name, w.config.present_mode);
             }
         }
         paced

@@ -112,15 +112,15 @@ impl App {
         // Surfaces are created later from this device's instance (Metal/DX12 need no display handle).
         let gpu = Gpu::new_headless()?;
         // A live show must not die on a GPU validation error (the default handler panics).
-        gpu.device.on_uncaptured_error(Arc::new(|e| eprintln!("GPU error: {e}")));
+        gpu.device.on_uncaptured_error(Arc::new(|e| log!("GPU error: {e}")));
         let mixer = match Mixer::start() {
             Ok(mixer) => {
                 let (rate, channels) = mixer.format();
-                eprintln!("audio: default output, {rate} Hz, {channels} ch");
+                log!("audio: default output, {rate} Hz, {channels} ch");
                 Some(mixer)
             }
             Err(e) => {
-                eprintln!("audio: {e:#}; running silent");
+                log!("audio: {e:#}; running silent");
                 let _ = events.send(FromEngine::Error { message: format!("audio: {e:#}") });
                 None
             }
@@ -130,7 +130,7 @@ impl App {
         std::thread::Builder::new().name("preview jpeg".into()).spawn(move || {
             for (bus, width, height, rgba) in frames {
                 if let Err(e) = jpegs.publish_rgba(bus, width, height, rgba) {
-                    eprintln!("preview {bus:?}: {e:#}");
+                    log!("preview {bus:?}: {e:#}");
                 }
             }
         })?;
@@ -183,17 +183,17 @@ impl App {
             ToEngine::Transport { bus, layer, action } => self.buses.transport(bus, layer, action, self.now),
             ToEngine::SetMasterVolume { volume } => match &self.mixer {
                 Some(mixer) => mixer.set_master(volume),
-                None => eprintln!("master volume: no audio output"),
+                None => log!("master volume: no audio output"),
             },
             ToEngine::ListMonitors => self.send(FromEngine::Monitors { monitors: monitors(event_loop) }),
             ToEngine::Identify { output_id } => {
                 if self.config.outputs.iter().any(|o| o.id == output_id) {
                     self.identify.insert(output_id, Instant::now() + IDENTIFY);
                 } else {
-                    eprintln!("identify: unknown output {output_id}");
+                    log!("identify: unknown output {output_id}");
                 }
             }
-            ToEngine::Probe { .. } => eprintln!("probe: answered by the network server (net::serve), ignored here"),
+            ToEngine::Probe { .. } => log!("probe: answered by the network server (net::serve), ignored here"),
         }
     }
 
@@ -206,7 +206,7 @@ impl App {
         self.status = status;
         let refresh_mhz = self.outputs.refresh_mhz().unwrap_or(FALLBACK_MHZ);
         if period(refresh_mhz) != self.clock.period() {
-            eprintln!("frame clock: {:.3} Hz", refresh_mhz as f64 / 1000.);
+            log!("frame clock: {:.3} Hz", refresh_mhz as f64 / 1000.);
             self.clock = FrameClock::new(period(refresh_mhz), Instant::now());
         }
     }
@@ -276,7 +276,7 @@ impl App {
                         let (width, height) = readback.size();
                         let _ = self.encoder.try_send((bus, width, height, rgba)); // JPEG thread busy: skip it
                     }
-                    Some(Err(e)) => eprintln!("preview {bus:?}: {e:#}"),
+                    Some(Err(e)) => log!("preview {bus:?}: {e:#}"),
                 }
                 capture.pending = None;
             }
@@ -342,7 +342,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         if let WindowEvent::CloseRequested = event {
-            eprintln!("output windows follow the config; close ignored");
+            log!("output windows follow the config; close ignored");
         }
     }
 

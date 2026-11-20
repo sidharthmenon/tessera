@@ -30,7 +30,7 @@ pub fn probe(path: &Path, thumb_dir: &Path, media_id: Uuid) -> anyhow::Result<Pr
     let name = format!("{media_id}.jpg");
     match save_jpeg(&thumb, thumb_dir, &name) {
         Ok(()) => info.thumb = Some(name),
-        Err(e) => eprintln!("probe {}: no thumbnail in {}: {e:#}", path.display(), thumb_dir.display()),
+        Err(e) => log!("probe {}: no thumbnail in {}: {e:#}", path.display(), thumb_dir.display()),
     }
     Ok(info)
 }

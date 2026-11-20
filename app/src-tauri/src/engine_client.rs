@@ -2,11 +2,14 @@
 //! exits, when 3 connects in a row fail, or when no event arrives for 5 s (it sends Stats
 //! every second); every (re)connect starts with a full resync.
 
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
@@ -48,17 +51,70 @@ pub async fn connect(port: u16, token: &str) -> Result<Ws, String> {
     Ok(tokio_tungstenite::connect_async(url).await.map_err(|e| e.to_string())?.0)
 }
 
+/// `<app data dir>/engine.json`: the running engine, so a restarted controller can adopt it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EngineFile {
+    pub pid: u32,
+    pub port: u16,
+    pub token: String,
+}
+
+const ADOPT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The engine recorded in `file`, if `connect(port, token)` succeeds within 1 s. Anything
+/// else (no file, garbage, refused, wrong token, no answer) is None: spawn a fresh engine
+/// and leave that pid alone.
+pub async fn adoptable<F, Fut, T>(file: &Path, connect: F) -> Option<EngineFile>
+where
+    F: FnOnce(u16, String) -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    let rec: EngineFile = serde_json::from_slice(&std::fs::read(file).ok()?).ok()?;
+    let answer = tokio::time::timeout(ADOPT_TIMEOUT, connect(rec.port, rec.token.clone())).await;
+    matches!(answer, Ok(Ok(_))).then_some(rec)
+}
+
+/// Whether `pid` still exists (unix; elsewhere we only learn it from the socket).
+#[cfg(unix)]
+fn alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks that the pid exists and may be signalled.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn alive(_pid: u32) -> bool {
+    true
+}
+
 /// Tauri managed state: the queue to the engine and the current process.
 pub struct Engine {
     tx: mpsc::UnboundedSender<ToEngine>,
     info: Mutex<Option<EngineInfo>>,
-    child: Mutex<Option<(u32, CommandChild)>>,
+    /// The engine's pid, and its handle unless it was adopted (then it isn't our child).
+    proc: Mutex<Option<(u32, Option<CommandChild>)>>,
+    /// The current engine was adopted: its PGM isn't ours to rewrite, so never SetProgram.
+    adopted: AtomicBool,
+    /// Adopted and the operator hasn't loaded a show yet: only requests go through.
+    hold: AtomicBool,
+    /// The app is quitting: no more engines.
+    stopping: AtomicBool,
+    /// `engine.json`
+    file: PathBuf,
 }
 
 impl Engine {
-    pub fn new() -> (Engine, mpsc::UnboundedReceiver<ToEngine>) {
+    pub fn new(file: PathBuf) -> (Engine, mpsc::UnboundedReceiver<ToEngine>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (Engine { tx, info: Mutex::new(None), child: Mutex::new(None) }, rx)
+        let engine = Engine {
+            tx,
+            info: Mutex::new(None),
+            proc: Mutex::new(None),
+            adopted: AtomicBool::new(false),
+            hold: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            file,
+        };
+        (engine, rx)
     }
 
     /// Queue messages for the engine. Call with the controller locked, so the queue holds
@@ -69,27 +125,73 @@ impl Engine {
         }
     }
 
+    /// The operator loaded a show: an adopted engine may now take config and PVW.
+    pub fn release_hold(&self) {
+        self.hold.store(false, Ordering::SeqCst);
+    }
+
+    /// Checked as each message goes out.
+    fn allowed(&self, msg: &ToEngine) -> bool {
+        if self.hold.load(Ordering::SeqCst) {
+            matches!(msg, ToEngine::ListMonitors | ToEngine::Probe { .. } | ToEngine::Identify { .. })
+        } else {
+            !(self.adopted.load(Ordering::SeqCst) && matches!(msg, ToEngine::SetProgram { .. }))
+        }
+    }
+
     pub fn info(&self) -> Option<EngineInfo> {
         self.info.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Kill the engine process (if any) and reap it. `unreaped`: also SIGKILL it by pid
+    /// Kill the engine process (if any) and wait for it. `unreaped`: also SIGKILL it by pid
     /// first. On macOS waitid() returns for a *stopped* child, after which shared_child holds
     /// its lock in a blocking waitpid, so `CommandChild::kill` (and `pid`) would wait for the
-    /// child to exit by itself, forever for a hung engine. Pass true only while the child
-    /// can't have been reaped, so its pid can't have been reused.
+    /// child to exit by itself, forever for a hung engine. Pass true only while the process
+    /// can't have been reaped, so its pid can't have been reused. An adopted engine isn't our
+    /// child: the pid signal is the only kill, and launchd reaps it.
     #[cfg_attr(not(unix), allow(unused_variables))]
     pub fn kill(&self, unreaped: bool) {
-        let Some((pid, child)) = self.child.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+        let Some((pid, child)) = self.proc.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
         #[cfg(unix)]
         if unreaped {
-            // SAFETY: a plain syscall on our own unreaped child's pid.
+            // SAFETY: a plain syscall on the engine's pid, which can't have been reused (above).
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         }
-        match child.kill() {
-            Ok(()) => log!("engine: stopped pid {pid}"),
-            Err(e) => log!("engine: killing pid {pid}: {e}"),
+        match child {
+            Some(child) => match child.kill() {
+                Ok(()) => log!("engine: stopped pid {pid}"),
+                Err(e) => log!("engine: killing pid {pid}: {e}"),
+            },
+            None => {
+                for _ in 0..40 {
+                    if !alive(pid) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                log!("engine: stopped adopted pid {pid}");
+            }
         }
+    }
+
+    /// Record the current engine. False (and the engine stopped again) once quitting: checked
+    /// under the same lock `shutdown` takes, so no engine outlives the app.
+    fn set_proc(&self, pid: u32, child: Option<CommandChild>) -> bool {
+        let mut proc = self.proc.lock().unwrap_or_else(|e| e.into_inner());
+        *proc = Some((pid, child));
+        drop(proc);
+        if self.stopping.load(Ordering::SeqCst) {
+            self.kill(true);
+            return false;
+        }
+        true
+    }
+
+    /// Graceful app exit: stop the engine, forget it, spawn no other.
+    pub fn shutdown(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        self.kill(true);
+        let _ = std::fs::remove_file(&self.file);
     }
 
     fn set_info(&self, app: &AppHandle, info: Option<EngineInfo>) {
@@ -98,23 +200,62 @@ impl Engine {
     }
 }
 
-/// Runs for the app's lifetime: one engine process after another.
+/// Runs for the app's lifetime: adopt the engine a previous controller left running, if it
+/// answers its token; then one fresh engine after another.
 pub async fn supervise(app: AppHandle, mut rx: mpsc::UnboundedReceiver<ToEngine>) {
+    let file = app.state::<Engine>().file.clone();
+    if let Some(rec) = adoptable(&file, |port, token| async move { connect(port, &token).await }).await {
+        let (_, why) = adopt(&app, &mut rx, rec).await;
+        restarting(&app, &why);
+    }
     let mut delay = MIN_BACKOFF;
-    loop {
+    while !app.state::<Engine>().stopping.load(Ordering::SeqCst) {
         let (connected, why) = run_engine(&app, &mut rx).await;
-        log!("engine: {why}; respawning");
-        let _ = app.emit("engine-event", FromEngine::Error { message: format!("engine restarting: {why}") });
+        restarting(&app, &why);
         // A crash loop (e.g. the binary can't start) backs off to one try per 2 s.
         delay = if connected { MIN_BACKOFF } else { (delay * 2).min(MAX_BACKOFF) };
         sleep(delay).await;
     }
 }
 
+fn restarting(app: &AppHandle, why: &str) {
+    if app.state::<Engine>().stopping.load(Ordering::SeqCst) {
+        return log!("engine: {why}; app quitting");
+    }
+    log!("engine: {why}; respawning");
+    let _ = app.emit("engine-event", FromEngine::Error { message: format!("engine restarting: {why}") });
+}
+
+/// Keep an engine a previous controller left running. Its outputs stay as they are: nothing
+/// but requests until the operator loads a show, and never SetProgram (we don't know its PGM).
+async fn adopt(app: &AppHandle, rx: &mut mpsc::UnboundedReceiver<ToEngine>, rec: EngineFile) -> (bool, String) {
+    let engine = app.state::<Engine>();
+    log!("engine: adopted running engine pid {} on port {}", rec.pid, rec.port);
+    engine.adopted.store(true, Ordering::SeqCst);
+    engine.hold.store(true, Ordering::SeqCst);
+    if !engine.set_proc(rec.pid, None) {
+        return (false, "app quitting".into());
+    }
+    let (exit_tx, mut exited) = watch::channel(false);
+    let pid = rec.pid;
+    tauri::async_runtime::spawn(async move {
+        while alive(pid) && !exit_tx.is_closed() {
+            sleep(Duration::from_millis(500)).await;
+        }
+        let _ = exit_tx.send(true);
+    });
+    let ended = drive(app, rx, rec.port, rec.token, &mut exited).await;
+    let gone = *exited.borrow(); // seen gone: never signal that pid again
+    engine.kill(!gone);
+    ended
+}
+
 /// Spawn one engine and keep it connected until it has to be replaced.
 /// Returns whether it ever connected, and why it ended.
 async fn run_engine(app: &AppHandle, rx: &mut mpsc::UnboundedReceiver<ToEngine>) -> (bool, String) {
     let engine = app.state::<Engine>();
+    engine.adopted.store(false, Ordering::SeqCst);
+    engine.hold.store(false, Ordering::SeqCst);
     let token = new_token();
     let spawned = app.path().app_cache_dir().map_err(|e| e.to_string()).and_then(|cache| {
         let cmd = app.shell().sidecar("tessera-engine").map_err(|e| e.to_string())?;
@@ -127,29 +268,40 @@ async fn run_engine(app: &AppHandle, rx: &mut mpsc::UnboundedReceiver<ToEngine>)
     };
     let pid = child.pid(); // before the pump's wait thread can sit on shared_child's lock
     log!("engine: spawned pid {pid}");
-    *engine.child.lock().unwrap_or_else(|e| e.into_inner()) = Some((pid, child));
+    if !engine.set_proc(pid, Some(child)) {
+        return (false, "app quitting".into());
+    }
     let (port_rx, mut exited) = pump(events);
-    let ended = drive(app, rx, port_rx, &mut exited, token).await;
+    let port = tokio::select! {
+        Ok(port) = port_rx => Ok(port),
+        _ = gone(&mut exited) => Err("exited before listening"),
+        _ = sleep(LISTEN_TIMEOUT) => Err("no TESSERA_ENGINE_LISTENING line"),
+    };
+    let ended = match port {
+        Ok(port) => {
+            let rec = EngineFile { pid, port, token: token.clone() };
+            let json = serde_json::to_vec(&rec).map_err(|e| e.to_string());
+            if let Err(e) = json.and_then(|json| crate::files::write_atomic(&engine.file, &json, true)) {
+                log!("engine: {e}"); // only adoption after a controller crash needs it
+            }
+            drive(app, rx, port, token, &mut exited).await
+        }
+        Err(why) => (false, why.into()),
+    };
     let reaped = *exited.borrow(); // true only once the pump saw the child reaped
     engine.kill(!reaped);
     ended
 }
 
-/// Wait for the port line, then connect, reconnecting with backoff, until the engine is
-/// gone or must be replaced.
+/// Connect, reconnecting with backoff, until the engine is gone or must be replaced.
 async fn drive(
     app: &AppHandle,
     rx: &mut mpsc::UnboundedReceiver<ToEngine>,
-    port_rx: oneshot::Receiver<u16>,
-    exited: &mut watch::Receiver<bool>,
+    port: u16,
     token: String,
+    exited: &mut watch::Receiver<bool>,
 ) -> (bool, String) {
     let engine = app.state::<Engine>();
-    let port = tokio::select! {
-        Ok(port) = port_rx => port,
-        _ = gone(exited) => return (false, "exited before listening".into()),
-        _ = sleep(LISTEN_TIMEOUT) => return (false, "no TESSERA_ENGINE_LISTENING line".into()),
-    };
     let info = EngineInfo { port, token };
     let (mut failures, mut backoff, mut connected) = (0, MIN_BACKOFF, false);
     loop {
@@ -238,8 +390,9 @@ async fn session(
     rx: &mut mpsc::UnboundedReceiver<ToEngine>,
     exited: &mut watch::Receiver<bool>,
 ) -> End {
+    let engine = app.state::<Engine>();
     let (mut sink, mut stream) = ws.split();
-    let resync = crate::resync(app, rx);
+    let resync: Vec<_> = crate::resync(app, rx).into_iter().filter(|m| engine.allowed(m)).collect();
     log!("engine: resync sent ({} messages)", resync.len());
     for msg in &resync {
         if let Err(e) = send(&mut sink, msg).await {
@@ -252,6 +405,7 @@ async fn session(
             _ = gone(exited) => return End::Exited,
             _ = sleep_until(deadline) => return End::Stale,
             msg = rx.recv() => match msg {
+                Some(msg) if !engine.allowed(&msg) => {}
                 Some(msg) => if let Err(e) = send(&mut sink, &msg).await { return End::Closed(e) },
                 None => return End::Closed("app shutting down".into()),
             },
@@ -280,6 +434,48 @@ mod tests {
         assert_eq!(parse_port("TESSERA_ENGINE_LISTENING 58126\n"), Some(58126));
         assert_eq!(parse_port("TESSERA_ENGINE_LISTENING x"), None);
         assert_eq!(parse_port("hello"), None);
+    }
+
+    #[tokio::test]
+    async fn adopt_only_when_token_authenticates() {
+        let dir = std::env::temp_dir().join(format!("tessera-adopt-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("engine.json");
+        // The stub engine on port 4000 accepts only "good".
+        let stub = |port: u16, token: String| async move {
+            if port == 4000 && token == "good" { Ok(()) } else { Err("HTTP 401".to_string()) }
+        };
+        assert_eq!(adoptable(&file, stub).await, None, "no file");
+        let rec = |token: &str| EngineFile { pid: 4242, port: 4000, token: token.into() };
+        std::fs::write(&file, serde_json::to_vec(&rec("good")).unwrap()).unwrap();
+        assert_eq!(adoptable(&file, stub).await, Some(rec("good")));
+        std::fs::write(&file, serde_json::to_vec(&rec("stale")).unwrap()).unwrap();
+        assert_eq!(adoptable(&file, stub).await, None, "wrong token");
+        std::fs::write(&file, b"{not json").unwrap();
+        assert_eq!(adoptable(&file, stub).await, None, "garbage");
+        // Something that never answers: given up after ~1 s.
+        std::fs::write(&file, serde_json::to_vec(&rec("good")).unwrap()).unwrap();
+        let start = std::time::Instant::now();
+        let hang = |_: u16, _: String| std::future::pending::<Result<(), String>>();
+        assert_eq!(adoptable(&file, hang).await, None, "no answer");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn adopted_engine_keeps_its_program() {
+        let (engine, _rx) = Engine::new(PathBuf::from("/nonexistent/engine.json"));
+        let program = ToEngine::SetProgram { scene: Default::default() };
+        let preview = ToEngine::SetPreview { scene: Default::default() };
+        let probe = ToEngine::Probe { media_id: uuid::Uuid::new_v4(), path: "/a.mp4".into() };
+        assert!(engine.allowed(&program) && engine.allowed(&preview), "our own engine gets everything");
+        engine.adopted.store(true, Ordering::SeqCst);
+        engine.hold.store(true, Ordering::SeqCst);
+        assert!(!engine.allowed(&program) && !engine.allowed(&preview), "no show loaded yet");
+        assert!(engine.allowed(&probe) && engine.allowed(&ToEngine::ListMonitors));
+        engine.release_hold();
+        assert!(engine.allowed(&preview));
+        assert!(!engine.allowed(&program), "never rewrite an adopted engine's PGM");
     }
 
     #[test]

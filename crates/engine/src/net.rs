@@ -95,7 +95,7 @@ pub fn serve(
             rt.block_on(async { Ok(axum::serve(tokio::net::TcpListener::from_std(listener)?, app).await?) })
         });
         if let Err(e) = served {
-            eprintln!("net: server stopped: {e:#}");
+            log!("net: server stopped: {e:#}");
         }
     })?;
     Ok(bound)
@@ -141,7 +141,7 @@ async fn client(s: Shared, mut socket: WebSocket) {
             event = events.recv() => match event {
                 Ok(event) => event,
                 Err(RecvError::Lagged(n)) => {
-                    eprintln!("net: a client fell behind, {n} events dropped");
+                    log!("net: a client fell behind, {n} events dropped");
                     continue;
                 }
                 Err(RecvError::Closed) => return,

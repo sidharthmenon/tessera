@@ -237,7 +237,7 @@ impl<O: Opener> Buses<O> {
         }
         let old = std::mem::replace(&mut self.pgm, BusState::new(scene, players));
         self.hand_over(&old, now);
-        eprintln!("take: {:?} {} ms, {} screen(s) change", t.kind, t.duration_ms, screens.len());
+        log!("take: {:?} {} ms, {} screen(s) change", t.kind, t.duration_ms, screens.len());
         let duration = Duration::from_millis(t.duration_ms.into());
         if t.kind == TransitionKind::Cut || duration.is_zero() || screens.is_empty() {
             drop(old);
@@ -261,7 +261,7 @@ impl<O: Opener> Buses<O> {
         for (id, h) in state.players.iter().filter(|(id, _)| layer.is_none_or(|l| l == **id)) {
             found = true;
             if bus == Bus::Pvw && self.live(h) {
-                eprintln!("transport: PVW layer {id} is shared with PGM, not touched");
+                log!("transport: PVW layer {id} is shared with PGM, not touched");
                 continue;
             }
             let mut e = lock(h);
@@ -397,7 +397,7 @@ impl<O: Opener> Buses<O> {
     }
 
     fn error(&mut self, message: String) {
-        eprintln!("{message}");
+        log!("{message}");
         self.events.push(FromEngine::Error { message });
     }
 }

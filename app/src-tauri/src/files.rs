@@ -30,8 +30,8 @@ pub fn open(path: &Path) -> Result<Show, String> {
     Ok(show)
 }
 
-/// Write `<path>.tmp` next to `path`, fsync, rename over `path`: a crash leaves either
-/// the old file or the new one, never half of one.
+/// Save atomically (see `write_atomic`): a crash leaves either the old file or the new one,
+/// never half of one.
 pub fn save_atomic(path: &Path, show: &Show) -> Result<(), String> {
     let dir = path.parent().unwrap_or(Path::new(""));
     let mut show = show.clone();
@@ -42,12 +42,25 @@ pub fn save_atomic(path: &Path, show: &Show) -> Result<(), String> {
         }
     }
     let json = serde_json::to_vec_pretty(&show).map_err(|e| e.to_string())?;
+    write_atomic(path, &json, false)
+}
+
+/// `bytes` to `<path>.tmp`, fsync, rename over `path`. `private`: owner-only (unix 0600).
+#[cfg_attr(not(unix), allow(unused_variables))]
+pub fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<(), String> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     let write = || -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&json)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         std::fs::rename(&tmp, path)
     };

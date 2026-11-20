@@ -152,13 +152,14 @@ impl Controller {
         }
     }
 
-    /// After undo/redo: config + PVW only; PGM never changes (R32).
+    /// After undo/redo: config, PVW and volume; PGM never changes (R32, R36).
     fn history_moved(&mut self) -> Vec<ToEngine> {
         if scene_of(&self.show, self.last_taken).is_none() {
             self.last_taken = None;
         }
         let preview = self.refresh_pvw(true);
-        [Some(ToEngine::SetConfig { config: self.engine_config() }), preview].into_iter().flatten().collect()
+        let volume = ToEngine::SetMasterVolume { volume: self.show.master_volume };
+        [Some(ToEngine::SetConfig { config: self.engine_config() }), preview, Some(volume)].into_iter().flatten().collect()
     }
 
     pub fn load_cue(&mut self, cue: CueRef) -> Result<Vec<ToEngine>, String> {
@@ -423,11 +424,15 @@ mod tests {
         assert_eq!(msgs, vec![
             ToEngine::SetConfig { config: c.engine_config() },
             ToEngine::SetPreview { scene: c.show.groups[0].cues[0].layers_by_screen.clone() },
+            ToEngine::SetMasterVolume { volume: 1.0 },
         ]);
         assert_eq!(c.pgm, pgm, "undo leaves PGM alone");
         assert_eq!(c.pvw_scene, c.show.groups[0].cues[0].layers_by_screen);
         // An unrelated op afterwards doesn't push the undone cue on air either.
         assert!(!has(&c.apply(ShowOp::SetMasterVolume { volume: 0.5 }).unwrap(), is_program));
+        // Undoing the volume change puts the engine's volume back too (R36).
+        assert!(has(&c.undo(), |m| *m == ToEngine::SetMasterVolume { volume: 1.0 }));
+        assert!(has(&c.redo(), |m| *m == ToEngine::SetMasterVolume { volume: 0.5 }));
         c.undo();
         assert!(!has(&c.redo(), is_program));
         assert!(!has(&c.redo(), is_program));

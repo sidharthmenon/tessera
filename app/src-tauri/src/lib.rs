@@ -164,6 +164,7 @@ fn import_media(app: AppHandle, paths: Vec<PathBuf>) -> Res<()> {
 #[tauri::command]
 fn open_show(app: AppHandle, path: PathBuf) -> Res<()> {
     let show = files::open(&path)?;
+    app.state::<Engine>().release_hold(); // an adopted engine may take this show
     let titled = path.extension().is_none_or(|e| e != "autosave");
     dispatch(&app, true, |c| Ok(c.open(show, titled.then_some(path))))
 }
@@ -191,8 +192,8 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
+            let (engine, rx) = Engine::new(data_dir.join("engine.json"));
             app.manage(AppState { ctl: Mutex::new(Controller::new()), autosave: Notify::new(), data_dir });
-            let (engine, rx) = Engine::new();
             app.manage(engine);
             tauri::async_runtime::spawn(engine_client::supervise(app.handle().clone(), rx));
             tauri::async_runtime::spawn(autosave(app.handle().clone()));
@@ -206,7 +207,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let RunEvent::Exit = event {
-                app.state::<Engine>().kill(true);
+                app.state::<Engine>().shutdown();
             }
         });
 }

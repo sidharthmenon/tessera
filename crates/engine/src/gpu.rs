@@ -51,7 +51,7 @@ impl Gpu {
     pub fn target(&self, width: u32, height: u32) -> wgpu::Texture {
         let (w, h) = self.target_size(width, height);
         if width > w || height > h {
-            eprintln!("warning: {width}x{height} exceeds the GPU texture limit, clamped to {w}x{h}");
+            log!("gpu: {width}x{height} exceeds the texture limit, clamped to {w}x{h}");
         }
         self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,

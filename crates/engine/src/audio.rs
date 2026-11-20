@@ -173,7 +173,7 @@ impl Mixer {
     pub fn set_master(&self, volume: f32) {
         match unit(volume) {
             Some(v) => self.shared.master.store(v.to_bits(), Relaxed),
-            None => eprintln!("master volume {volume}: not finite, ignored"),
+            None => log!("master volume {volume}: not finite, ignored"),
         }
     }
 
@@ -208,7 +208,7 @@ impl Shared {
     }
 
     fn stream_error(&self, e: cpal::Error) {
-        eprintln!("audio output: {e}");
+        log!("audio output: {e}");
         use cpal::ErrorKind::{DeviceChanged, RealtimeDenied, Xrun};
         let fatal = !matches!(e.kind(), DeviceChanged | RealtimeDenied | Xrun);
         if fatal && !self.failed.swap(true, Relaxed) {
