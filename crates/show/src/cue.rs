@@ -67,10 +67,10 @@ pub fn resolve_shared(pgm: &Scene, incoming: &Scene) -> HashMap<Uuid, Uuid> {
     for (screen, layers) in incoming {
         let Some(live) = pgm.get(screen) else { continue };
         for (inc, cur) in layers.iter().zip(live) {
-            if let (Source::Media { media_id: a }, Source::Media { media_id: b }) = (&inc.source, &cur.source) {
-                if a == b {
-                    map.insert(inc.id, cur.id);
-                }
+            if let (Source::Media { media_id: a }, Source::Media { media_id: b }) = (&inc.source, &cur.source)
+                && a == b
+            {
+                map.insert(inc.id, cur.id);
             }
         }
     }

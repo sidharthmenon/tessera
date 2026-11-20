@@ -17,7 +17,7 @@ impl Rect {
         let y = self.y.max(o.y);
         let r = (self.x + self.w).min(o.x + o.w);
         let b = (self.y + self.h).min(o.y + o.h);
-        (r > x && b > y).then(|| Rect { x, y, w: r - x, h: b - y })
+        (r > x && b > y).then_some(Rect { x, y, w: r - x, h: b - y })
     }
 
     /// Affine map of `self` from `from`-space into `to`-space.
