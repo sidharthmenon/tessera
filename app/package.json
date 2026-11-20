@@ -11,6 +11,7 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",
+    "release": "tauri build --bundles app && sh ../scripts/bundle-ffmpeg-macos.sh",
     "test": "node src/lib/logic.test.ts"
   },
   "license": "MIT",
