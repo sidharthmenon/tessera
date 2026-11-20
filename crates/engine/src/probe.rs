@@ -9,9 +9,9 @@ use image::RgbImage;
 use tessera_show::{MediaKind, ProbeInfo};
 use uuid::Uuid;
 
-use crate::video_decode::{init, sws};
+use crate::video_decode::{init, pix_fmt, sws};
 
-/// Thumbnail width; the height keeps the aspect ratio.
+/// Thumbnail width (videos; stills fit in a square this wide); the aspect ratio is kept.
 const THUMB_WIDTH: u32 = 160;
 
 /// What `path` is, and a `THUMB_WIDTH`-wide JPEG thumbnail written to `<thumb_dir>/<media_id>.jpg`
@@ -43,7 +43,8 @@ fn save_jpeg(image: &RgbImage, dir: &Path, name: &str) -> anyhow::Result<()> {
 fn still(path: &Path) -> anyhow::Result<(ProbeInfo, RgbImage)> {
     let image = image::open(path).context("cannot open")?;
     let (width, height, has_alpha) = (image.width(), image.height(), image.color().has_alpha());
-    let thumb = image.resize(THUMB_WIDTH, u32::MAX, image::imageops::FilterType::Triangle).into_rgb8();
+    // Fits in a THUMB_WIDTH square: a very tall image stays small.
+    let thumb = image.thumbnail(THUMB_WIDTH, THUMB_WIDTH).into_rgb8();
     let info = ProbeInfo { kind: MediaKind::Image, width, height, duration_ms: None, has_audio: false, has_alpha, thumb: None };
     Ok((info, thumb))
 }
@@ -70,11 +71,10 @@ fn video(path: &Path) -> anyhow::Result<(ProbeInfo, RgbImage)> {
     let frame = frame_at(&mut input, &mut decoder, index, start + (at / time_base) as i64)?;
     let (w, h) = (frame.width(), frame.height());
     ensure!(w > 0 && h > 0, "{w}x{h} frame");
-    // SAFETY: plain field reads; the format came from FFmpeg, so it is a valid AVPixelFormat, and
-    // its descriptor is static (or null).
+    // SAFETY: plain field reads; the descriptor is static (or null).
     let (has_alpha, full_range) = unsafe {
         let p = frame.as_ptr();
-        let desc = ffi::av_pix_fmt_desc_get(std::mem::transmute::<i32, ffi::AVPixelFormat>((*p).format));
+        let desc = pix_fmt((*p).format).map_or(std::ptr::null(), |f| ffi::av_pix_fmt_desc_get(f));
         let alpha = !desc.is_null() && (*desc).flags & ffi::AV_PIX_FMT_FLAG_ALPHA as u64 != 0;
         (alpha, (*p).color_range == ffi::AVColorRange::AVCOL_RANGE_JPEG)
     };

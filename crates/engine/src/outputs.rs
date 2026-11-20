@@ -218,7 +218,13 @@ fn fullscreen(event_loop: &ActiveEventLoop, attrs: WindowAttributes, monitor: &M
     anyhow::ensure!(window.set_simple_fullscreen(true), "simple fullscreen refused");
     // The engine is never the active app, so the active app's menu bar (level 24) would draw across
     // the wall. Screen-saver level (1000) also clears the Dock, notification banners and pop-up
-    // menus, which sit between 24 and 1000; only the cursor stays above.
+    // menus, which sit between 24 and 1000; only the cursor stays above. Not on the main display
+    // (origin 0,0: the menu bar's): the operator's controller is there, and a window above
+    // everything with no Dock icon to click would lock them out (I3). A menu-bar strip is fine there.
+    if monitor.position() == PhysicalPosition::new(0, 0) {
+        log!("output on the main display: normal window level, the controller can come in front");
+        return Ok(window);
+    }
     use objc2_app_kit::{NSScreenSaverWindowLevel, NSView};
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let RawWindowHandle::AppKit(handle) = window.window_handle()?.as_raw() else { anyhow::bail!("not an AppKit window") };

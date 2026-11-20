@@ -79,6 +79,7 @@ fn videotoolbox_decodes_fixtures() {
         ("h264_64.mp4", PixelFormatKind::Nv12),
         ("prores4444_64.mov", PixelFormatKind::Ayuv64),
         ("hevc10_64.mp4", PixelFormatKind::P010),
+        ("prores422hq_64.mov", PixelFormatKind::P210),
     ] {
         let frames = decode_all_frames(&fixture(name)).unwrap();
         assert!(!frames.is_empty(), "{name}: no frames");
@@ -120,6 +121,20 @@ fn hevc_main10_converts() {
     // ±2: scale 256 lands within 1 code value here; 255 (LSB-style scaling) is 3 off.
     assert_near(px(&data, 8, 32), [255, 255, 255, 255], 2);
     assert_near(px(&data, 56, 32), [191, 191, 191, 255], 2);
+}
+
+#[test]
+fn prores422_converts() {
+    // ProRes 422 HQ (VideoToolbox: p210le, 4:2:2 with a full-height CbCr plane): quadrants
+    // red | blue / green | white. Wrong UV plane height or width would smear the bottom row or
+    // the right column's colour.
+    let gpu = gpu();
+    let mut player = Player::open(&fixture("prores422hq_64.mov"), Playback::Loop, None).unwrap();
+    let data = render(&gpu, frame(&mut player, &gpu, Instant::now()).expect("first frame, shown while paused"));
+    assert_near(px(&data, 16, 16), [255, 0, 0, 255], 4);
+    assert_near(px(&data, 48, 16), [0, 0, 255, 255], 4);
+    assert_near(px(&data, 16, 48), [0, 255, 0, 255], 4);
+    assert_near(px(&data, 48, 48), [255, 255, 255, 255], 4);
 }
 
 #[test]

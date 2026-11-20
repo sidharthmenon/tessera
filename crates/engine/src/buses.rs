@@ -1,6 +1,6 @@
 //! PVW/PGM buses over a refcounted player pool, Take with transitions.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,6 +32,8 @@ pub trait Media {
     fn stop(&mut self);
     /// First frame decoded, or failed: waiting longer won't change how it starts.
     fn ready(&self) -> bool;
+    /// It will never show anything again: the next scene that wants it opens a new one (I1).
+    fn failed(&self) -> bool;
     fn take_error(&mut self) -> Option<String>;
     fn take_dropped(&mut self) -> u64;
     fn audio(&self) -> Option<AudioTap>;
@@ -59,10 +61,10 @@ struct Entry<M> {
     start: bool,
 }
 
-/// A player can stand in for `layer`: same media, same playback mode.
-fn fits<M>(h: &Handle<M>, layer: &Layer) -> bool {
+/// A player can stand in for `layer`: same media, same playback mode, not failed.
+fn fits<M: Media>(h: &Handle<M>, layer: &Layer) -> bool {
     let e = lock(h);
-    layer.source == Source::Media { media_id: e.media_id } && layer.playback == e.playback
+    layer.source == Source::Media { media_id: e.media_id } && layer.playback == e.playback && !e.media.failed()
 }
 
 struct PlayerPool<O: Opener> {
@@ -151,6 +153,9 @@ pub struct Buses<O: Opener> {
     dropped: u64,
     /// `audio_taps` scratch.
     gains: Vec<(Handle<O::Media>, f32)>,
+    /// Open errors already reported: every SetConfig retries the layers that couldn't open, and
+    /// one message per layer/path is enough (M5).
+    open_errors: HashSet<String>,
 }
 
 impl<O: Opener> Buses<O> {
@@ -163,6 +168,7 @@ impl<O: Opener> Buses<O> {
             events: vec![],
             dropped: 0,
             gains: vec![],
+            open_errors: HashSet::new(),
         }
     }
 
@@ -231,9 +237,28 @@ impl<O: Opener> Buses<O> {
         let scene = take_merge(&self.pgm.scene, &self.pvw.scene);
         let screens = changed_screens(&self.pgm.scene, &scene);
         let mut players = HashMap::new();
+        let mut failed = vec![];
         for (screen, layers) in &scene {
             let from = if self.pvw.scene.contains_key(screen) { &self.pvw } else { &self.pgm };
-            players.extend(layers.iter().filter_map(|l| Some((l.id, from.players.get(&l.id)?.clone()))));
+            for l in layers {
+                match from.players.get(&l.id) {
+                    Some(h) if !lock(h).media.failed() => _ = players.insert(l.id, h.clone()),
+                    Some(_) => failed.push(l),
+                    None => {}
+                }
+            }
+        }
+        // A failed player never shows again: a fresh one goes on air in its place (I1), and PVW,
+        // which keeps its scene, shows it too.
+        for l in failed {
+            if let Source::Media { media_id } = l.source
+                && let Some(h) = self.open(media_id, l)
+            {
+                if self.pvw.players.contains_key(&l.id) {
+                    self.pvw.players.insert(l.id, h.clone());
+                }
+                players.insert(l.id, h);
+            }
         }
         let old = std::mem::replace(&mut self.pgm, BusState::new(scene, players));
         self.hand_over(&old, now);
@@ -393,7 +418,15 @@ impl<O: Opener> Buses<O> {
     }
 
     fn open(&mut self, media_id: Uuid, layer: &Layer) -> Option<Handle<O::Media>> {
-        self.pool.open(media_id, layer).map_err(|e| self.error(e)).ok()
+        match self.pool.open(media_id, layer) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                if self.open_errors.insert(e.clone()) {
+                    self.error(e);
+                }
+                None
+            }
+        }
     }
 
     fn error(&mut self, message: String) {
@@ -456,6 +489,13 @@ impl Media for FileMedia {
         match self {
             FileMedia::Video { player, .. } => player.ready(),
             FileMedia::Image(_) => true, // nothing to start
+        }
+    }
+
+    fn failed(&self) -> bool {
+        match self {
+            FileMedia::Video { player, .. } => player.failed(),
+            FileMedia::Image(image) => image.failed(),
         }
     }
 
@@ -557,6 +597,9 @@ mod tests {
         }
         fn ready(&self) -> bool {
             self.ready || self.failed
+        }
+        fn failed(&self) -> bool {
+            self.failed
         }
         fn take_error(&mut self) -> Option<String> {
             self.error.take()
@@ -810,6 +853,54 @@ mod tests {
             assert!(events.iter().any(named), "error names {}: {events:?}", path(media));
         }
         assert_eq!(frames(&mut b, ScreenSlot::Pgm, a), [None, None, Some(good), None], "failed layers transparent");
+    }
+
+    /// I1: a failed player is never reused: reloading PVW, Take, SetProgram (and so SetConfig,
+    /// which re-sends both scenes) open a new one.
+    #[test]
+    fn failed_player_is_reopened() {
+        let [a, m] = ids();
+        let t0 = Instant::now();
+        let mut b = buses();
+        b.pool.opener.broken.insert(m);
+        let x = clip(m);
+        let scene = Scene::from([(a, vec![x.clone()])]);
+        b.set_preview(scene.clone());
+        let first = pvw(&b, &x);
+        b.set_preview(scene.clone());
+        let failed = pvw(&b, &x);
+        assert!(!Arc::ptr_eq(&failed, &first), "reloading PVW: a new player");
+        // The file is back: Take puts a working player on air, and PVW shows it too.
+        b.pool.opener.broken.remove(&m);
+        b.take(&cut(), t0);
+        let live = pgm(&b, &x);
+        assert!(!Arc::ptr_eq(&live, &failed) && !lock(&live).media.failed && playing(&live));
+        assert!(Arc::ptr_eq(&pvw(&b, &x), &live));
+        drop((first, failed));
+        // It fails on air: the next SetProgram replaces it, and the new one plays.
+        lock(&live).media.failed = true;
+        b.set_program(b.scene(Bus::Pgm).clone(), t0 + ms(100));
+        let again = pgm(&b, &x);
+        assert!(!Arc::ptr_eq(&again, &live) && playing(&again));
+        // A working player is kept as before.
+        b.set_program(b.scene(Bus::Pgm).clone(), t0 + ms(200));
+        assert!(Arc::ptr_eq(&pgm(&b, &x), &again));
+    }
+
+    /// M5: every SetConfig retries layers that couldn't open; the error is reported once.
+    #[test]
+    fn open_errors_reported_once() {
+        let [a, m] = ids();
+        let t0 = Instant::now();
+        let mut b = buses();
+        b.pool.opener.fail.insert(m);
+        let scene = Scene::from([(a, vec![clip(m)])]);
+        for _ in 0..3 {
+            b.set_program(scene.clone(), t0);
+            b.set_preview(scene.clone());
+        }
+        let events = b.tick(t0, PERIOD);
+        assert_eq!(events.iter().filter(|e| matches!(e, FromEngine::Error { .. })).count(), 1, "{events:?}");
     }
 
     #[test]

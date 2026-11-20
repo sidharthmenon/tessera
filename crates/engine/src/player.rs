@@ -28,6 +28,8 @@ enum Msg {
     End { epoch: u64 },
     /// The decode thread stopped.
     Error(String),
+    /// A decode or read error the clip plays on past (taken as its end): reported, not fatal.
+    Warning(String),
 }
 
 #[derive(Clone, Copy)]
@@ -82,7 +84,7 @@ impl Player {
         std::thread::Builder::new().name(thread_name("decode", path)).spawn(move || {
             let result = Decoder::open(&owned, tap).and_then(|d| {
                 let _ = tx.send(Msg::Opened(d.duration));
-                decode(d, looping, &tx, &seeks)
+                decode(d, looping, &tx, &seeks, &owned)
             });
             if let Err(e) = result {
                 let _ = tx.send(Msg::Error(format!("{}: {e:#}", owned.display())));
@@ -196,6 +198,7 @@ impl Player {
                 Msg::Frame { frame, .. } => (self.due, taken) = (Some(frame), taken + 1),
                 Msg::End { epoch } => self.ended |= epoch == self.epoch,
                 Msg::Error(e) => return self.fail(e),
+                Msg::Warning(e) => self.error = Some(e),
             }
         }
         if !shown {
@@ -228,6 +231,11 @@ impl Player {
 
     fn showing(&self) -> bool {
         self.gpu.is_some() && !self.stale
+    }
+
+    /// It will never show anything again (open, first-frame or upload error): open a new one.
+    pub fn failed(&self) -> bool {
+        self.failed
     }
 
     /// The error that made this player go transparent, or why its audio failed (the video plays
@@ -271,16 +279,32 @@ impl Player {
 }
 
 /// Decode thread: frames in order into `tx` (blocking when the queue is full); Loop rewinds at
-/// the end without a gap, Once/HoldLast report `End` and wait for a seek.
-fn decode(mut d: Decoder, looping: bool, tx: &SyncSender<Msg>, seeks: &Receiver<u64>) -> anyhow::Result<()> {
-    let (mut epoch, mut offset, mut sent) = (0, Duration::ZERO, false);
+/// the end without a gap, Once/HoldLast report `End` and wait for a seek. A decode or read error
+/// after this pass has shown frames is the pass's end (a corrupt tail, a bad packet: I1), reported
+/// once as a `Warning`; one before any frame of the pass is fatal (nothing would ever show, and a
+/// Loop would spin rewinding).
+fn decode(mut d: Decoder, looping: bool, tx: &SyncSender<Msg>, seeks: &Receiver<u64>, path: &Path) -> anyhow::Result<()> {
+    let (mut epoch, mut offset, mut sent, mut warned) = (0, Duration::ZERO, false, false);
+    // pts of the last frame sent this pass.
+    let mut last: Option<Duration> = None;
     loop {
         if let Some(e) = seeks.try_iter().last() {
-            (epoch, offset) = (e, Duration::ZERO);
+            (epoch, offset, last) = (e, Duration::ZERO, None);
             d.seek(e)?;
         }
-        match d.next()? {
+        let (next, cut) = match d.next() {
+            Ok(next) => (next, false),
+            Err(e) if last.is_some() => {
+                if !std::mem::replace(&mut warned, true) {
+                    let _ = tx.send(Msg::Warning(format!("{}: {e:#}; playing on from the start", path.display())));
+                }
+                (None, true)
+            }
+            Err(e) => return Err(e),
+        };
+        match next {
             Some(frame) => {
+                last = Some(frame.pts);
                 if tx.send(Msg::Frame { epoch, t: offset + frame.pts, frame }).is_err() {
                     return Ok(()); // player dropped
                 }
@@ -289,7 +313,13 @@ fn decode(mut d: Decoder, looping: bool, tx: &SyncSender<Msg>, seeks: &Receiver<
             // Would loop forever without output (and never show anything).
             None if !sent => anyhow::bail!("no video frames"),
             None if looping => {
-                offset += d.duration;
+                // Cut short: the next pass follows the last frame shown, not a freeze until the
+                // clip's full duration.
+                offset += match last.filter(|_| cut) {
+                    Some(pts) => (pts + d.frame_interval).min(d.duration),
+                    None => d.duration,
+                };
+                last = None;
                 d.rewind()?;
             }
             None => {
@@ -297,7 +327,7 @@ fn decode(mut d: Decoder, looping: bool, tx: &SyncSender<Msg>, seeks: &Receiver<
                     return Ok(());
                 }
                 let Ok(e) = seeks.recv() else { return Ok(()) }; // idle until a seek or the player drops
-                (epoch, offset) = (e, Duration::ZERO);
+                (epoch, offset, last) = (e, Duration::ZERO, None);
                 d.seek(e)?;
             }
         }
@@ -316,13 +346,14 @@ fn check_size(gpu: &Gpu, w: u32, h: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Texture format, subsampling divisor (both axes) and bytes per texel of each plane.
-fn layout(kind: PixelFormatKind) -> &'static [(F, u32, u32)] {
+/// Texture format, subsampling divisor (x, y) and bytes per texel of each plane.
+fn layout(kind: PixelFormatKind) -> &'static [(F, (u32, u32), u32)] {
     match kind {
-        PixelFormatKind::Nv12 => &[(F::R8Unorm, 1, 1), (F::Rg8Unorm, 2, 2)],
-        PixelFormatKind::P010 => &[(F::R16Unorm, 1, 2), (F::Rg16Unorm, 2, 4)],
-        PixelFormatKind::Ayuv64 => &[(F::Rgba16Unorm, 1, 8)],
-        PixelFormatKind::Rgba => &[(F::Rgba8Unorm, 1, 4)],
+        PixelFormatKind::Nv12 => &[(F::R8Unorm, (1, 1), 1), (F::Rg8Unorm, (2, 2), 2)],
+        PixelFormatKind::P010 => &[(F::R16Unorm, (1, 1), 2), (F::Rg16Unorm, (2, 2), 4)],
+        PixelFormatKind::P210 => &[(F::R16Unorm, (1, 1), 2), (F::Rg16Unorm, (2, 1), 4)],
+        PixelFormatKind::Ayuv64 => &[(F::Rgba16Unorm, (1, 1), 8)],
+        PixelFormatKind::Rgba => &[(F::Rgba8Unorm, (1, 1), 4)],
     }
 }
 
@@ -339,10 +370,10 @@ impl GpuFrame {
     fn new(gpu: &Gpu, kind: PixelFormatKind, w: u32, h: u32) -> GpuFrame {
         let textures: Vec<_> = layout(kind)
             .iter()
-            .map(|&(format, div, _)| {
+            .map(|&(format, (dx, dy), _)| {
                 gpu.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("video plane"),
-                    size: wgpu::Extent3d { width: w.div_ceil(div).max(1), height: h.div_ceil(div).max(1), depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d { width: w.div_ceil(dx).max(1), height: h.div_ceil(dy).max(1), depth_or_array_layers: 1 },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
@@ -355,7 +386,9 @@ impl GpuFrame {
         let view = |i: usize| textures[i].create_view(&Default::default());
         let planes = match kind {
             PixelFormatKind::Nv12 => Planes::Nv12 { y: view(0), uv: view(1) },
-            PixelFormatKind::P010 => Planes::P010 { y: view(0), uv: view(1) },
+            // 4:2:2 is P010's shader path too: the half-width, full-height UV plane is sampled by
+            // normalized coordinates.
+            PixelFormatKind::P010 | PixelFormatKind::P210 => Planes::P010 { y: view(0), uv: view(1) },
             PixelFormatKind::Ayuv64 => Planes::Ayuv64(view(0)),
             PixelFormatKind::Rgba => Planes::Rgba(view(0)),
         };
@@ -408,6 +441,7 @@ pub struct ImageSource {
     loaded: Option<Receiver<anyhow::Result<LayerTexture>>>,
     layer: Option<LayerTexture>,
     error: Option<String>,
+    failed: bool,
 }
 
 impl ImageSource {
@@ -419,7 +453,7 @@ impl ImageSource {
         std::thread::Builder::new().name(thread_name("image", path)).spawn(move || {
             let _ = tx.send(load_image(&gpu, &owned).with_context(|| owned.display().to_string()));
         })?;
-        Ok(ImageSource { loaded: Some(loaded), layer: None, error: None })
+        Ok(ImageSource { loaded: Some(loaded), layer: None, error: None, failed: false })
     }
 
     /// The image once loaded; `None` until then or on error.
@@ -433,7 +467,7 @@ impl ImageSource {
             self.loaded = None;
             match result {
                 Ok(layer) => self.layer = Some(layer),
-                Err(e) => self.error = Some(format!("{e:#}")),
+                Err(e) => (self.error, self.failed) = (Some(format!("{e:#}")), true),
             }
         }
         self.layer.clone()
@@ -442,6 +476,11 @@ impl ImageSource {
     /// Why the image will never show, once.
     pub fn take_error(&mut self) -> Option<String> {
         self.error.take()
+    }
+
+    /// It failed to load and never will.
+    pub fn failed(&self) -> bool {
+        self.failed
     }
 }
 
@@ -460,4 +499,46 @@ fn load_image(gpu: &Gpu, path: &Path) -> anyhow::Result<LayerTexture> {
     let texture = gpu.upload(w, h, F::Rgba8Unorm, &image);
     let planes = Planes::Rgba(texture.create_view(&Default::default()));
     Ok(LayerTexture { planes, premultiplied: true, full_range: false })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PERIOD: Duration = Duration::from_micros(16_667);
+
+    /// I1(a): a decode error after the clip has shown frames (a file cut short) ends the pass: one
+    /// warning, and the Loop plays on from the start right after the last good frame, never
+    /// failing and never freezing until the clip's full duration.
+    #[test]
+    fn corrupt_tail_loops_on() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/h264_trunc_64.mp4");
+        assert!(crate::video_decode::decode_all_frames(&path).is_err(), "the fixture must end in an error");
+        let mut player = Player::open(&path, Playback::Loop, None).unwrap();
+        let t0 = Instant::now();
+        player.play(t0);
+        let (mut frames, mut errors) = (0, vec![]);
+        let steps = 90; // 3 s at 30 fps: three passes of the 1 s clip, each cut short
+        for step in 0..steps {
+            let now = t0 + Duration::from_secs(1) * step / 30;
+            let give_up = Instant::now() + Duration::from_secs(2);
+            loop {
+                player.poll(now, PERIOD);
+                errors.extend(player.take_error());
+                assert!(!player.failed(), "failed: {errors:?}");
+                if player.due.take().is_some() {
+                    frames += 1;
+                    break;
+                }
+                if player.pending.is_some() {
+                    break; // the next frame isn't due at this time: the picture holds
+                }
+                assert!(Instant::now() < give_up, "no frame at step {step}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("h264_trunc_64.mp4"), "{errors:?}");
+        assert!(frames >= steps - 3, "{frames} of {steps} steps showed a new frame");
+    }
 }

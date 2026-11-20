@@ -15,6 +15,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 const USAGE: &str = "usage: tessera-engine [--port <u16>] [--cache-dir <path>] [--demo | --demo-4k <clip dir>]
+  --demo-4k: h264.mp4 hevc8.mp4 hevc10.mp4 prores4444a.mov (spike gen_clips.sh), + prores422hq.mov if present
   env TESSERA_TOKEN: required unless --demo/--demo-4k; every request must carry ?token=<it>";
 /// The `--demo` token when TESSERA_TOKEN isn't set.
 const DEV_TOKEN: &str = "tessera-dev";
@@ -122,9 +123,12 @@ fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
 }
 
 /// Perf check: the spike's four 4K clips (`gen_clips.sh` names) as full-screen layers, looped,
-/// ProRes 4444 alpha on top.
+/// ProRes 4444 alpha on top; plus `prores422hq.mov` under it if the folder has one (the README's
+/// hardware checklist has the ffmpeg line; ~1.5 GB, don't commit it).
 fn demo_4k(dir: &Path) -> Vec<ToEngine> {
-    let media: Vec<MediaItem> = ["h264.mp4", "hevc8.mp4", "hevc10.mp4", "prores4444a.mov"]
+    let clips = ["h264.mp4", "hevc8.mp4", "hevc10.mp4", "prores422hq.mov", "prores4444a.mov"];
+    let clips = clips.into_iter().filter(|clip| *clip != "prores422hq.mov" || dir.join(clip).exists());
+    let media: Vec<MediaItem> = clips
         .map(|clip| MediaItem {
             id: Uuid::new_v4(),
             name: clip.into(),
@@ -134,10 +138,10 @@ fn demo_4k(dir: &Path) -> Vec<ToEngine> {
             height: 2160,
             duration_ms: None,
             has_audio: false,
-            has_alpha: clip.ends_with(".mov"),
+            has_alpha: clip == "prores4444a.mov",
             thumb: None,
         })
-        .into();
+        .collect();
     let layers = media.iter().map(|m| Layer::new(Source::Media { media_id: m.id }, rect(0., 0., 3840., 2160.))).collect();
     let (config, screen) = demo(2160, media);
     vec![ToEngine::SetConfig { config }, ToEngine::SetProgram { scene: Scene::from([(screen, layers)]) }]

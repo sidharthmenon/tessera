@@ -18,6 +18,8 @@ pub enum PixelFormatKind {
     Nv12,
     /// 10-bit 4:2:0 like NV12, MSB-aligned in 16 bits.
     P010,
+    /// 10-bit 4:2:2 like P010 with a full-height CbCr plane: VideoToolbox's ProRes 422 (`p210le`).
+    P210,
     /// Packed 16-bit A, Y, Cb, Cr: VideoToolbox's ProRes 4444 with alpha (`y416`).
     Ayuv64,
     /// Straight-alpha RGBA8, converted by `sws_scale` (software fallback for everything else).
@@ -64,9 +66,10 @@ impl Frame {
         // CVPixelBuffer planes are `stride × rows` bytes, and the last row is read only to `row`.
         unsafe {
             let p = self.frame.as_ptr();
-            let (data, stride) = ((*p).data[i], (*p).linesize[i]);
-            ensure!(!data.is_null() && rows > 0 && stride as usize >= row, "plane {i}: unexpected layout (stride {stride})");
-            let stride = stride as usize;
+            let (data, linesize) = ((*p).data[i], (*p).linesize[i]);
+            // A negative linesize (bottom-up planes) would read before `data`.
+            let stride = usize::try_from(linesize).ok().filter(|s| *s >= row && !data.is_null() && rows > 0);
+            let stride = stride.with_context(|| format!("plane {i}: unexpected layout (stride {linesize})"))?;
             Ok((std::slice::from_raw_parts(data, stride * (rows - 1) + row), stride))
         }
     }
@@ -80,7 +83,7 @@ pub(crate) struct Decoder {
     /// Seconds per stream tick.
     time_base: f64,
     start: i64,
-    frame_interval: Duration,
+    pub frame_interval: Duration,
     last_pts: Option<Duration>,
     flushing: bool,
     sws: Option<Sws>,
@@ -107,7 +110,14 @@ impl Decoder {
         let frame_interval = Duration::from_secs_f64(if fps > 0. { 1. / fps } else { 1. / 30. });
         let index = stream.index();
         let mut ctx = ff::codec::Context::from_parameters(stream.parameters())?;
-        attach_hw(&mut ctx);
+        if !attach_hw(&mut ctx) {
+            // SAFETY: the codec context is not opened yet.
+            unsafe {
+                // Software only (e.g. FFV1, DNxHD): frame threads on every core, so a 4K clip keeps up.
+                (*ctx.as_mut_ptr()).thread_count = 0;
+                (*ctx.as_mut_ptr()).thread_type = ffi::FF_THREAD_FRAME | ffi::FF_THREAD_SLICE;
+            }
+        }
         let decoder = ctx.decoder().video().context("unsupported video codec")?;
         let audio = audio.and_then(|tap| AudioDecoder::open(&input, tap, path));
         Ok(Decoder {
@@ -196,6 +206,7 @@ impl Decoder {
             let kind = match (*p).format {
                 f if f == AV_PIX_FMT_NV12 as i32 => PixelFormatKind::Nv12,
                 f if f == AV_PIX_FMT_P010LE as i32 => PixelFormatKind::P010,
+                f if f == AV_PIX_FMT_P210LE as i32 => PixelFormatKind::P210,
                 f if f == AV_PIX_FMT_AYUV64LE as i32 => PixelFormatKind::Ayuv64,
                 _ => {
                     frame = sws(&mut self.sws, &frame, ff::format::Pixel::RGBA, (frame.width(), frame.height()), full_range)?;
@@ -225,8 +236,7 @@ pub(crate) fn sws(
         let key = ((*p).format, (*p).width, (*p).height, full_range, to as i32, size.0 as i32, size.1 as i32);
         if cache.as_ref().is_none_or(|s| s.key != key) {
             *cache = None;
-            // The format came from FFmpeg, so it is a valid AVPixelFormat.
-            let from = std::mem::transmute::<i32, ffi::AVPixelFormat>(key.0);
+            let from = pix_fmt(key.0).with_context(|| format!("unknown pixel format {}", key.0))?;
             let flags = ffi::SwsFlags::SWS_BILINEAR as i32;
             let ctx = ffi::sws_getContext(key.1, key.2, from, key.5, key.6, to, flags, ptr::null_mut(), ptr::null_mut(), ptr::null());
             ensure!(!ctx.is_null(), "no software conversion from pixel format {}", pix_name(from));
@@ -276,22 +286,39 @@ const HW: Option<(ffi::AVHWDeviceType, ffi::AVPixelFormat)> =
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const HW: Option<(ffi::AVHWDeviceType, ffi::AVPixelFormat)> = None;
 
-/// Gives the decoder the platform's hardware device; it uses it only for codecs (and sizes) the
-/// hardware supports and silently decodes in software otherwise.
-// ponytail: software decode runs single-threaded; set thread_count for software-only streams if
-// a 4K software codec (no hardware support) has to play.
-fn attach_hw(ctx: &mut ff::codec::Context) {
-    let Some((device, _)) = HW else { return };
+/// Gives the decoder the platform's hardware device if its codec has a hardware decoder; it is used
+/// only for sizes and profiles the hardware supports, else the stream decodes in software. Returns
+/// whether the codec has one (false: software for sure).
+// ponytail: a hardware-capable codec the hardware refuses at runtime decodes single-threaded;
+// threads can't be added once the decoder is open.
+fn attach_hw(ctx: &mut ff::codec::Context) -> bool {
+    let Some((device, _)) = HW else { return false };
     // SAFETY: the codec context is not opened yet; it takes ownership of the device reference.
+    // avcodec_get_hw_config returns static configs, null past the last.
     unsafe {
+        let c = ctx.as_mut_ptr();
+        let codec = ffi::avcodec_find_decoder((*c).codec_id);
+        let has_hw = !codec.is_null()
+            && (0..).map(|i| ffi::avcodec_get_hw_config(codec, i)).take_while(|cfg| !cfg.is_null()).any(|cfg| {
+                (*cfg).device_type == device && (*cfg).methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32 != 0
+            });
+        if !has_hw {
+            return false;
+        }
         let mut dev = ptr::null_mut();
         if ffi::av_hwdevice_ctx_create(&mut dev, device, ptr::null(), ptr::null_mut(), 0) < 0 {
-            return;
+            return false;
         }
-        let c = ctx.as_mut_ptr();
         (*c).hw_device_ctx = dev;
         (*c).get_format = Some(pick_hw);
+        true
     }
+}
+
+/// `f` as an AVPixelFormat, if it is one (transmuting any other i32 into the enum is UB).
+pub(crate) fn pix_fmt(f: i32) -> Option<ffi::AVPixelFormat> {
+    // SAFETY: the enum's values are contiguous from AV_PIX_FMT_NONE (-1) to AV_PIX_FMT_NB.
+    (-1..=ffi::AVPixelFormat::AV_PIX_FMT_NB as i32).contains(&f).then(|| unsafe { std::mem::transmute::<i32, ffi::AVPixelFormat>(f) })
 }
 
 unsafe extern "C" fn pick_hw(c: *mut ffi::AVCodecContext, formats: *const ffi::AVPixelFormat) -> ffi::AVPixelFormat {
