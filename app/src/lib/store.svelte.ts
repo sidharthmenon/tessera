@@ -3,7 +3,7 @@
 import { ask, open, save } from '@tauri-apps/plugin-dialog';
 import * as api from './api';
 import type { CueRef, EngineInfo, Live } from './api';
-import { copyScene, cueAt, findLayer, firstEmptySlot, losesPicture, newCue, newLayer, sameRef, withLayer, withScreen } from './logic';
+import { copyScene, cueAt, findLayer, firstEmptySlot, forkCue, forksEdit, isAutosave, losesPicture, newCue, newLayer, onAir, sameRef, withLayer, withScreen } from './logic';
 import type { Cue } from '$lib/bindings/Cue';
 import type { FromEngine } from '$lib/bindings/FromEngine';
 import type { Layer } from '$lib/bindings/Layer';
@@ -30,6 +30,8 @@ class Store {
   outputs = $state.raw<OutputState[]>([]);
   monitors = $state.raw<MonitorInfo[]>([]);
   error = $state('');
+  /** A passing note for the status bar (`toast`). */
+  notice = $state('');
   /** The show's file as far as this window knows (null: untitled → Save means Save As). */
   path = $state<string | null>(null);
 
@@ -54,7 +56,7 @@ class Store {
   busScene = $derived(this.canvasTab === 'pvw' ? (this.editCue?.layersByScreen ?? {}) : this.live.program);
   /** The selected layer as the bus has it (transport's target). */
   busLayer = $derived(this.selected ? findLayer(this.busScene, this.selected.screenId, this.selected.layerId) : undefined);
-  /** After a Take the same cue stays in PVW: its edits go to air. */
+  /** After a Take the same cue stays in PVW. Edits from the Preview tab then go to a copy (R44). */
   pvwLive = $derived(sameRef(this.live.pvw, this.live.lastTaken));
   status = $derived<'connected' | 'held' | 'restarting' | 'connecting'>(
     this.engine ? (this.engine.held ? 'held' : 'connected') : this.restarting ? 'restarting' : 'connecting',
@@ -66,6 +68,14 @@ export const ui = new Store();
 export function fail(e: unknown) {
   ui.error = e instanceof Error ? e.message : String(e);
   console.error(ui.error);
+}
+
+let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+/** Shows `message` in the status bar for a few seconds. */
+export function toast(message: string) {
+  ui.notice = message;
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => (ui.notice = ''), 5000);
 }
 
 /** Read back what the controller holds. Its events say the same, but may arrive after a
@@ -161,9 +171,16 @@ const offerRecovery = action(async (path: string) => {
 const showFilters = [{ name: 'Tessera show', extensions: ['tshow'] }];
 /** Also lets a kept autosave be opened by hand. */
 const openFilters = [{ name: 'Tessera show or autosave', extensions: ['tshow', 'autosave', 'prev'] }];
-const isAutosave = (p: string) => /\.autosave(\.prev)?$/.test(p);
 
+/** Opening keeps PGM running, but the outputs switch to the opened show's setup (I6). */
 async function openShowAt(path: string) {
+  if (onAir(ui.live)) {
+    const name = path.split(/[\\/]/).pop();
+    const yes = await ask(`Open ${name}? What is on air keeps playing, but outputs, screens and mappings switch to that show's setup now, and unsaved changes here are lost.`, {
+      title: 'Open while on air', kind: 'warning', okLabel: 'Open',
+    });
+    if (!yes) return;
+  }
   await api.openShow(path);
   ui.path = isAutosave(path) ? null : path;
   ui.selected = null;
@@ -221,6 +238,23 @@ export function applyOps(ops: ShowOp[]): Promise<string> {
 }
 const setCue = (ref: CueRef, cue: Cue) => api.applyOp({ op: 'SetCue', groupId: ref.groupId, cue });
 
+/** Store `next`, an edit of the PVW cue at `ref`. While that cue is on air (R44) the edit goes to a
+ *  copy in its group's first empty slot instead, which is loaded into PVW; the on-air cue and
+ *  Program stay as they are. Returns the copy's layer ids (old → new), or null if not copied. */
+async function setPvwCue(ref: CueRef, next: Cue): Promise<Record<string, string> | null> {
+  if (!forksEdit('pvw', ui.live)) {
+    await setCue(ref, next);
+    return null;
+  }
+  const group = ui.show?.groups.find((g) => g.id === ref.groupId);
+  if (!group) throw new Error('The on-air cue’s group is gone: nothing changed');
+  const { cue, ids } = forkCue(group, next);
+  await setCue({ groupId: group.id, slot: cue.slot }, cue);
+  await api.loadCue(group.id, cue.slot);
+  toast(`Copied to slot ${cue.slot + 1} — on-air cue unchanged`);
+  return ids;
+}
+
 /** Add a full-screen layer to the PVW cue (on `screen`, else the selected layer's, else the first).
  *  With nothing in PVW, a new cue in the active group's first free slot is created and loaded. */
 export const addToPvw = action(async (source: Source, name: string, screen?: Screen) => {
@@ -228,32 +262,42 @@ export const addToPvw = action(async (source: Source, name: string, screen?: Scr
   if (!show) return;
   screen ??= show.screens.find((s) => s.id === ui.selected?.screenId) ?? show.screens[0];
   if (!screen) throw new Error('No screens yet: add one in Screen Management');
-  let ref = ui.live.pvw;
-  let cue = cueAt(show, ref);
-  const create = !cue || !ref;
-  if (!cue || !ref) {
+  const layer = newLayer(source, screen, name);
+  const add = (c: Cue) => withScreen(c, screen.id, [...(c.layersByScreen[screen.id] ?? []), layer]);
+  const ref = ui.live.pvw;
+  const cue = cueAt(show, ref);
+  let ids: Record<string, string> | null = null;
+  if (cue && ref) {
+    ids = await setPvwCue(ref, add(cue));
+  } else {
     const group = ui.group;
     if (!group) return;
-    ref = { groupId: group.id, slot: firstEmptySlot(group) };
-    cue = newCue(ref.slot);
+    const slot = firstEmptySlot(group);
+    await setCue({ groupId: group.id, slot }, add(newCue(slot)));
+    await api.loadCue(group.id, slot);
   }
-  const layer = newLayer(source, screen, name);
-  await setCue(ref, withScreen(cue, screen.id, [...(cue.layersByScreen[screen.id] ?? []), layer]));
-  if (create) await api.loadCue(ref.groupId, ref.slot);
   ui.canvasTab = 'pvw';
-  ui.selected = { screenId: screen.id, layerId: layer.id };
+  ui.selected = { screenId: screen.id, layerId: ids?.[layer.id] ?? layer.id };
 });
 
-/** Change (or with null, remove) a layer of the cue on the canvas bus. Removing or hiding picture
- *  on the cue that is on air (PGM tab, or PVW while LIVE) asks first: it changes Program at once. */
+/** Change (or with null, remove) a layer of the cue on the canvas bus. From the Preview tab an edit
+ *  to the on-air cue goes to a copy (R44). From the Program tab it changes Program at once, so
+ *  taking picture away (or restarting a clip) asks first. */
 export const editLayer = action(async (sel: LayerRef, f: (l: Layer) => Layer | null) => {
   const ref = ui.editRef;
   const cue = ui.editCue;
   const next = cue && withLayer(cue, sel.screenId, sel.layerId, f);
   if (!ref || !cue || !next || next === cue) return;
-  if (sameRef(ref, ui.live.lastTaken) && losesPicture(cue, next)) {
+  if (ui.canvasTab === 'pvw') {
+    const ids = await setPvwCue(ref, next);
+    const s = ui.selected;
+    if (ids && s) ui.selected = { screenId: s.screenId, layerId: ids[s.layerId] ?? s.layerId };
+    return;
+  }
+  // An adopted engine never gets SetProgram: the edit reaches air on the next GO, not now.
+  if (sameRef(ref, ui.live.lastTaken) && !ui.engine?.adopted && losesPicture(cue, next)) {
     const name = findLayer(cue.layersByScreen, sel.screenId, sel.layerId)?.name || 'this layer';
-    const yes = await confirmAsk(`Cue ${cue.slot + 1} “${cue.name}” is on air. This takes “${name}” off Program now.`, 'Change Program');
+    const yes = await confirmAsk(`Cue ${cue.slot + 1} “${cue.name}” is on air. This changes “${name}” on Program now: it disappears, or restarts from its first frame.`, 'Change Program');
     if (!yes) return;
   }
   await setCue(ref, next);

@@ -19,6 +19,7 @@
     <span class:bad={ui.stats.dropped > 0}>{ui.stats.dropped} dropped</span>
   {/if}
   {#if ui.outputs.length}<span>outputs {bound}/{ui.outputs.length} bound</span>{/if}
+  {#if ui.notice}<span class="notice">{ui.notice}</span>{/if}
   {#if ui.error}
     <button class="error" title="Dismiss" onclick={() => (ui.error = '')}>⚠ {ui.error}</button>
   {/if}
@@ -64,6 +65,11 @@
   }
   .bad {
     color: var(--warn);
+  }
+  .notice {
+    color: var(--accent-2);
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .error {
     margin-left: auto;

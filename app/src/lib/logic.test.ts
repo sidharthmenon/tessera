@@ -71,6 +71,42 @@ eq(Object.keys(L.withScreen(c, 'a', []).layersByScreen).sort(), ['a', 'b'], 'cle
     [false, false, false, false, false, false, false], 'leave screen, move, dim, rename, add, unhide, remove an already hidden layer',
   );
 }
+// M6: on the on-air cue, a source or playback change of a showing media layer recreates its player.
+{
+  const vid = L.newLayer({ type: 'Media', mediaId: 'm1' }, b, 'Clip');
+  const cv = cue(6, { b: [vid, layer] });
+  const set = (id: string, patch: object) => (x: Cue) => L.withLayer(x, 'b', id, (l) => ({ ...l, ...patch }));
+  const hit = (f: (c: Cue) => Cue) => L.losesPicture(cv, f(cv));
+  eq(
+    [hit(set(vid.id, { source: { type: 'Media', mediaId: 'm2' } })), hit(set(vid.id, { playback: 'Once' })), hit(set(layer.id, { source: { type: 'Media', mediaId: 'm1' } })),
+      hit(set(vid.id, { source: { type: 'Pattern', pattern: { type: 'Grid' } } }))],
+    [true, true, true, true], 'other clip, playback mode, pattern ↔ media',
+  );
+  const hiddenVid = set(vid.id, { visible: false })(cv);
+  eq(
+    [hit(set(layer.id, { source: { type: 'Pattern', pattern: { type: 'Grid' } } })), hit(set(vid.id, { volume: 0.5, rect: { x: 1, y: 1, w: 5, h: 5 } })),
+      L.losesPicture(hiddenVid, set(vid.id, { source: { type: 'Media', mediaId: 'm2' } })(hiddenVid))],
+    [false, false, false], 'pattern → pattern, volume/move, a hidden clip',
+  );
+}
+
+// R44: from the Preview tab, the cue that is on air is never edited; the edit goes to a copy.
+{
+  const live = (pvw: number | null, lastTaken: number | null) => ({ pvw: pvw === null ? null : { groupId: 'g', slot: pvw }, lastTaken: lastTaken === null ? null : { groupId: 'g', slot: lastTaken }, program: {} });
+  eq([L.forksEdit('pvw', live(5, 5)), L.forksEdit('pgm', live(5, 5)), L.forksEdit('pvw', live(5, 4)), L.forksEdit('pvw', live(null, null))], [true, false, false, false], 'fork: Preview tab, PVW = last taken');
+  const onAir = { ...cue(5, { b: [layer], a: [] }), name: 'Opener', transition: { kind: 'WipeLeft' as const, durationMs: 800 } };
+  const grp: Group = { id: 'g', name: 'G', cues: [cue(0), cue(1), onAir, cue(3)] };
+  const { cue: copy, ids } = L.forkCue(grp, onAir);
+  eq([copy.slot, copy.id !== onAir.id, copy.name, copy.transition, copy.transition !== onAir.transition], [2, true, 'Opener', onAir.transition, true], 'first empty slot, fresh cue id, same name and transition');
+  const strip = (sc: L.Scene) => Object.fromEntries(Object.entries(sc).map(([k, ls]) => [k, ls.map((l) => ({ ...l, id: '' }))]));
+  eq(strip(copy.layersByScreen), strip(onAir.layersByScreen), 'same layers on the same screens (PGM players stay shared)');
+  eq([ids[layer.id] === copy.layersByScreen.b[0].id, ids[layer.id] !== layer.id, Object.keys(ids).length], [true, true, 1], 'fresh layer ids, old → new');
+}
+
+// Autosave files open as untitled work (I8 adds `.autosave.<ms>.prev`).
+eq(['/s/a.tshow.autosave', '/s/a.tshow.autosave.prev', '/s/a.tshow.autosave.1763680000000.prev', '/s/a.tshow.autosave.1763680000000-2.prev'].map(L.isAutosave), [true, true, true, true], 'autosaves');
+eq(['/s/a.tshow', '/s/x.prev', '/s/autosave.tshow'].map(L.isAutosave), [false, false, false], 'not autosaves');
+
 eq(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(L.uuid()), true, 'uuid v4');
 
 // Hotkeys, and when they're off.

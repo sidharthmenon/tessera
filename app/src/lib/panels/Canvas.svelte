@@ -75,16 +75,17 @@
       <button class:on={ui.canvasTab === 'pvw'} onclick={() => (ui.canvasTab = 'pvw')}>Preview</button>
     </div>
     {#if ui.canvasTab === 'pgm'}
-      <span class="badge live">ON AIR</span><span class="note">edits to the last taken cue go to air</span>
+      <!-- M2: an adopted engine never gets SetProgram, so its live edits wait for the next GO. -->
+      <span class="badge live">ON AIR</span><span class="note warn">{ui.engine?.adopted ? 'edits to the last taken cue reach air on the next GO' : 'edits to the last taken cue go to air now'}</span>
     {:else if ui.pvwLive}
-      <span class="badge live big">LIVE</span><span class="note warn">this cue is on air: edits here go to air now</span>
+      <span class="badge live">LIVE</span><span class="note">this cue is on air: an edit here goes to a copy in the first free slot</span>
     {/if}
     <span class="cue">{cue ? `${cue.slot + 1} · ${cue.name}` : ui.canvasTab === 'pvw' ? 'nothing in preview' : 'nothing taken yet'}</span>
   </div>
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     class="area"
-    class:live={ui.canvasTab === 'pgm' || ui.pvwLive}
+    class:live={ui.canvasTab === 'pgm'}
     bind:clientWidth={cw}
     bind:clientHeight={ch}
     ondragover={(e) => {
@@ -150,16 +151,6 @@
   .note.warn {
     color: var(--live);
     font-weight: 600;
-  }
-  .badge.big {
-    font-size: 12px;
-    padding: 1px 8px;
-    animation: pulse 1.2s ease-in-out infinite;
-  }
-  @keyframes pulse {
-    50% {
-      opacity: 0.55;
-    }
   }
   .cue {
     margin-left: auto;

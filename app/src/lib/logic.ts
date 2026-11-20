@@ -120,16 +120,41 @@ export function mediaOf(show: Show | null, layer: Layer | undefined): MediaItem 
 }
 
 /** Whether `after` shows less than `before`: a layer that was showing is removed, hidden or at
- *  opacity 0, or a screen the cue didn't define becomes explicit black. On the cue that is on air
- *  such an edit changes Program at once (SetProgram), so the UI asks first. A screen dropped from
- *  the cue (`withScreen(…, null)`) loses nothing: Program keeps what it shows there. */
+ *  opacity 0, or gets another source or playback mode where a clip is involved (the engine opens a
+ *  new player, which blanks until its first frame and starts from the top: M6), or a screen the
+ *  cue didn't define becomes explicit black. On the cue that is on air such an edit changes
+ *  Program at once (SetProgram), so the UI asks first. A screen dropped from the cue
+ *  (`withScreen(…, null)`) loses nothing: Program keeps what it shows there. */
 export function losesPicture(before: Cue, after: Cue): boolean {
-  const shown = (c: Cue, s: string) => (c.layersByScreen[s] ?? []).filter((l) => l.visible && l.opacity > 0).map((l) => l.id);
+  const shown = (c: Cue, s: string) => (c.layersByScreen[s] ?? []).filter((l) => l.visible && l.opacity > 0);
+  const media = (l: Layer) => l.source.type === 'Media';
+  const newPlayer = (a: Layer, b: Layer) => (media(a) || media(b)) && (!same(a.source, b.source) || a.playback !== b.playback);
   return Object.entries(after.layersByScreen).some(([s, layers]) => {
-    const now = new Set(shown(after, s));
-    return shown(before, s).some((id) => !now.has(id)) || (!layers.length && !(s in before.layersByScreen));
+    const now = new Map(shown(after, s).map((l) => [l.id, l]));
+    const lost = (l: Layer) => {
+      const n = now.get(l.id);
+      return !n || newPlayer(l, n);
+    };
+    return shown(before, s).some(lost) || (!layers.length && !(s in before.layersByScreen));
   });
 }
+
+/** R44: an edit made from the Preview tab while PVW holds the cue that is on air never goes to air:
+ *  it goes to a copy of the cue (`forkCue`) instead. */
+export const forksEdit = (tab: 'pvw' | 'pgm', live: Live) => tab === 'pvw' && sameRef(live.pvw, live.lastTaken);
+
+/** A copy of `cue` for `group`'s first empty slot: fresh cue and layer ids, the same layers on the
+ *  same screens and the same transition, so PVW still shares PGM's running players (the engine
+ *  matches screen, media and position) and the next Take continues them. `ids`: old → new layer id. */
+export function forkCue(group: Group, cue: Cue): { cue: Cue; ids: Record<string, string> } {
+  const ids: Record<string, string> = {};
+  const layersByScreen = Object.fromEntries(Object.entries(cue.layersByScreen).map(([s, ls]) => [s, ls.map((l) => ({ ...l, id: (ids[l.id] = uuid()) }))]));
+  return { cue: { ...cue, id: uuid(), slot: firstEmptySlot(group), layersByScreen, transition: { ...cue.transition } }, ids };
+}
+
+/** An autosave, or one kept from an earlier session (`….autosave.prev`, `….autosave.<ms>.prev`):
+ *  it opens as untitled work. */
+export const isAutosave = (p: string) => /\.autosave(\.\d+(-\d+)?)?\.prev$|\.autosave$/.test(p);
 
 /** `http://127.0.0.1:<port><path>?token=…`, or null while the engine is disconnected. */
 export function engineUrl(e: EngineInfo | null, path: string): string | null {

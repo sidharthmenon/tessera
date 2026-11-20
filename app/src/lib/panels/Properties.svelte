@@ -47,7 +47,10 @@
 {/snippet}
 
 <section class="panel props">
-  <h2>Properties {#if ui.canvasTab === 'pgm' || ui.pvwLive}<span class="badge live">ON AIR</span>{/if}</h2>
+  <h2>
+    Properties
+    {#if ui.canvasTab === 'pgm'}<span class="badge live">ON AIR</span>{:else if ui.pvwLive}<span class="badge live" title="This cue is on air: layer edits here go to a copy of it in the first free slot">LIVE · layer edits copy</span>{/if}
+  </h2>
   <div class="body">
     {#if cue && ref}
       <h4>Cue {cue.slot + 1}</h4>
