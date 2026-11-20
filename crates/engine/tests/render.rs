@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use tessera_engine::compositor::{Compositor, LayerTexture, Planes, ScreenSlot};
 use tessera_engine::gpu::{Gpu, read_rgba};
-use tessera_show::{Layer, Mapping, Output, OutputTarget, Pattern, Rect, Screen, Source};
+use tessera_show::{Layer, Mapping, Output, OutputTarget, Pattern, Rect, Screen, Source, TransitionKind};
 use uuid::Uuid;
 use wgpu::TextureFormat;
 
@@ -279,4 +279,24 @@ fn layout_places_screens_scaled() {
     assert_eq!(px(&data, 100, 25, 25), [255, 0, 0, 255]);
     assert_eq!(px(&data, 100, 75, 75), [0, 0, 255, 255]);
     assert_eq!(px(&data, 100, 75, 25), [0, 0, 0, 255]);
+}
+
+#[test]
+fn transition_mixes_outgoing_into_incoming() {
+    let gpu = gpu();
+    let mut c = Compositor::new(&gpu);
+    let s = screen(100, 10);
+    let full = r(0., 0., 100., 10.);
+    let outgoing = c.render_screen(&gpu, ScreenSlot::Outgoing, &s, &[solid(RED, full.clone())]);
+    let incoming = c.render_screen(&gpu, ScreenSlot::Pgm, &s, &[solid(BLUE, full)]);
+    let mut mix = |kind, p| read_rgba(&gpu, c.render_transition(&gpu, &s, &outgoing, &incoming, &kind, p).texture());
+    let fade = mix(TransitionKind::Fade, 0.5);
+    assert_near(px(&fade, 100, 50, 5), [128, 0, 128, 255], 2);
+    assert_near(px(&mix(TransitionKind::Fade, 0.), 100, 50, 5), [255, 0, 0, 255], 0);
+    // Hard edge at p·width; WipeLeft reveals the incoming from the left edge, WipeRight from the right.
+    let left = mix(TransitionKind::WipeLeft, 0.5);
+    assert_eq!((px(&left, 100, 49, 5), px(&left, 100, 50, 5)), ([0, 0, 255, 255], [255, 0, 0, 255]));
+    let right = mix(TransitionKind::WipeRight, 0.5);
+    assert_eq!((px(&right, 100, 49, 5), px(&right, 100, 50, 5)), ([255, 0, 0, 255], [0, 0, 255, 255]));
+    assert_eq!(px(&mix(TransitionKind::WipeLeft, 1.), 100, 99, 5), [0, 0, 255, 255]);
 }

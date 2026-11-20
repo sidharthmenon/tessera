@@ -1,26 +1,21 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
-use tessera_show::{
-    EngineConfig, FromEngine, Layer, Mapping, MediaKind, Output, OutputState, Pattern, Rect, Scene, Screen, Source,
-    ToEngine,
-};
+use tessera_show::{Bus, EngineConfig, FromEngine, Layer, Mapping, Output, OutputState, Pattern, Rect, Screen, Source, ToEngine};
 use uuid::Uuid;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::WindowId;
 
-use crate::audio::Mixer;
-use crate::compositor::{Compositor, LayerTexture, ScreenSlot};
+use crate::audio::{AudioTap, Mixer};
+use crate::buses::{Buses, FileOpener};
+use crate::compositor::{Compositor, ScreenSlot};
 use crate::frame_clock::FrameClock;
 use crate::gpu::Gpu;
 use crate::outputs::{Outputs, monitors};
-use crate::player::{ImageSource, Player};
 
 const MONITOR_POLL: Duration = Duration::from_secs(2);
 const IDENTIFY: Duration = Duration::from_secs(3);
@@ -59,30 +54,20 @@ pub fn event_loop() -> anyhow::Result<(EventLoop<UserEvent>, EngineHandle)> {
     Ok((event_loop, handle))
 }
 
-/// A media layer's frame source.
-// ponytail: one per program layer id, opened (blocking) on SetProgram; Task 9's player pool
-// (players shared across PVW/PGM by refcount) replaces this map.
-enum Media {
-    Video(Box<Player>),
-    Image(Box<ImageSource>),
-}
-
 /// Engine state driven by `event_loop().run_app(&mut app)`; replies go out through `events`.
 pub struct App {
     gpu: Gpu,
     compositor: Compositor,
     outputs: Outputs,
     config: EngineConfig,
-    program: Scene,
+    buses: Buses<FileOpener>,
     events: Sender<FromEngine>,
     status: Vec<OutputState>,
     next_poll: Instant,
     identify: HashMap<Uuid, Instant>,
-    /// Program layer id → (media id, source).
-    media: HashMap<Uuid, (Uuid, Media)>,
-    /// Newly opened videos, started together once all are ready (show their first frame or failed).
-    starting: Vec<Uuid>,
     clock: FrameClock,
+    /// The current frame's time on the frame clock: commands act at it, previews render it.
+    now: Instant,
     /// The last frame presented on a Fifo surface (so the next one is one vsync later).
     paced: bool,
     presented: u32,
@@ -90,6 +75,10 @@ pub struct App {
     stats_since: Instant,
     /// `None`: no usable output device, the engine runs silent.
     mixer: Option<Mixer>,
+    // Per-frame scratch, reused so the render path doesn't allocate.
+    views: HashMap<Uuid, wgpu::TextureView>,
+    mappings: Vec<Mapping>,
+    taps: Vec<(AudioTap, f32)>,
 }
 
 impl App {
@@ -110,24 +99,27 @@ impl App {
                 None
             }
         };
+        let now = Instant::now();
         Ok(App {
             compositor: Compositor::new(&gpu),
+            buses: Buses::new(FileOpener::new(gpu.clone(), mixer.as_ref().map(Mixer::format))),
             gpu,
             outputs: Outputs::default(),
             config: EngineConfig { outputs: vec![], screens: vec![], mappings: vec![], media: vec![] },
-            program: Scene::new(),
             events,
             status: vec![],
-            next_poll: Instant::now() + MONITOR_POLL,
+            next_poll: now + MONITOR_POLL,
             identify: HashMap::new(),
-            media: HashMap::new(),
-            starting: vec![],
-            clock: FrameClock::new(period(FALLBACK_MHZ), Instant::now()),
+            clock: FrameClock::new(period(FALLBACK_MHZ), now),
+            now,
             paced: false,
             presented: 0,
             dropped: 0,
-            stats_since: Instant::now(),
+            stats_since: now,
             mixer,
+            views: HashMap::new(),
+            mappings: vec![],
+            taps: vec![],
         })
     }
 
@@ -138,19 +130,22 @@ impl App {
     fn command(&mut self, event_loop: &ActiveEventLoop, command: ToEngine) {
         match command {
             ToEngine::SetConfig { config } => {
+                self.buses.opener().media = config.media.clone();
                 self.config = config;
                 self.apply(event_loop, true);
-                self.sync_media();
+                // Opens media layers that couldn't open before (e.g. their media wasn't listed yet).
+                let (pgm, pvw) = (self.buses.scene(Bus::Pgm).clone(), self.buses.scene(Bus::Pvw).clone());
+                self.buses.set_program(pgm, self.now);
+                self.buses.set_preview(pvw);
             }
-            ToEngine::SetProgram { scene } => {
-                self.program = scene;
-                self.sync_media();
-            }
-            ToEngine::SetMasterVolume { volume } => {
-                if let Some(mixer) = &self.mixer {
-                    mixer.set_master(volume);
-                }
-            }
+            ToEngine::SetPreview { scene } => self.buses.set_preview(scene),
+            ToEngine::SetProgram { scene } => self.buses.set_program(scene, self.now),
+            ToEngine::Take { transition } => self.buses.take(&transition, self.now),
+            ToEngine::Transport { bus, layer, action } => self.buses.transport(bus, layer, action, self.now),
+            ToEngine::SetMasterVolume { volume } => match &self.mixer {
+                Some(mixer) => mixer.set_master(volume),
+                None => eprintln!("master volume: no audio output"),
+            },
             ToEngine::ListMonitors => self.send(FromEngine::Monitors { monitors: monitors(event_loop) }),
             ToEngine::Identify { output_id } => {
                 if self.config.outputs.iter().any(|o| o.id == output_id) {
@@ -159,11 +154,7 @@ impl App {
                     eprintln!("identify: unknown output {output_id}");
                 }
             }
-            other => {
-                let debug = format!("{other:?}");
-                let name = debug.split([' ', '{', '(']).next().unwrap_or_default();
-                eprintln!("{name}: unsupported until later task, ignored");
-            }
+            ToEngine::Probe { .. } => eprintln!("Probe: unsupported until later task, ignored"),
         }
     }
 
@@ -181,89 +172,12 @@ impl App {
         }
     }
 
-    /// Opens a source for every program media layer that lacks one (without blocking: R22) and
-    /// drops the sources of layers that are gone. New videos start together once all are ready
-    /// (see `start_ready`), so none skips its opening frames.
-    fn sync_media(&mut self) {
-        let wanted: HashMap<Uuid, Uuid> = (self.program.values().flatten())
-            .filter_map(|l| match l.source {
-                Source::Media { media_id } => Some((l.id, media_id)),
-                Source::Pattern { .. } => None,
-            })
-            .collect();
-        self.media.retain(|layer, (media, _)| wanted.get(layer) == Some(media));
-        for layer in self.program.values().flatten() {
-            let Source::Media { media_id } = layer.source else { continue };
-            if self.media.contains_key(&layer.id) {
-                continue;
-            }
-            match self.open_media(layer, media_id) {
-                Ok(media) => {
-                    self.media.insert(layer.id, (media_id, media));
-                    self.starting.push(layer.id);
-                }
-                Err(e) => self.send(FromEngine::Error { message: format!("layer {}: {e:#}", layer.id) }),
-            }
-        }
-        self.set_taps();
-    }
-
-    /// Mixes the program video layers' audio at their layer volumes. A paused player's tap stays
-    /// silent by itself, so this only runs when the program changes.
-    fn set_taps(&self) {
-        let Some(mixer) = &self.mixer else { return };
-        let taps = (self.program.values().flatten())
-            .filter_map(|l| match self.media.get(&l.id) {
-                Some((_, Media::Video(player))) => Some((player.audio()?, l.volume)),
-                _ => None,
-            })
-            .collect();
-        mixer.set_taps(taps);
-    }
-
-    /// Plays the newly opened videos at `now` once every one of them is ready.
-    fn start_ready(&mut self, now: Instant) {
-        let waiting = |id| matches!(self.media.get(id), Some((_, Media::Video(player))) if !player.ready());
-        if self.starting.iter().any(waiting) {
-            return;
-        }
-        for id in std::mem::take(&mut self.starting) {
-            if let Some((_, Media::Video(player))) = self.media.get_mut(&id) {
-                player.play(now);
-            }
-        }
-    }
-
-    fn open_media(&self, layer: &Layer, media_id: Uuid) -> anyhow::Result<Media> {
-        let item = self.config.media.iter().find(|m| m.id == media_id).context("unknown media")?;
-        let path = Path::new(&item.path);
-        Ok(match item.kind {
-            MediaKind::Video => {
-                let audio = self.mixer.as_ref().map(Mixer::format);
-                Media::Video(Box::new(Player::open(path, layer.playback.clone(), audio)?))
-            }
-            MediaKind::Image => Media::Image(Box::new(ImageSource::open(&self.gpu, path)?)),
-        })
-    }
-
-    /// Forwards media and audio output errors; once a second reports presented fps and total
-    /// dropped frames.
+    /// Forwards audio output errors; once a second reports presented fps and total dropped frames.
     fn report(&mut self, real: Instant) {
         if let Some(message) = self.mixer.as_ref().and_then(Mixer::take_error) {
             self.send(FromEngine::Error { message });
         }
-        for (_, media) in self.media.values_mut() {
-            let error = match media {
-                Media::Video(player) => {
-                    self.dropped += player.take_dropped();
-                    player.take_error()
-                }
-                Media::Image(image) => image.take_error(),
-            };
-            if let Some(message) = error {
-                let _ = self.events.send(FromEngine::Error { message });
-            }
-        }
+        self.dropped += self.buses.take_dropped();
         self.presented += self.paced as u32;
         let elapsed = real - self.stats_since;
         if elapsed >= STATS {
@@ -273,35 +187,64 @@ impl App {
         }
     }
 
-    /// Composites every screen from `program` with each media layer's frame for `now` (frame
-    /// clock time) and draws all outputs. Returns whether a Fifo present paced this frame.
-    fn render(&mut self, now: Instant) -> bool {
+    /// Composites every configured screen of `bus` at `self.now` into `self.views`.
+    fn render_screens(&mut self, bus: Bus) {
+        self.views.clear();
+        for screen in &self.config.screens {
+            let view = screen_view(&self.gpu, &mut self.compositor, &mut self.buses, bus, screen, self.now);
+            self.views.insert(screen.id, view);
+        }
+    }
+
+    /// Draws PGM to every output. Returns whether a Fifo present paced this frame.
+    fn render(&mut self) -> bool {
         if self.outputs.is_empty() {
             return false;
         }
-        let period = self.clock.period();
-        let mut views = HashMap::new();
-        for screen in &self.config.screens {
-            let layers: Vec<(Layer, Option<LayerTexture>)> = (self.program.get(&screen.id).into_iter().flatten())
-                .map(|l| {
-                    // Hidden layers too: polling collects decode errors and keeps the queue moving.
-                    let frame = match self.media.get_mut(&l.id) {
-                        Some((_, Media::Video(player))) => player.current_frame(&self.gpu, now, period),
-                        Some((_, Media::Image(image))) => image.texture(),
-                        None => None,
-                    };
-                    (l.clone(), frame)
-                })
-                .collect();
-            views.insert(screen.id, self.compositor.render_screen(&self.gpu, ScreenSlot::Pgm, screen, &layers));
+        self.render_screens(Bus::Pgm);
+        let mappings = if self.identify.is_empty() {
+            &self.config.mappings
+        } else {
+            self.mappings.clone_from(&self.config.mappings);
+            for output in self.config.outputs.iter().filter(|o| self.identify.contains_key(&o.id)) {
+                let (mapping, view) = identify_overlay(&self.gpu, &mut self.compositor, output);
+                self.mappings.push(mapping);
+                self.views.insert(output.id, view);
+            }
+            &self.mappings
+        };
+        self.outputs.render(&self.gpu, &mut self.compositor, &self.config.outputs, mappings, &self.views)
+    }
+
+    /// `bus`'s screens at their layout positions, `width` px wide, for the controller's preview
+    /// (Task 10). Rendered only when asked: PVW is never drawn otherwise.
+    pub fn render_preview(&mut self, bus: Bus, width: u32) -> wgpu::TextureView {
+        self.render_screens(bus);
+        self.compositor.render_layout(&self.gpu, &self.config.screens, &self.views, width)
+    }
+}
+
+/// One screen of `bus` at `now`; PGM mid-transition mixes the outgoing render into the incoming.
+fn screen_view(
+    gpu: &Gpu,
+    compositor: &mut Compositor,
+    buses: &mut Buses<FileOpener>,
+    bus: Bus,
+    screen: &Screen,
+    now: Instant,
+) -> wgpu::TextureView {
+    let slot = match bus {
+        Bus::Pgm => ScreenSlot::Pgm,
+        Bus::Pvw => ScreenSlot::Pvw,
+    };
+    let view = compositor.render_screen(gpu, slot, screen, buses.layers(slot, screen.id));
+    match buses.transition(screen.id, now).filter(|_| bus == Bus::Pgm) {
+        Some((kind, p)) => {
+            let layers = buses.layers(ScreenSlot::Outgoing, screen.id);
+            let outgoing = compositor.render_screen(gpu, ScreenSlot::Outgoing, screen, layers);
+            compositor.render_transition(gpu, screen, &outgoing, &view, &kind, p)
         }
-        let mut mappings = self.config.mappings.clone();
-        for output in self.config.outputs.iter().filter(|o| self.identify.contains_key(&o.id)) {
-            let (mapping, view) = identify_overlay(&self.gpu, &mut self.compositor, output);
-            mappings.push(mapping);
-            views.insert(output.id, view);
-        }
-        self.outputs.render(&self.gpu, &mut self.compositor, &self.config.outputs, &mappings, &views)
+        None => view,
     }
 }
 
@@ -341,9 +284,16 @@ impl ApplicationHandler<UserEvent> for App {
             self.apply(event_loop, false);
         }
         self.identify.retain(|_, until| *until > real);
-        let now = self.clock.tick(real, self.paced);
-        self.paced = self.render(now);
-        self.start_ready(now);
+        self.now = self.clock.tick(real, self.paced);
+        // Polled with or without output windows, so errors and readiness always surface.
+        for event in self.buses.tick(self.now, self.clock.period()) {
+            self.send(event);
+        }
+        if let Some(mixer) = &self.mixer {
+            self.buses.audio_taps(self.now, &mut self.taps);
+            mixer.set_taps(self.taps.drain(..));
+        }
+        self.paced = self.render();
         self.report(real);
         let flow = if self.paced { ControlFlow::Poll } else { ControlFlow::WaitUntil(real + IDLE_TICK) };
         event_loop.set_control_flow(flow);

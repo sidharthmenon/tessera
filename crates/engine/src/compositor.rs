@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
-use tessera_show::{Layer, Mapping, Output, Pattern, Rect, Screen, Source};
+use tessera_show::{Layer, Mapping, Output, Pattern, Rect, Screen, Source, TransitionKind};
 use uuid::Uuid;
 use wgpu::util::DeviceExt;
 
@@ -31,12 +31,14 @@ pub enum Planes {
 }
 
 /// Which copy of a screen to render: PGM, PVW and a transition's outgoing PGM can all show the
-/// same screen in one frame, so each gets its own texture. During a transition, incoming = `Pgm`.
+/// same screen in one frame, so each gets its own texture. During a transition, incoming = `Pgm`
+/// and `Transition` holds the mix of `Outgoing` into it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScreenSlot {
     Pgm,
     Pvw,
     Outgoing,
+    Transition,
 }
 
 /// Mirrors `U` in shaders/layer.wgsl.
@@ -56,6 +58,15 @@ struct LayerUniform {
     _pad: [f32; 3],
 }
 
+/// Mirrors `U` in shaders/transition.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TransitionUniform {
+    kind: u32,
+    p: f32,
+    _pad: [f32; 2],
+}
+
 /// Mirrors `U` in shaders/map.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -72,6 +83,7 @@ pub struct Compositor {
     pipeline_layout: wgpu::PipelineLayout,
     map_shader: wgpu::ShaderModule,
     layer_pipeline: wgpu::RenderPipeline,
+    transition_pipeline: wgpu::RenderPipeline,
     /// Keyed by target format: outputs may be surfaces (e.g. Bgra8Unorm).
     map_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     sampler: wgpu::Sampler,
@@ -110,11 +122,14 @@ impl Compositor {
         };
         let layer_shader = shader(include_str!("shaders/layer.wgsl"));
         let layer_pipeline = pipeline(gpu, &pipeline_layout, &layer_shader, wgpu::TextureFormat::Rgba8Unorm);
+        let transition_shader = shader(include_str!("shaders/transition.wgsl"));
+        let transition_pipeline = pipeline(gpu, &pipeline_layout, &transition_shader, wgpu::TextureFormat::Rgba8Unorm);
         Compositor {
             map_shader: shader(include_str!("shaders/map.wgsl")),
             bind_layout,
             pipeline_layout,
             layer_pipeline,
+            transition_pipeline,
             map_pipelines: HashMap::new(),
             // Linear + clamp-to-edge (the default address mode).
             sampler: d.create_sampler(&wgpu::SamplerDescriptor {
@@ -137,6 +152,44 @@ impl Compositor {
         screen: &Screen,
         layers: &[(Layer, Option<LayerTexture>)],
     ) -> wgpu::TextureView {
+        let view = self.target(gpu, slot, screen);
+        let size = [view.texture().width() as f32, view.texture().height() as f32];
+        let groups: Vec<_> = layers
+            .iter()
+            .filter(|(l, _)| l.visible)
+            .filter_map(|(l, t)| self.layer_group(gpu, size, l, t.as_ref()))
+            .collect();
+        draw(gpu, &view, wgpu::Color::TRANSPARENT, &self.layer_pipeline, &groups);
+        view
+    }
+
+    /// Mixes two renders of `screen` (premultiplied) into its `Transition` texture at progress `p`
+    /// (0 = all `outgoing`): Fade cross-fades; WipeLeft reveals `incoming` from the left edge up to
+    /// a hard edge at p·width, WipeRight from the right edge. Cut shows `incoming`.
+    pub fn render_transition(
+        &mut self,
+        gpu: &Gpu,
+        screen: &Screen,
+        outgoing: &wgpu::TextureView,
+        incoming: &wgpu::TextureView,
+        kind: &TransitionKind,
+        p: f32,
+    ) -> wgpu::TextureView {
+        let (kind, p) = match kind {
+            TransitionKind::Fade => (0, p),
+            TransitionKind::WipeLeft => (1, p),
+            TransitionKind::WipeRight => (2, p),
+            TransitionKind::Cut => (0, 1.),
+        };
+        let view = self.target(gpu, ScreenSlot::Transition, screen);
+        let u = TransitionUniform { kind, p: p.clamp(0., 1.), _pad: [0.; 2] };
+        let group = self.bind(gpu, outgoing, incoming, bytemuck::bytes_of(&u));
+        draw(gpu, &view, wgpu::Color::TRANSPARENT, &self.transition_pipeline, &[group]);
+        view
+    }
+
+    /// The cached Rgba8Unorm texture for `(screen, slot)`, (re)made at the screen's clamped size.
+    fn target(&mut self, gpu: &Gpu, slot: ScreenSlot, screen: &Screen) -> wgpu::TextureView {
         let size = gpu.target_size(screen.width, screen.height);
         let view = self
             .screens
@@ -145,15 +198,7 @@ impl Compositor {
         if (view.texture().width(), view.texture().height()) != size {
             *view = gpu.target(screen.width, screen.height).create_view(&Default::default());
         }
-        let view = view.clone();
-        let size = [size.0 as f32, size.1 as f32];
-        let groups: Vec<_> = layers
-            .iter()
-            .filter(|(l, _)| l.visible)
-            .filter_map(|(l, t)| self.layer_group(gpu, size, l, t.as_ref()))
-            .collect();
-        draw(gpu, &view, wgpu::Color::TRANSPARENT, &self.layer_pipeline, &groups);
-        view
+        view.clone()
     }
 
     /// Clears `target` to black and draws each of `output`'s mappings (others are ignored): the

@@ -50,8 +50,17 @@ pub struct Player {
     state: State,
     /// Next frame, not due yet.
     pending: Option<(Duration, Frame)>,
+    /// Newest due frame, not uploaded yet (`texture` uploads it).
+    due: Option<Frame>,
     ended: bool,
+    /// Once, past its end: transparent.
+    over: bool,
     failed: bool,
+    /// Stopped: the uploaded texture is the old position's, so nothing shows until the new
+    /// epoch's first frame is uploaded.
+    stale: bool,
+    /// `texture` ran since the last `poll`: the layer is on screen, so skipped frames count as dropped.
+    shown: bool,
     gpu: Option<GpuFrame>,
     error: Option<String>,
     dropped: u64,
@@ -80,7 +89,25 @@ impl Player {
             }
         })?;
         let state = State::Paused(Duration::ZERO);
-        Ok(Player { playback, duration: None, frames, seek, epoch: 0, state, pending: None, ended: false, failed: false, gpu: None, error: None, dropped: 0, audio })
+        Ok(Player {
+            playback,
+            duration: None,
+            frames,
+            seek,
+            epoch: 0,
+            state,
+            pending: None,
+            due: None,
+            ended: false,
+            over: false,
+            failed: false,
+            stale: false,
+            shown: false,
+            gpu: None,
+            error: None,
+            dropped: 0,
+            audio,
+        })
     }
 
     pub fn play(&mut self, at: Instant) {
@@ -99,14 +126,15 @@ impl Player {
         }
     }
 
-    /// Back to the first frame, paused.
+    /// Back to the first frame, paused. Shows nothing until that frame is decoded again (never the
+    /// old position's frame).
     pub fn stop(&mut self) {
         self.epoch += 1;
         if let Some(tap) = &self.audio {
             tap.reset(self.epoch); // before the seek: the decode thread pushes the new epoch's audio only after
         }
         let _ = self.seek.send(self.epoch);
-        (self.state, self.pending, self.ended) = (State::Paused(Duration::ZERO), None, false);
+        (self.state, self.pending, self.due, self.ended, self.stale) = (State::Paused(Duration::ZERO), None, None, false, true);
     }
 
     pub fn restart(&mut self, at: Instant) {
@@ -124,22 +152,31 @@ impl Player {
         position.as_millis() as u64
     }
 
-    /// Showing its first frame, or failed: waiting longer won't change how it starts.
+    /// Its first frame is decoded (or it failed): waiting longer won't change how it starts.
     pub fn ready(&self) -> bool {
-        self.gpu.is_some() || self.failed
+        self.showing() || self.due.is_some() || self.failed
     }
 
-    /// The newest frame due at `now` (pts ≤ position + `period`/2, so frame boundaries sit half
-    /// a vsync away from the ticks: R19), uploaded into this player's reused textures. `None`:
-    /// nothing to show (first frame not decoded yet, Once after its end, or the player failed;
-    /// see `take_error`). Call it every frame: it also collects the decode thread's messages.
+    /// `poll` then `texture`.
     pub fn current_frame(&mut self, gpu: &Gpu, now: Instant, period: Duration) -> Option<LayerTexture> {
+        self.poll(now, period);
+        self.texture(gpu)
+    }
+
+    /// Advances to `now`: collects the decode thread's messages and keeps the newest frame due
+    /// (pts ≤ position + `period`/2, so frame boundaries sit half a vsync away from the ticks: R19)
+    /// for `texture`. Call it every loop iteration, drawn or not, so errors and readiness surface
+    /// and the queue keeps moving; frames that come due while the layer isn't drawn are skipped
+    /// without an upload.
+    pub fn poll(&mut self, now: Instant, period: Duration) {
+        let shown = std::mem::take(&mut self.shown);
         let t = self.elapsed(now);
-        if self.failed || (self.playback == Playback::Once && self.duration.is_some_and(|d| t >= d)) {
-            return None;
+        self.over = self.playback == Playback::Once && self.duration.is_some_and(|d| t >= d);
+        if self.failed || self.over {
+            return;
         }
         let due = t + period / 2;
-        let (mut newest, mut taken) = (None, 0);
+        let mut taken = 0;
         loop {
             let msg = match self.pending.take() {
                 Some((t, frame)) => Msg::Frame { epoch: self.epoch, t, frame },
@@ -156,27 +193,41 @@ impl Player {
                     self.pending = Some((t, frame));
                     break;
                 }
-                Msg::Frame { frame, .. } => (newest, taken) = (Some(frame), taken + 1),
+                Msg::Frame { frame, .. } => (self.due, taken) = (Some(frame), taken + 1),
                 Msg::End { epoch } => self.ended |= epoch == self.epoch,
                 Msg::Error(e) => return self.fail(e),
             }
         }
-        match newest {
-            // More than one due: the ones before the newest are never shown.
-            Some(frame) => {
-                self.dropped += taken - 1;
-                if let Err(e) = self.upload(gpu, &frame) {
-                    return self.fail(format!("{e:#}"));
-                }
-            }
-            // Playing, showing something, nothing queued and not at the end: the decoder is late,
-            // the frame repeats.
-            None if matches!(self.state, State::Playing(_)) && self.gpu.is_some() && self.pending.is_none() && !self.ended => {
-                self.dropped += 1
-            }
-            None => {}
+        if !shown {
+            return;
         }
-        self.gpu.as_ref().map(|g| g.layer.clone())
+        if taken > 1 {
+            self.dropped += taken - 1; // the ones before the newest are never shown
+        } else if taken == 0 && matches!(self.state, State::Playing(_)) && self.showing() && self.pending.is_none() && !self.ended {
+            self.dropped += 1; // the decoder is late: the frame repeats
+        }
+    }
+
+    /// The frame for the last `poll`, uploaded into this player's reused textures if new. `None`:
+    /// nothing to show (first frame not decoded yet, stopped and its first frame not back yet,
+    /// Once after its end, or the player failed; see `take_error`).
+    pub fn texture(&mut self, gpu: &Gpu) -> Option<LayerTexture> {
+        self.shown = true;
+        if self.failed || self.over {
+            return None;
+        }
+        if let Some(frame) = self.due.take() {
+            if let Err(e) = self.upload(gpu, &frame) {
+                self.fail(format!("{e:#}"));
+                return None;
+            }
+            self.stale = false;
+        }
+        self.gpu.as_ref().filter(|_| !self.stale).map(|g| g.layer.clone())
+    }
+
+    fn showing(&self) -> bool {
+        self.gpu.is_some() && !self.stale
     }
 
     /// The error that made this player go transparent, or why its audio failed (the video plays
@@ -203,9 +254,8 @@ impl Player {
         }
     }
 
-    fn fail(&mut self, error: String) -> Option<LayerTexture> {
-        (self.failed, self.error, self.gpu) = (true, Some(error), None);
-        None
+    fn fail(&mut self, error: String) {
+        (self.failed, self.error, self.gpu, self.due) = (true, Some(error), None, None);
     }
 
     fn upload(&mut self, gpu: &Gpu, frame: &Frame) -> anyhow::Result<()> {

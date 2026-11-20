@@ -331,3 +331,68 @@ fn oversized_image_is_err() {
     let error = texture.unwrap_err();
     assert!(error.contains("exceeds the GPU texture limit"), "{error}");
 }
+
+/// Mean absolute difference per byte of two read-backs.
+fn diff(a: &[u8], b: &[u8]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x.abs_diff(*y) as f64).sum::<f64>() / a.len() as f64
+}
+
+/// The frame for `now` once the decode thread has caught up with it (~0.2 s of polling).
+fn settled_frame(player: &mut Player, gpu: &Gpu, now: Instant) -> Vec<u8> {
+    for _ in 0..100 {
+        player.current_frame(gpu, now, PERIOD);
+        std::thread::sleep(ms(2));
+    }
+    render(gpu, frame(player, gpu, now).unwrap())
+}
+
+#[test]
+fn player_stop_shows_first_frame() {
+    // After stop the layer shows nothing until the new epoch's first frame is back, then that
+    // frame: never the stale mid-clip one.
+    let gpu = gpu();
+    let mut player = Player::open(&fixture("h264_64.mp4"), Playback::Loop, None).unwrap();
+    let t0 = Instant::now();
+    let first = render(&gpu, frame(&mut player, &gpu, t0).unwrap());
+    player.play(t0);
+    let mid = settled_frame(&mut player, &gpu, t0 + ms(500));
+    assert!(diff(&first, &mid) > 10., "testsrc2 0.5 s in differs from its first frame ({})", diff(&first, &mid));
+    player.stop();
+    let after = render(&gpu, frame(&mut player, &gpu, t0 + ms(600)).unwrap());
+    assert!(diff(&first, &after) < 1., "first frame again, not the stale one ({})", diff(&first, &after));
+    assert_eq!(player.position_ms(t0 + ms(5000)), 0, "stopped: paused at 0");
+}
+
+#[test]
+fn player_restart_resets_position() {
+    let gpu = gpu();
+    let mut player = Player::open(&fixture("h264_64.mp4"), Playback::Loop, None).unwrap();
+    let t0 = Instant::now();
+    let first = render(&gpu, frame(&mut player, &gpu, t0).unwrap());
+    player.play(t0);
+    settled_frame(&mut player, &gpu, t0 + ms(600));
+    assert_eq!(player.position_ms(t0 + ms(600)), 600);
+    let t1 = t0 + ms(600);
+    player.restart(t1);
+    assert_eq!(player.position_ms(t1), 0);
+    assert_eq!(player.position_ms(t1 + ms(200)), 200, "playing from 0");
+    let again = render(&gpu, frame(&mut player, &gpu, t1).unwrap());
+    assert!(diff(&first, &again) < 1., "shows the first frame ({})", diff(&first, &again));
+}
+
+#[test]
+fn player_pause_holds_position() {
+    let gpu = gpu();
+    let mut player = Player::open(&fixture("h264_64.mp4"), Playback::Loop, None).unwrap();
+    let t0 = Instant::now();
+    frame(&mut player, &gpu, t0).unwrap(); // opened: duration known
+    player.play(t0);
+    let at_pause = settled_frame(&mut player, &gpu, t0 + ms(400));
+    player.pause(t0 + ms(400));
+    assert_eq!(player.position_ms(t0 + ms(2000)), 400);
+    let later = settled_frame(&mut player, &gpu, t0 + ms(2000));
+    assert!(diff(&at_pause, &later) < 1., "paused: the frame holds ({})", diff(&at_pause, &later));
+    let t2 = t0 + ms(3000);
+    player.play(t2);
+    assert_eq!(player.position_ms(t2 + ms(100)), 500, "resumes where it paused");
+}

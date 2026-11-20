@@ -160,13 +160,13 @@ impl Mixer {
         self.format
     }
 
-    /// Replaces the mixed taps; volumes clamp to 0..1 (non-finite: 0). One swap under a lock the
-    /// callback only try-locks; the old list is dropped here, never in the callback.
-    pub fn set_taps(&self, mut taps: Vec<(AudioTap, f32)>) {
-        for (_, volume) in &mut taps {
-            *volume = unit(*volume).unwrap_or(0.);
-        }
-        let _old = std::mem::replace(&mut *lock(&self.shared.taps), taps);
+    /// Replaces the mixed taps; volumes clamp to 0..1 (non-finite: 0). Refilled in place (no
+    /// allocation once the list has grown) under a lock the callback only try-locks; replaced taps
+    /// are dropped here, never in the callback.
+    pub fn set_taps(&self, taps: impl IntoIterator<Item = (AudioTap, f32)>) {
+        let mut current = lock(&self.shared.taps);
+        current.clear();
+        current.extend(taps.into_iter().map(|(tap, volume)| (tap, unit(volume).unwrap_or(0.))));
     }
 
     /// Clamped to 0..1; a non-finite volume is ignored.
@@ -229,7 +229,7 @@ fn mutex<T>(value: T) -> Mutex<T> {
     m
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 

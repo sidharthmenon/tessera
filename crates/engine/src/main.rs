@@ -1,22 +1,28 @@
 use std::path::Path;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use anyhow::Context;
 use tessera_engine::app::{App, event_loop};
 use tessera_show::{
     EngineConfig, Layer, Mapping, MediaItem, MediaKind, Output, OutputTarget, Pattern, Rect, Scene, Screen, Source, ToEngine,
+    Transition, TransitionKind,
 };
 use uuid::Uuid;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let demo = if args.iter().any(|a| a == "--demo") {
-        let bars = Layer::new(Source::Pattern { pattern: Pattern::Bars }, rect(0., 0., 3840., 1080.));
-        Some(demo(1080, vec![bars], vec![]))
+    // (commands now, commands 3 s later)
+    let (demo, later) = if args.iter().any(|a| a == "--demo") {
+        let (config, screen) = demo(1080, vec![]);
+        let scene = |pattern| Scene::from([(screen, vec![Layer::new(Source::Pattern { pattern }, rect(0., 0., 3840., 1080.))])]);
+        let fade = Transition { kind: TransitionKind::Fade, duration_ms: 1000 };
+        let now = vec![ToEngine::SetConfig { config }, ToEngine::SetProgram { scene: scene(Pattern::Bars) }];
+        (now, vec![ToEngine::SetPreview { scene: scene(Pattern::Grid) }, ToEngine::Take { transition: fade }])
     } else if let Some(i) = args.iter().position(|a| a == "--demo-4k") {
-        Some(demo_4k(Path::new(args.get(i + 1).context("--demo-4k needs a clip directory")?)))
+        (demo_4k(Path::new(args.get(i + 1).context("--demo-4k needs a clip directory")?)), vec![])
     } else {
-        None
+        (vec![], vec![])
     };
     let (event_loop, handle) = event_loop()?;
     let (events, replies) = mpsc::channel();
@@ -26,8 +32,15 @@ fn main() -> anyhow::Result<()> {
             eprintln!("engine -> {event:?}");
         }
     });
-    for command in demo.into_iter().flatten() {
+    for command in demo {
         handle.send(command);
+    }
+    if !later.is_empty() {
+        let handle = handle.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            later.into_iter().for_each(|command| _ = handle.send(command));
+        });
     }
     event_loop.run_app(&mut App::new(events)?)?;
     Ok(())
@@ -39,7 +52,7 @@ fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
 
 /// Perf check: the spike's four 4K clips (`gen_clips.sh` names) as full-screen layers, looped,
 /// ProRes 4444 alpha on top.
-fn demo_4k(dir: &Path) -> [ToEngine; 2] {
+fn demo_4k(dir: &Path) -> Vec<ToEngine> {
     let media: Vec<MediaItem> = ["h264.mp4", "hevc8.mp4", "hevc10.mp4", "prores4444a.mov"]
         .map(|clip| MediaItem {
             id: Uuid::new_v4(),
@@ -55,12 +68,14 @@ fn demo_4k(dir: &Path) -> [ToEngine; 2] {
         })
         .into();
     let layers = media.iter().map(|m| Layer::new(Source::Media { media_id: m.id }, rect(0., 0., 3840., 2160.))).collect();
-    demo(2160, layers, media)
+    let (config, screen) = demo(2160, media);
+    vec![ToEngine::SetConfig { config }, ToEngine::SetProgram { scene: Scene::from([(screen, layers)]) }]
 }
 
 /// Smoke test: two windows side by side, each showing one half of a 3840×`height` screen at half
-/// size (`--demo`: 960×540 windows of a Bars screen).
-fn demo(height: u32, layers: Vec<Layer>, media: Vec<MediaItem>) -> [ToEngine; 2] {
+/// size (`--demo`: 960×540 windows of a Bars screen that fades to Grid after 3 s). Returns the
+/// config and the screen's id.
+fn demo(height: u32, media: Vec<MediaItem>) -> (EngineConfig, Uuid) {
     let window = |name: &str, x| Output {
         id: Uuid::new_v4(),
         name: name.into(),
@@ -80,7 +95,6 @@ fn demo(height: u32, layers: Vec<Layer>, media: Vec<MediaItem>) -> [ToEngine; 2]
         dst: rect(0., 0., 960., (height / 2) as f32),
     };
     let mappings = vec![half(&left, 0.), half(&right, 1920.)];
-    let scene = Scene::from([(screen.id, layers)]);
-    let config = EngineConfig { outputs: vec![left, right], screens: vec![screen], mappings, media };
-    [ToEngine::SetConfig { config }, ToEngine::SetProgram { scene }]
+    let id = screen.id;
+    (EngineConfig { outputs: vec![left, right], screens: vec![screen], mappings, media }, id)
 }
