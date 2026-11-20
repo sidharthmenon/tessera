@@ -1,0 +1,12 @@
+[package]
+name = "tessera-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tessera-show = { path = "../show" }
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "1"
+uuid = { version = "1", features = ["v4"] }
+wgpu = "30"
