@@ -27,6 +27,15 @@ pub enum Planes {
     P010 { y: wgpu::TextureView, uv: wgpu::TextureView },
 }
 
+/// Which copy of a screen to render: PGM, PVW and a transition's outgoing PGM can all show the
+/// same screen in one frame, so each gets its own texture. During a transition, incoming = `Pgm`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScreenSlot {
+    Pgm,
+    Pvw,
+    Outgoing,
+}
+
 /// Mirrors `U` in shaders/layer.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -65,7 +74,7 @@ pub struct Compositor {
     sampler: wgpu::Sampler,
     blank: wgpu::TextureView,
     // ponytail: never evicted; prune against EngineConfig.screens if screens churn.
-    screens: HashMap<Uuid, wgpu::TextureView>,
+    screens: HashMap<(Uuid, ScreenSlot), wgpu::TextureView>,
 }
 
 impl Compositor {
@@ -115,27 +124,32 @@ impl Compositor {
         }
     }
 
-    /// Composites `layers` bottom→top into the screen's cached Rgba8Unorm texture (premultiplied,
-    /// cleared transparent). Hidden layers and media layers without a frame are skipped.
+    /// Composites `layers` bottom→top into the cached Rgba8Unorm texture for `(screen, slot)`
+    /// (premultiplied, cleared transparent) and returns a view of it. Hidden layers and media layers
+    /// without a frame are skipped. A screen larger than the device limit is cropped to it.
     pub fn render_screen(
         &mut self,
         gpu: &Gpu,
+        slot: ScreenSlot,
         screen: &Screen,
         layers: &[(Layer, Option<LayerTexture>)],
-    ) -> &wgpu::TextureView {
+    ) -> wgpu::TextureView {
+        let size = gpu.target_size(screen.width, screen.height);
+        let view = self
+            .screens
+            .entry((screen.id, slot))
+            .or_insert_with(|| gpu.target(screen.width, screen.height).create_view(&Default::default()));
+        if (view.texture().width(), view.texture().height()) != size {
+            *view = gpu.target(screen.width, screen.height).create_view(&Default::default());
+        }
+        let view = view.clone();
+        let size = [size.0 as f32, size.1 as f32];
         let groups: Vec<_> = layers
             .iter()
             .filter(|(l, _)| l.visible)
-            .filter_map(|(l, t)| self.layer_group(gpu, screen, l, t.as_ref()))
+            .filter_map(|(l, t)| self.layer_group(gpu, size, l, t.as_ref()))
             .collect();
-        let view = self
-            .screens
-            .entry(screen.id)
-            .or_insert_with(|| gpu.target(screen.width, screen.height).create_view(&Default::default()));
-        if (view.texture().width(), view.texture().height()) != (screen.width, screen.height) {
-            *view = gpu.target(screen.width, screen.height).create_view(&Default::default());
-        }
-        draw(gpu, view, wgpu::Color::TRANSPARENT, &self.layer_pipeline, &groups);
+        draw(gpu, &view, wgpu::Color::TRANSPARENT, &self.layer_pipeline, &groups);
         view
     }
 
@@ -172,11 +186,13 @@ impl Compositor {
         views: &HashMap<Uuid, wgpu::TextureView>,
         width: u32,
     ) -> wgpu::TextureView {
-        let x0 = screens.iter().map(|s| s.layout_x).min().unwrap_or(0);
-        let y0 = screens.iter().map(|s| s.layout_y).min().unwrap_or(0);
-        let x1 = screens.iter().map(|s| s.layout_x + s.width as i32).max().unwrap_or(1);
-        let y1 = screens.iter().map(|s| s.layout_y + s.height as i32).max().unwrap_or(1);
+        // i64: layout_x + width can overflow i32.
+        let x0 = screens.iter().map(|s| s.layout_x as i64).min().unwrap_or(0);
+        let y0 = screens.iter().map(|s| s.layout_y as i64).min().unwrap_or(0);
+        let x1 = screens.iter().map(|s| s.layout_x as i64 + s.width as i64).max().unwrap_or(1);
+        let y1 = screens.iter().map(|s| s.layout_y as i64 + s.height as i64).max().unwrap_or(1);
         let bounds = Rect { x: x0 as f32, y: y0 as f32, w: (x1 - x0).max(1) as f32, h: (y1 - y0).max(1) as f32 };
+        // `as u32` saturates and `target` clamps to the device limit, so a tall layout can't overflow.
         let texture = gpu.target(width, (bounds.h * width as f32 / bounds.w).round() as u32);
         let out = Rect { x: 0., y: 0., w: texture.width() as f32, h: texture.height() as f32 };
         let full_uv = Rect { x: 0., y: 0., w: 1., h: 1. };
@@ -193,11 +209,11 @@ impl Compositor {
         view
     }
 
-    fn layer_group(&self, gpu: &Gpu, screen: &Screen, l: &Layer, tex: Option<&LayerTexture>) -> Option<wgpu::BindGroup> {
+    fn layer_group(&self, gpu: &Gpu, size: [f32; 2], l: &Layer, tex: Option<&LayerTexture>) -> Option<wgpu::BindGroup> {
         let mut u = LayerUniform {
             rect: [l.rect.x, l.rect.y, l.rect.w, l.rect.h],
             color: [0.; 4],
-            screen: [screen.width as f32, screen.height as f32],
+            screen: size,
             kind: 0,
             flags: 0,
             opacity: l.opacity,

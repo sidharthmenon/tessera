@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use tessera_engine::compositor::{Compositor, LayerTexture, Planes};
+use tessera_engine::compositor::{Compositor, LayerTexture, Planes, ScreenSlot};
 use tessera_engine::gpu::{Gpu, read_rgba};
 use tessera_show::{Layer, Mapping, Output, OutputTarget, Pattern, Rect, Screen, Source};
 use uuid::Uuid;
@@ -55,7 +55,7 @@ fn assert_near(got: [u8; 4], want: [u8; 4], tol: u8) {
 
 /// Renders `layers` onto `s` and reads the screen texture back.
 fn render(gpu: &Gpu, c: &mut Compositor, s: &Screen, layers: &[(Layer, Option<LayerTexture>)]) -> Vec<u8> {
-    let view = c.render_screen(gpu, s, layers).clone();
+    let view = c.render_screen(gpu, ScreenSlot::Pgm, s, layers);
     read_rgba(gpu, view.texture())
 }
 
@@ -180,11 +180,36 @@ fn p010_solid_converts() {
 }
 
 #[test]
+fn slots_do_not_alias() {
+    let gpu = gpu();
+    let mut c = Compositor::new(&gpu);
+    let s = screen(10, 10);
+    let full = r(0., 0., 10., 10.);
+    let pgm = c.render_screen(&gpu, ScreenSlot::Pgm, &s, &[solid(RED, full.clone())]);
+    let pvw = c.render_screen(&gpu, ScreenSlot::Pvw, &s, &[solid(BLUE, full)]);
+    assert_eq!(px(&read_rgba(&gpu, pgm.texture()), 10, 5, 5), [255, 0, 0, 255]);
+    assert_eq!(px(&read_rgba(&gpu, pvw.texture()), 10, 5, 5), [0, 0, 255, 255]);
+}
+
+#[test]
+fn oversized_screen_does_not_panic() {
+    let gpu = gpu();
+    let mut c = Compositor::new(&gpu);
+    let max = gpu.device.limits().max_texture_dimension_2d;
+    let s = screen(max + 100, 4);
+    let view = c.render_screen(&gpu, ScreenSlot::Pgm, &s, &[solid(RED, r(0., 0., (max + 100) as f32, 4.))]);
+    assert_eq!((view.texture().width(), view.texture().height()), (max, 4), "clamped to the device limit");
+    assert_eq!(px(&read_rgba(&gpu, view.texture()), max, max - 1, 2), [255, 0, 0, 255]);
+    let tall = Screen { layout_y: i32::MAX, ..screen(1, u32::MAX) };
+    c.render_layout(&gpu, &[tall], &HashMap::new(), 100);
+}
+
+#[test]
 fn screen_split_across_two_outputs() {
     let gpu = gpu();
     let mut c = Compositor::new(&gpu);
     let s = screen(200, 100);
-    let view = c.render_screen(&gpu, &s, &[solid(RED, r(0., 0., 100., 100.)), solid(BLUE, r(100., 0., 100., 100.))]).clone();
+    let view = c.render_screen(&gpu, ScreenSlot::Pgm, &s, &[solid(RED, r(0., 0., 100., 100.)), solid(BLUE, r(100., 0., 100., 100.))]);
     let screens = HashMap::from([(s.id, view)]);
     let (a, b) = (output(100, 100), output(100, 100));
     let full = r(0., 0., 100., 100.);
@@ -202,7 +227,7 @@ fn mapping_outside_bounds_clips() {
     let gpu = gpu();
     let mut c = Compositor::new(&gpu);
     let s = screen(100, 100);
-    let view = c.render_screen(&gpu, &s, &[solid(RED, r(0., 0., 100., 100.))]).clone();
+    let view = c.render_screen(&gpu, ScreenSlot::Pgm, &s, &[solid(RED, r(0., 0., 100., 100.))]);
     let screens = HashMap::from([(s.id, view)]);
     let o = output(100, 100);
     let draw = |c: &mut Compositor, m: Mapping| {
@@ -227,7 +252,7 @@ fn brightness_zero_output_black() {
     let gpu = gpu();
     let mut c = Compositor::new(&gpu);
     let s = screen(100, 100);
-    let view = c.render_screen(&gpu, &s, &[solid([1., 1., 1., 1.], r(0., 0., 100., 100.))]).clone();
+    let view = c.render_screen(&gpu, ScreenSlot::Pgm, &s, &[solid([1., 1., 1., 1.], r(0., 0., 100., 100.))]);
     let mut o = output(100, 100);
     o.brightness = 0.0;
     let full = r(0., 0., 100., 100.);
@@ -244,8 +269,8 @@ fn layout_places_screens_scaled() {
     let b = Screen { layout_x: 100, layout_y: 100, ..screen(100, 100) };
     let full = r(0., 0., 100., 100.);
     let views = HashMap::from([
-        (a.id, c.render_screen(&gpu, &a, &[solid(RED, full.clone())]).clone()),
-        (b.id, c.render_screen(&gpu, &b, &[solid(BLUE, full)]).clone()),
+        (a.id, c.render_screen(&gpu, ScreenSlot::Pgm, &a, &[solid(RED, full.clone())])),
+        (b.id, c.render_screen(&gpu, ScreenSlot::Pgm, &b, &[solid(BLUE, full)])),
     ]);
     // 200×200 layout scaled to 100 px wide
     let view = c.render_layout(&gpu, &[a, b], &views, 100);

@@ -26,20 +26,32 @@ impl Gpu {
             ..Default::default()
         }))
         .context("no GPU adapter found")?;
-        // R16/Rg16 unorm planes for P010 video.
+        // R16/Rg16 unorm planes for P010 video; adapter limits so wide screens (> 8192 px) fit.
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             required_features: wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
+            required_limits: adapter.limits(),
             ..Default::default()
         }))
         .context("GPU device lacks 16-bit normalized textures (needed for P010)")?;
         Ok(Gpu { instance, adapter, device, queue })
     }
 
-    /// Rgba8Unorm render target that can also be sampled and read back.
+    /// Size `target(width, height)` really gets: at least 1 px, at most the device's 2D limit.
+    pub fn target_size(&self, width: u32, height: u32) -> (u32, u32) {
+        let max = self.device.limits().max_texture_dimension_2d;
+        (width.clamp(1, max), height.clamp(1, max))
+    }
+
+    /// Rgba8Unorm render target that can also be sampled and read back; oversize is clamped
+    /// (with a warning) instead of failing.
     pub fn target(&self, width: u32, height: u32) -> wgpu::Texture {
+        let (w, h) = self.target_size(width, height);
+        if width > w || height > h {
+            eprintln!("warning: {width}x{height} exceeds the GPU texture limit, clamped to {w}x{h}");
+        }
         self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
-            size: extent(width, height),
+            size: extent(w, h),
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
