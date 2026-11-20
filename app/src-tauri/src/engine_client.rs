@@ -46,6 +46,13 @@ pub fn parse_port(line: &str) -> Option<u16> {
     line.trim().strip_prefix("TESSERA_ENGINE_LISTENING ")?.parse().ok()
 }
 
+/// `connect`, given up after `limit`: a wedged engine's kernel still accepts the TCP
+/// connection, but the WebSocket handshake never answers.
+pub async fn try_connect(port: u16, token: &str, limit: Duration) -> Result<Ws, String> {
+    let handshake = tokio::time::timeout(limit, connect(port, token)).await;
+    handshake.map_err(|_| format!("no WebSocket handshake within {} ms", limit.as_millis()))?
+}
+
 pub async fn connect(port: u16, token: &str) -> Result<Ws, String> {
     let url = format!("ws://127.0.0.1:{port}/ws?token={token}");
     Ok(tokio_tungstenite::connect_async(url).await.map_err(|e| e.to_string())?.0)
@@ -258,13 +265,13 @@ async fn run_engine(app: &AppHandle, rx: &mut mpsc::UnboundedReceiver<ToEngine>)
     engine.hold.store(false, Ordering::SeqCst);
     let token = new_token();
     let spawned = app.path().app_cache_dir().map_err(|e| e.to_string()).and_then(|cache| {
-        let cmd = app.shell().sidecar("tessera-engine").map_err(|e| e.to_string())?;
+        let cmd = app.shell().sidecar("tessera-render").map_err(|e| e.to_string())?;
         let cmd = cmd.args(["--port".as_ref(), "0".as_ref(), "--cache-dir".as_ref(), cache.as_os_str()]);
         cmd.env("TESSERA_TOKEN", &token).spawn().map_err(|e| e.to_string())
     });
     let (events, child) = match spawned {
         Ok(spawned) => spawned,
-        Err(e) => return (false, format!("can't start tessera-engine: {e}")),
+        Err(e) => return (false, format!("can't start the tessera-render sidecar: {e}")),
     };
     let pid = child.pid(); // before the pump's wait thread can sit on shared_child's lock
     log!("engine: spawned pid {pid}");
@@ -306,7 +313,7 @@ async fn drive(
     let (mut failures, mut backoff, mut connected) = (0, MIN_BACKOFF, false);
     loop {
         let attempt = tokio::select! {
-            ws = connect(port, &info.token) => ws,
+            ws = try_connect(port, &info.token, STALE) => ws,
             _ = gone(exited) => return (connected, "process exited".into()),
         };
         match attempt {
@@ -379,9 +386,14 @@ enum End {
     Closed(String),
 }
 
-async fn send(sink: &mut Sink, msg: &ToEngine) -> Result<(), String> {
-    let json = serde_json::to_string(msg).map_err(|e| e.to_string())?;
-    sink.send(Message::text(json)).await.map_err(|e| e.to_string())
+/// Send, but give up at `deadline`: an engine that stops reading fills the socket buffer and
+/// would block us (and the stale check) forever.
+async fn send(sink: &mut Sink, msg: &ToEngine, deadline: Instant) -> Result<(), End> {
+    let json = serde_json::to_string(msg).map_err(|e| End::Closed(e.to_string()))?;
+    match tokio::time::timeout_at(deadline, sink.send(Message::text(json))).await {
+        Ok(sent) => sent.map_err(|e| End::Closed(e.to_string())),
+        Err(_) => Err(End::Stale),
+    }
 }
 
 async fn session(
@@ -393,20 +405,20 @@ async fn session(
     let engine = app.state::<Engine>();
     let (mut sink, mut stream) = ws.split();
     let resync: Vec<_> = crate::resync(app, rx).into_iter().filter(|m| engine.allowed(m)).collect();
-    log!("engine: resync sent ({} messages)", resync.len());
+    let mut deadline = Instant::now() + STALE;
     for msg in &resync {
-        if let Err(e) = send(&mut sink, msg).await {
-            return End::Closed(e);
+        if let Err(end) = send(&mut sink, msg, deadline).await {
+            return end;
         }
     }
-    let mut deadline = Instant::now() + STALE;
+    log!("engine: resync sent ({} messages)", resync.len());
     loop {
         tokio::select! {
             _ = gone(exited) => return End::Exited,
             _ = sleep_until(deadline) => return End::Stale,
             msg = rx.recv() => match msg {
                 Some(msg) if !engine.allowed(&msg) => {}
-                Some(msg) => if let Err(e) = send(&mut sink, &msg).await { return End::Closed(e) },
+                Some(msg) => if let Err(end) = send(&mut sink, &msg, deadline).await { return end },
                 None => return End::Closed("app shutting down".into()),
             },
             frame = stream.next() => {
@@ -460,6 +472,21 @@ mod tests {
         assert_eq!(adoptable(&file, hang).await, None, "no answer");
         assert!(start.elapsed() < Duration::from_secs(2));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_gives_up_on_silent_listener() {
+        // Accepts the TCP connection (like a stopped engine's kernel backlog), never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(1).collect();
+            std::thread::sleep(Duration::from_secs(5));
+            drop(held);
+        });
+        let start = std::time::Instant::now();
+        assert!(try_connect(port, "t", Duration::from_millis(300)).await.is_err());
+        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
     }
 
     #[test]

@@ -1,6 +1,8 @@
 #!/bin/sh
 # Build tessera-engine and copy it to where Tauri expects the sidecar:
-# app/src-tauri/binaries/tessera-engine-<target triple>.  Usage: build-engine.sh [release]
+# app/src-tauri/binaries/tessera-render-<target triple>. The sidecar has its own name so
+# tauri-build's copy (target/<profile>/tessera-render) never replaces cargo's
+# target/<profile>/tessera-engine.  Usage: build-engine.sh [release]
 set -eu
 root="$(cd "$(dirname "$0")/.." && pwd)"
 profile="${1:-debug}"
@@ -11,4 +13,4 @@ else
   cargo build --manifest-path "$root/Cargo.toml" -p tessera-engine
 fi
 mkdir -p "$root/app/src-tauri/binaries"
-cp "$root/target/$profile/tessera-engine" "$root/app/src-tauri/binaries/tessera-engine-$triple"
+cp "${CARGO_TARGET_DIR:-$root/target}/$profile/tessera-engine" "$root/app/src-tauri/binaries/tessera-render-$triple"

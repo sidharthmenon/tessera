@@ -63,18 +63,23 @@ impl Controller {
         Live { pvw: self.pvw, last_taken: self.last_taken }
     }
 
-    /// The show's render setup; media paths always absolute.
+    /// The show's render setup. Media paths are absolute: every path that enters is
+    /// (`apply` rejects relative ones, `import_media` and `files::open` resolve them).
     pub fn engine_config(&self) -> EngineConfig {
-        let dir = self.path.as_deref().and_then(Path::parent).unwrap_or(Path::new(""));
         let s = &self.show;
-        let media = s.media.iter()
-            .map(|m| MediaItem { path: dir.join(&m.path).to_string_lossy().into(), ..m.clone() })
-            .collect();
-        EngineConfig { outputs: s.outputs.clone(), screens: s.screens.clone(), mappings: s.mappings.clone(), media }
+        EngineConfig { outputs: s.outputs.clone(), screens: s.screens.clone(), mappings: s.mappings.clone(), media: s.media.clone() }
     }
 
     /// Apply a user edit (one undo step). PGM changes only when the last taken cue is edited.
     pub fn apply(&mut self, op: ShowOp) -> Result<Vec<ToEngine>, String> {
+        let relative = |m: &MediaItem| Path::new(&m.path).is_relative();
+        if match &op {
+            ShowOp::AddMedia { items } => items.iter().any(relative),
+            ShowOp::UpdateMedia { item } => relative(item),
+            _ => false,
+        } {
+            return Err("media paths must be absolute".into());
+        }
         let config = self.engine_config();
         let volume = self.show.master_volume;
         let taken = scene_of(&self.show, self.last_taken).cloned();
@@ -211,6 +216,7 @@ impl Controller {
         let mut items = vec![];
         for p in paths {
             let p = std::path::absolute(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            let p = crate::files::normalize(&p);
             items.push(MediaItem {
                 id: Uuid::new_v4(),
                 name: p.file_name().map(|n| n.to_string_lossy().into()).unwrap_or_default(),
@@ -501,14 +507,27 @@ mod tests {
     }
 
     #[test]
-    fn engine_config_media_paths_absolute() {
-        let mut c = Controller::new();
-        c.path = Some(PathBuf::from("/shows/s.tshow"));
-        let mut item = tessera_show::MediaItem { id: Uuid::new_v4(), name: "m".into(), path: "clips/m.mp4".into(),
+    fn relative_media_paths_rejected() {
+        let item = |path: &str| tessera_show::MediaItem { id: Uuid::new_v4(), name: "m".into(), path: path.into(),
             kind: MediaKind::Video, width: 1, height: 1, duration_ms: None, has_audio: false, has_alpha: false, thumb: None };
-        c.apply(ShowOp::AddMedia { items: vec![item.clone()] }).unwrap();
-        item.path = "/shows/clips/m.mp4".into();
-        assert_eq!(c.engine_config().media, vec![item]);
-        assert!(Path::new(&c.engine_config().media[0].path).is_absolute());
+        for titled in [None, Some(PathBuf::from("/shows/s.tshow"))] {
+            let mut c = Controller::new();
+            c.path = titled;
+            let before = c.show.clone();
+            assert!(c.apply(ShowOp::AddMedia { items: vec![item("clips/m.mp4")] }).is_err());
+            assert_eq!(c.show, before);
+            let good = item("/shows/clips/m.mp4");
+            c.apply(ShowOp::AddMedia { items: vec![good.clone()] }).unwrap();
+            assert!(c.apply(ShowOp::UpdateMedia { item: tessera_show::MediaItem { path: "m.mp4".into(), ..good.clone() } }).is_err());
+            assert_eq!(c.engine_config().media, vec![good]);
+        }
+    }
+
+    #[test]
+    fn import_normalizes_paths() {
+        let mut c = Controller::new();
+        c.import_media(&[PathBuf::from("/shows/a/../b.mov"), PathBuf::from("/shows/./c.png")]).unwrap();
+        let paths: Vec<_> = c.show.media.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, ["/shows/b.mov", "/shows/c.png"]);
     }
 }

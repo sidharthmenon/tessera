@@ -6,5 +6,5 @@
 # will have schema files for capabilities auto-completion
 /gen/schemas
 
-# Tauri sidecar, built by scripts/build-engine.sh
+# Tauri sidecar tessera-render-<triple>: scripts/build-engine.sh (build.rs writes a placeholder)
 /binaries/

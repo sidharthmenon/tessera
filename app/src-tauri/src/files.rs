@@ -4,12 +4,13 @@
 
 use std::collections::HashSet;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use tessera_show::Show;
 
 /// Read a show file (`.tshow` or `.autosave`). Relative media paths come back absolute.
 pub fn open(path: &Path) -> Result<Show, String> {
+    let path = &std::path::absolute(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     // Version first: a newer file may not parse as today's Show at all.
     let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("not a show file: {e}"))?;
@@ -25,7 +26,7 @@ pub fn open(path: &Path) -> Result<Show, String> {
     }
     let dir = path.parent().unwrap_or(Path::new(""));
     for m in &mut show.media {
-        m.path = dir.join(&m.path).to_string_lossy().into(); // join keeps an absolute path as is
+        m.path = normalize(&dir.join(&m.path)).to_string_lossy().into(); // join keeps an absolute path
     }
     Ok(show)
 }
@@ -33,13 +34,17 @@ pub fn open(path: &Path) -> Result<Show, String> {
 /// Save atomically (see `write_atomic`): a crash leaves either the old file or the new one,
 /// never half of one.
 pub fn save_atomic(path: &Path, show: &Show) -> Result<(), String> {
-    let dir = path.parent().unwrap_or(Path::new(""));
+    let abs = std::path::absolute(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let dir = normalize(abs.parent().unwrap_or(Path::new("")));
     let mut show = show.clone();
     for m in &mut show.media {
-        if let Ok(rel) = Path::new(&m.path).strip_prefix(dir) {
+        // Normalized first, so a relative path never climbs out with "..".
+        let media = normalize(Path::new(&m.path));
+        m.path = match media.strip_prefix(&dir) {
             // '/' so a show folder moves between macOS and Windows.
-            m.path = rel.iter().map(|c| c.to_string_lossy()).collect::<Vec<_>>().join("/");
-        }
+            Ok(rel) => rel.iter().map(|c| c.to_string_lossy()).collect::<Vec<_>>().join("/"),
+            Err(_) => media.to_string_lossy().into(),
+        };
     }
     let json = serde_json::to_vec_pretty(&show).map_err(|e| e.to_string())?;
     write_atomic(path, &json, false)
@@ -48,9 +53,7 @@ pub fn save_atomic(path: &Path, show: &Show) -> Result<(), String> {
 /// `bytes` to `<path>.tmp`, fsync, rename over `path`. `private`: owner-only (unix 0600).
 #[cfg_attr(not(unix), allow(unused_variables))]
 pub fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<(), String> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
+    let tmp = suffixed(path, ".tmp");
     let write = || -> std::io::Result<()> {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
@@ -71,14 +74,50 @@ pub fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<(), Stri
     })
 }
 
+/// Unsaved work from an earlier session, moved to `<autosave>.prev` so this session's
+/// autosaves can't overwrite it: the untitled autosave, or `<show>.autosave` when it is newer
+/// than the show file. Returns where it went.
+pub fn take_recovery(show_path: Option<&Path>, data_dir: &Path) -> Option<PathBuf> {
+    let auto = autosave_path(show_path, data_dir);
+    let auto_time = std::fs::metadata(&auto).and_then(|m| m.modified()).ok()?;
+    let saved_since = show_path
+        .and_then(|show| std::fs::metadata(show).and_then(|m| m.modified()).ok())
+        .is_some_and(|show_time| show_time >= auto_time);
+    if saved_since {
+        return None;
+    }
+    let prev = suffixed(&auto, ".prev");
+    std::fs::rename(&auto, &prev).ok()?;
+    Some(prev)
+}
+
+/// `p` with `.` and `..` resolved lexically (no filesystem access; symlinks are not followed).
+pub fn normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => _ = out.pop(),
+                Some(Component::RootDir | Component::Prefix(_)) => {} // "/.." is "/"
+                _ => out.push(".."),
+            },
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn suffixed(p: &Path, suffix: &str) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(suffix);
+    s.into()
+}
+
 /// `<show>.autosave` next to the show, or `<data_dir>/untitled.tshow.autosave` for an untitled one.
 pub fn autosave_path(show_path: Option<&Path>, data_dir: &Path) -> PathBuf {
     match show_path {
-        Some(p) => {
-            let mut s = p.as_os_str().to_owned();
-            s.push(".autosave");
-            s.into()
-        }
+        Some(p) => suffixed(p, ".autosave"),
         None => data_dir.join("untitled.tshow.autosave"),
     }
 }
@@ -86,6 +125,7 @@ pub fn autosave_path(show_path: Option<&Path>, data_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tessera_show::{Cue, MediaItem, MediaKind, Scene, Transition, TransitionKind};
     use uuid::Uuid;
 
@@ -195,6 +235,68 @@ mod tests {
         assert_eq!(open(&moved).unwrap(), show);
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::remove_dir_all(elsewhere).unwrap();
+    }
+
+    #[test]
+    fn save_never_stores_parent_relative_paths() {
+        let (dir, elsewhere) = (temp_dir(), temp_dir());
+        let name = elsewhere.file_name().unwrap().to_str().unwrap().to_owned();
+        let mut show = Show::new();
+        show.media = vec![
+            media(&dir.join("a/../b/x.mp4")),               // inside, after normalizing
+            media(&dir.join("./z.png")),                     // inside
+            media(&dir.join("..").join(&name).join("y.mp4")), // outside, spelled from inside
+        ];
+        let path = dir.join("show.tshow");
+        save_atomic(&path, &show).unwrap();
+        let raw: Show = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let stored: Vec<_> = raw.media.iter().map(|m| m.path.clone()).collect();
+        assert_eq!(stored, ["b/x.mp4".to_string(), "z.png".into(), elsewhere.join("y.mp4").to_string_lossy().into()]);
+        let opened: Vec<_> = open(&path).unwrap().media.into_iter().map(|m| m.path).collect();
+        assert_eq!(opened, [dir.join("b/x.mp4"), dir.join("z.png"), elsewhere.join("y.mp4")]
+            .map(|p| p.to_string_lossy().into_owned()));
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(elsewhere).unwrap();
+    }
+
+    fn set_mtime(path: &Path, t: std::time::SystemTime) {
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(t).unwrap();
+    }
+
+    #[test]
+    fn recovery_moves_newer_autosave_aside() {
+        let dir = temp_dir();
+        let show = dir.join("x.tshow");
+        save_atomic(&show, &Show::new()).unwrap();
+        let auto = autosave_path(Some(&show), &dir);
+        let mut unsaved = Show::new();
+        unsaved.master_volume = 0.3;
+        save_atomic(&auto, &unsaved).unwrap();
+        let now = std::time::SystemTime::now();
+        set_mtime(&show, now - Duration::from_secs(60));
+        set_mtime(&auto, now);
+        let prev = take_recovery(Some(&show), &dir).expect("newer autosave is recoverable");
+        assert_eq!(prev, dir.join("x.tshow.autosave.prev"));
+        assert!(!auto.exists(), "moved, so this session's autosave can't overwrite it");
+        assert_eq!(open(&prev).unwrap(), unsaved);
+        // An autosave older than the show file was saved since: nothing to recover.
+        save_atomic(&auto, &unsaved).unwrap();
+        set_mtime(&auto, now - Duration::from_secs(120));
+        assert_eq!(take_recovery(Some(&show), &dir), None);
+        assert!(auto.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn untitled_autosave_moved_aside() {
+        let data = temp_dir();
+        assert_eq!(take_recovery(None, &data), None);
+        let auto = autosave_path(None, &data);
+        save_atomic(&auto, &Show::new()).unwrap();
+        let prev = take_recovery(None, &data).unwrap();
+        assert_eq!(prev, data.join("untitled.tshow.autosave.prev"));
+        assert!(!auto.exists() && prev.exists());
+        std::fs::remove_dir_all(data).unwrap();
     }
 
     #[test]
