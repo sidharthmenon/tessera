@@ -7,7 +7,7 @@ use uuid::Uuid;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event_loop::ActiveEventLoop;
 use winit::monitor::MonitorHandle;
-use winit::window::{Window, WindowAttributes, WindowLevel};
+use winit::window::{Window, WindowAttributes};
 
 use crate::compositor::Compositor;
 use crate::gpu::Gpu;
@@ -158,8 +158,8 @@ fn open(
     place: Place,
     (width, height): (u32, u32),
 ) -> anyhow::Result<OutputWindow> {
-    // Accessory apps never come to the front: without this, outputs open behind the operator's apps.
-    let attrs = Window::default_attributes().with_title(&output.name).with_window_level(WindowLevel::AlwaysOnTop);
+    // Normal level: Window targets are dev/confidence monitors and must not cover the controller UI.
+    let attrs = Window::default_attributes().with_title(&output.name);
     let window = Arc::new(match &place {
         Place::Window { x, y } => {
             let pos = PhysicalPosition::new(*x, *y);
@@ -213,12 +213,22 @@ fn fullscreen(event_loop: &ActiveEventLoop, attrs: WindowAttributes, monitor: &M
     window.set_outer_position(pos);
     // Simple (pre-Lion) fullscreen: no Spaces animation, the window just covers the screen.
     anyhow::ensure!(window.set_simple_fullscreen(true), "simple fullscreen refused");
+    // The engine is never the active app, so the active app's menu bar (level 24) would draw across
+    // the wall. Screen-saver level (1000) also clears the Dock, notification banners and pop-up
+    // menus, which sit between 24 and 1000; only the cursor stays above.
+    use objc2_app_kit::{NSScreenSaverWindowLevel, NSView};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let RawWindowHandle::AppKit(handle) = window.window_handle()?.as_raw() else { anyhow::bail!("not an AppKit window") };
+    // SAFETY: `ns_view` is the live NSView `window` owns; we are on the main (event loop) thread.
+    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    view.window().context("view has no NSWindow")?.setLevel(NSScreenSaverWindowLevel);
     Ok(window)
 }
 
 #[cfg(not(target_os = "macos"))]
 fn fullscreen(event_loop: &ActiveEventLoop, attrs: WindowAttributes, monitor: &MonitorHandle) -> anyhow::Result<Window> {
-    use winit::window::Fullscreen;
+    use winit::window::{Fullscreen, WindowLevel};
+    let attrs = attrs.with_window_level(WindowLevel::AlwaysOnTop);
     Ok(event_loop.create_window(attrs.with_fullscreen(Some(Fullscreen::Borderless(Some(monitor.clone())))))?)
 }
 
