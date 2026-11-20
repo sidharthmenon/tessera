@@ -70,6 +70,7 @@ pub struct ProbeInfo {
     pub kind: MediaKind,
     pub width: u32,
     pub height: u32,
+    #[ts(type = "number | null")]
     pub duration_ms: Option<u64>,
     pub has_audio: bool,
     pub has_alpha: bool,
@@ -83,8 +84,15 @@ pub enum FromEngine {
     OutputStatus { outputs: Vec<OutputState> },
     Probed { media_id: Uuid, info: Option<ProbeInfo>, error: Option<String> },
     TakeDone,
-    Positions { positions: BTreeMap<Uuid, u64> },
-    Stats { fps: f32, dropped: u64 },
+    Positions {
+        #[ts(type = "Record<string, number>")]
+        positions: BTreeMap<Uuid, u64>,
+    },
+    Stats {
+        fps: f32,
+        #[ts(type = "number")]
+        dropped: u64,
+    },
     Error { message: String },
 }
 

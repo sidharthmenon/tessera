@@ -3,4 +3,4 @@ import type { MonitorInfo } from "./MonitorInfo";
 import type { OutputState } from "./OutputState";
 import type { ProbeInfo } from "./ProbeInfo";
 
-export type FromEngine = { "type": "Monitors", monitors: Array<MonitorInfo>, } | { "type": "OutputStatus", outputs: Array<OutputState>, } | { "type": "Probed", mediaId: string, info: ProbeInfo | null, error: string | null, } | { "type": "TakeDone" } | { "type": "Positions", positions: { [key in string]: bigint }, } | { "type": "Stats", fps: number, dropped: bigint, } | { "type": "Error", message: string, };
+export type FromEngine = { "type": "Monitors", monitors: Array<MonitorInfo>, } | { "type": "OutputStatus", outputs: Array<OutputState>, } | { "type": "Probed", mediaId: string, info: ProbeInfo | null, error: string | null, } | { "type": "TakeDone" } | { "type": "Positions", positions: Record<string, number>, } | { "type": "Stats", fps: number, dropped: number, } | { "type": "Error", message: string, };

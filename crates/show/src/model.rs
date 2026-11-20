@@ -89,6 +89,7 @@ pub struct MediaItem {
     pub kind: MediaKind,
     pub width: u32,
     pub height: u32,
+    #[ts(type = "number | null")]
     pub duration_ms: Option<u64>,
     pub has_audio: bool,
     pub has_alpha: bool,
