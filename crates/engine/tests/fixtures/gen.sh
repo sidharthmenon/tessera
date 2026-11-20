@@ -1,5 +1,5 @@
 #!/bin/sh
-# Regenerates the decode test fixtures (committed; ~52 KB total). Needs the ffmpeg CLI
+# Regenerates the decode test fixtures (committed; ~71 KB total). Needs the ffmpeg CLI
 # (built against Homebrew FFmpeg 9.0.2; hevc_videotoolbox needs macOS). VideoToolbox decodes the
 # first three at 64x64, so the tests can assert the hardware path; FFV1 has no hardware decoder.
 set -e
@@ -26,4 +26,7 @@ ffmpeg $F -f lavfi -i color=c=red:s=64x64:r=30:d=1 \
   -f lavfi -i "color=c=white:s=64x64:r=30:d=1,drawbox=x=0:y=0:w=32:h=64:color=black:t=fill,format=gray" \
   -filter_complex "[0][1]alphamerge,format=yuva420p" -c:v ffv1 -pix_fmt yuva420p $TAGS ffv1_alpha_64.mkv
 
-ls -l h264_64.mp4 prores4444_64.mov hevc10_64.mp4 ffv1_alpha_64.mkv
+# h264_64.mp4 with every AAC packet corrupted (deterministic): audio errors must not stop the video.
+ffmpeg $F -i h264_64.mp4 -c copy -bsf:a noise=amount=2 h264_badaudio_64.mp4
+
+ls -l h264_64.mp4 prores4444_64.mov hevc10_64.mp4 ffv1_alpha_64.mkv h264_badaudio_64.mp4

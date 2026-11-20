@@ -9,6 +9,8 @@ use anyhow::{Context, ensure};
 use ffmpeg_next as ff;
 use ff::ffi;
 
+use crate::audio::{AudioDecoder, AudioTap};
+
 /// How a frame's planes reach the GPU (see `player::layout`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormatKind {
@@ -32,7 +34,7 @@ pub struct DecodedFrameInfo {
 
 /// Decodes `path` to the end on this thread and describes every frame (tests, diagnostics).
 pub fn decode_all_frames(path: &Path) -> anyhow::Result<Vec<DecodedFrameInfo>> {
-    let mut decoder = Decoder::open(path).with_context(|| path.display().to_string())?;
+    let mut decoder = Decoder::open(path, None).with_context(|| path.display().to_string())?;
     let mut frames = vec![];
     while let Some(f) = decoder.next()? {
         frames.push(DecodedFrameInfo { pts_ms: f.pts.as_millis() as u64, format: f.kind, hardware: f.hardware });
@@ -70,7 +72,7 @@ impl Frame {
     }
 }
 
-/// Opens the best video stream only; audio (Task 8) gets its own stream decoder alongside.
+/// The best video stream, plus (given a tap) the best audio stream, decoded from the same packets.
 pub(crate) struct Decoder {
     input: ff::format::context::Input,
     decoder: ff::decoder::Video,
@@ -82,11 +84,12 @@ pub(crate) struct Decoder {
     last_pts: Option<Duration>,
     flushing: bool,
     sws: Option<Sws>,
+    audio: Option<AudioDecoder>,
     pub duration: Duration,
 }
 
 impl Decoder {
-    pub fn open(path: &Path) -> anyhow::Result<Decoder> {
+    pub fn open(path: &Path, audio: Option<AudioTap>) -> anyhow::Result<Decoder> {
         // ffmpeg-next unwraps the path as a CString.
         ensure!(!path.as_os_str().as_encoded_bytes().contains(&0), "path contains a NUL byte");
         init();
@@ -106,6 +109,7 @@ impl Decoder {
         let mut ctx = ff::codec::Context::from_parameters(stream.parameters())?;
         attach_hw(&mut ctx);
         let decoder = ctx.decoder().video().context("unsupported video codec")?;
+        let audio = audio.and_then(|tap| AudioDecoder::open(&input, tap, path));
         Ok(Decoder {
             input,
             decoder,
@@ -116,6 +120,7 @@ impl Decoder {
             last_pts: None,
             flushing: false,
             sws: None,
+            audio,
             duration: Duration::from_secs_f64(seconds),
         })
     }
@@ -133,12 +138,23 @@ impl Decoder {
         }
     }
 
-    /// Back to the first frame.
+    /// Back to the first frame (Loop wrap: audio continues without a gap).
     pub fn rewind(&mut self) -> anyhow::Result<()> {
         self.input.seek(0, ..).context("seek")?;
         self.decoder.flush();
+        if let Some(audio) = &mut self.audio {
+            audio.rewind();
+        }
         (self.flushing, self.last_pts) = (false, None);
         Ok(())
+    }
+
+    /// Back to the first frame for the player's seek `epoch`: audio decoded before it is dropped.
+    pub fn seek(&mut self, epoch: u64) -> anyhow::Result<()> {
+        if let Some(audio) = &mut self.audio {
+            audio.seek(epoch);
+        }
+        self.rewind()
     }
 
     /// Sends the decoder its next packet, or end-of-stream.
@@ -147,9 +163,16 @@ impl Decoder {
         loop {
             match packet.read(&mut self.input) {
                 Ok(()) if packet.stream() == self.stream => return Ok(self.decoder.send_packet(&packet)?),
-                Ok(()) => {} // other streams (audio: Task 8)
+                Ok(()) => {
+                    if let Some(audio) = &mut self.audio {
+                        audio.packet(&packet); // errors go to the tap; the video plays on
+                    }
+                }
                 Err(ff::Error::Eof) => {
                     self.flushing = true;
+                    if let Some(audio) = &mut self.audio {
+                        audio.eof();
+                    }
                     return Ok(self.decoder.send_eof()?);
                 }
                 Err(e) => return Err(e).context("read"),

@@ -1,4 +1,5 @@
 pub mod app;
+pub mod audio;
 pub mod compositor;
 pub mod frame_clock;
 pub mod gpu;

@@ -15,6 +15,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::WindowId;
 
+use crate::audio::Mixer;
 use crate::compositor::{Compositor, LayerTexture, ScreenSlot};
 use crate::frame_clock::FrameClock;
 use crate::gpu::Gpu;
@@ -87,6 +88,8 @@ pub struct App {
     presented: u32,
     dropped: u64,
     stats_since: Instant,
+    /// `None`: no usable output device, the engine runs silent.
+    mixer: Option<Mixer>,
 }
 
 impl App {
@@ -95,6 +98,18 @@ impl App {
         let gpu = Gpu::new_headless()?;
         // A live show must not die on a GPU validation error (the default handler panics).
         gpu.device.on_uncaptured_error(Arc::new(|e| eprintln!("GPU error: {e}")));
+        let mixer = match Mixer::start() {
+            Ok(mixer) => {
+                let (rate, channels) = mixer.format();
+                eprintln!("audio: default output, {rate} Hz, {channels} ch");
+                Some(mixer)
+            }
+            Err(e) => {
+                eprintln!("audio: {e:#}; running silent");
+                let _ = events.send(FromEngine::Error { message: format!("audio: {e:#}") });
+                None
+            }
+        };
         Ok(App {
             compositor: Compositor::new(&gpu),
             gpu,
@@ -112,6 +127,7 @@ impl App {
             presented: 0,
             dropped: 0,
             stats_since: Instant::now(),
+            mixer,
         })
     }
 
@@ -129,6 +145,11 @@ impl App {
             ToEngine::SetProgram { scene } => {
                 self.program = scene;
                 self.sync_media();
+            }
+            ToEngine::SetMasterVolume { volume } => {
+                if let Some(mixer) = &self.mixer {
+                    mixer.set_master(volume);
+                }
             }
             ToEngine::ListMonitors => self.send(FromEngine::Monitors { monitors: monitors(event_loop) }),
             ToEngine::Identify { output_id } => {
@@ -184,6 +205,20 @@ impl App {
                 Err(e) => self.send(FromEngine::Error { message: format!("layer {}: {e:#}", layer.id) }),
             }
         }
+        self.set_taps();
+    }
+
+    /// Mixes the program video layers' audio at their layer volumes. A paused player's tap stays
+    /// silent by itself, so this only runs when the program changes.
+    fn set_taps(&self) {
+        let Some(mixer) = &self.mixer else { return };
+        let taps = (self.program.values().flatten())
+            .filter_map(|l| match self.media.get(&l.id) {
+                Some((_, Media::Video(player))) => Some((player.audio()?, l.volume)),
+                _ => None,
+            })
+            .collect();
+        mixer.set_taps(taps);
     }
 
     /// Plays the newly opened videos at `now` once every one of them is ready.
@@ -203,13 +238,20 @@ impl App {
         let item = self.config.media.iter().find(|m| m.id == media_id).context("unknown media")?;
         let path = Path::new(&item.path);
         Ok(match item.kind {
-            MediaKind::Video => Media::Video(Box::new(Player::open(path, layer.playback.clone())?)),
+            MediaKind::Video => {
+                let audio = self.mixer.as_ref().map(Mixer::format);
+                Media::Video(Box::new(Player::open(path, layer.playback.clone(), audio)?))
+            }
             MediaKind::Image => Media::Image(Box::new(ImageSource::open(&self.gpu, path)?)),
         })
     }
 
-    /// Forwards media errors; once a second reports presented fps and total dropped frames.
+    /// Forwards media and audio output errors; once a second reports presented fps and total
+    /// dropped frames.
     fn report(&mut self, real: Instant) {
+        if let Some(message) = self.mixer.as_ref().and_then(Mixer::take_error) {
+            self.send(FromEngine::Error { message });
+        }
         for (_, media) in self.media.values_mut() {
             let error = match media {
                 Media::Video(player) => {

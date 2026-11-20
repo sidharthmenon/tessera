@@ -9,6 +9,7 @@ use tessera_show::Playback;
 use wgpu::TextureFormat as F;
 use wgpu::util::StagingBelt;
 
+use crate::audio::AudioTap;
 use crate::compositor::{LayerTexture, Planes};
 use crate::gpu::Gpu;
 use crate::video_decode::{Decoder, Frame, PixelFormatKind};
@@ -54,19 +55,23 @@ pub struct Player {
     gpu: Option<GpuFrame>,
     error: Option<String>,
     dropped: u64,
+    audio: Option<AudioTap>,
 }
 
 impl Player {
     /// Returns at once (R22: opening must never stall the render loop); a new decode thread opens
     /// the file and decodes ahead. Until the first frame is ready `current_frame` is `None`; a
     /// missing file, unsupported codec or decode error shows up in `take_error`. `Err` only if
-    /// the thread can't be spawned.
-    pub fn open(path: &Path, playback: Playback) -> anyhow::Result<Player> {
+    /// the thread can't be spawned. `audio`: the mixer's (sample rate, channels), which the decode
+    /// thread resamples the file's audio to (see `audio()`); `None` skips audio.
+    pub fn open(path: &Path, playback: Playback, audio: Option<(u32, u16)>) -> anyhow::Result<Player> {
         let (tx, frames) = mpsc::sync_channel(QUEUE);
         let (seek, seeks) = mpsc::channel();
         let (owned, looping) = (path.to_path_buf(), playback == Playback::Loop);
+        let audio = audio.map(AudioTap::new);
+        let tap = audio.clone();
         std::thread::Builder::new().name(thread_name("decode", path)).spawn(move || {
-            let result = Decoder::open(&owned).and_then(|d| {
+            let result = Decoder::open(&owned, tap).and_then(|d| {
                 let _ = tx.send(Msg::Opened(d.duration));
                 decode(d, looping, &tx, &seeks)
             });
@@ -75,22 +80,31 @@ impl Player {
             }
         })?;
         let state = State::Paused(Duration::ZERO);
-        Ok(Player { playback, duration: None, frames, seek, epoch: 0, state, pending: None, ended: false, failed: false, gpu: None, error: None, dropped: 0 })
+        Ok(Player { playback, duration: None, frames, seek, epoch: 0, state, pending: None, ended: false, failed: false, gpu: None, error: None, dropped: 0, audio })
     }
 
     pub fn play(&mut self, at: Instant) {
         if let State::Paused(t) = self.state {
             self.state = State::Playing(at.checked_sub(t).unwrap_or(at));
         }
+        if let Some(tap) = &self.audio {
+            tap.set_playing(true);
+        }
     }
 
     pub fn pause(&mut self, now: Instant) {
         self.state = State::Paused(self.elapsed(now));
+        if let Some(tap) = &self.audio {
+            tap.set_playing(false);
+        }
     }
 
     /// Back to the first frame, paused.
     pub fn stop(&mut self) {
         self.epoch += 1;
+        if let Some(tap) = &self.audio {
+            tap.reset(self.epoch); // before the seek: the decode thread pushes the new epoch's audio only after
+        }
         let _ = self.seek.send(self.epoch);
         (self.state, self.pending, self.ended) = (State::Paused(Duration::ZERO), None, false);
     }
@@ -165,9 +179,16 @@ impl Player {
         self.gpu.as_ref().map(|g| g.layer.clone())
     }
 
-    /// The error that made this player go transparent, once.
+    /// The error that made this player go transparent, or why its audio failed (the video plays
+    /// on), once.
     pub fn take_error(&mut self) -> Option<String> {
-        self.error.take()
+        self.error.take().or_else(|| self.audio.as_ref()?.take_error())
+    }
+
+    /// This player's audio for the mixer (`None` if opened without a mixer format). It is consumed
+    /// only while the player plays; `stop`/`restart` empty it.
+    pub fn audio(&self) -> Option<AudioTap> {
+        self.audio.clone()
     }
 
     /// Frames skipped or repeated since the last call because the decoder (or the loop) was late.
@@ -206,7 +227,7 @@ fn decode(mut d: Decoder, looping: bool, tx: &SyncSender<Msg>, seeks: &Receiver<
     loop {
         if let Some(e) = seeks.try_iter().last() {
             (epoch, offset) = (e, Duration::ZERO);
-            d.rewind()?;
+            d.seek(e)?;
         }
         match d.next()? {
             Some(frame) => {
@@ -227,7 +248,7 @@ fn decode(mut d: Decoder, looping: bool, tx: &SyncSender<Msg>, seeks: &Receiver<
                 }
                 let Ok(e) = seeks.recv() else { return Ok(()) }; // idle until a seek or the player drops
                 (epoch, offset) = (e, Duration::ZERO);
-                d.rewind()?;
+                d.seek(e)?;
             }
         }
     }
