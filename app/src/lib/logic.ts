@@ -1,14 +1,18 @@
-// Pure helpers for the main window: no runes, no Tauri, so `npm test` runs them in plain Node.
+// Pure helpers for the UI: no runes, no Tauri, so `npm test` runs them in plain Node.
 import type { Cue } from './bindings/Cue';
 import type { Group } from './bindings/Group';
 import type { Layer } from './bindings/Layer';
+import type { Mapping } from './bindings/Mapping';
 import type { MediaItem } from './bindings/MediaItem';
+import type { MonitorInfo } from './bindings/MonitorInfo';
+import type { Output } from './bindings/Output';
 import type { Rect } from './bindings/Rect';
 import type { Screen } from './bindings/Screen';
 import type { Show } from './bindings/Show';
+import type { ShowOp } from './bindings/ShowOp';
 import type { Source } from './bindings/Source';
 import type { Transition } from './bindings/Transition';
-import type { CueRef, EngineInfo } from './api';
+import type { CueRef, EngineInfo, Live } from './api';
 
 export type Scene = Cue['layersByScreen'];
 export type Bounds = { x: number; y: number; w: number; h: number };
@@ -172,4 +176,74 @@ export const rgbaToHex = (c: number[]) =>
 export function fmtTime(ms: number): string {
   const t = Math.round(Math.max(0, ms) / 100); // tenths
   return `${Math.floor(t / 600)}:${((t % 600) / 10).toFixed(1).padStart(4, '0')}`;
+}
+
+// ---- Screen Management (T13) ----
+
+/** What Screen Management edits: a local copy, sent as ops on Apply. */
+export type Setup = Pick<Show, 'outputs' | 'screens' | 'mappings'>;
+
+/** Largest magnitude a numeric field takes (keeps f32/i32 fields far from overflow). */
+export const MAX_NUM = 1_000_000;
+
+/** A numeric field's text → the number, or the message to show when it is not finite, larger
+ *  than ±MAX_NUM, below `min`, or (with `int`) not whole. */
+export function parseNum(text: string, { int = false, min = -MAX_NUM } = {}): number | string {
+  const v = text.trim() ? Number(text) : NaN;
+  if (Number.isFinite(v) && v >= min && Math.abs(v) <= MAX_NUM && (!int || Number.isInteger(v))) return v;
+  return `Enter ${int ? 'a whole number' : 'a number'} from ${min} to ${MAX_NUM}`;
+}
+
+/** Deep equality of JSON-like values; object key order doesn't matter. */
+export function same(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) return false;
+  const [x, y] = [a as Record<string, unknown>, b as Record<string, unknown>];
+  const keys = Object.keys(x);
+  return keys.length === Object.keys(y).length && keys.every((k) => k in y && same(x[k], y[k]));
+}
+
+/** A cue has been taken, or Program shows something: output changes are seen on air. */
+export const onAir = (live: Live) => !!live.lastTaken || Object.keys(live.program).length > 0;
+
+const output = (name: string, target: Output['target'], width: number, height: number): Output =>
+  ({ id: uuid(), name, node: 'local', target, width, height, brightness: 1 });
+
+/** Fullscreen on `m`, at its size; the engine binds it by name (then position). */
+export const displayOutput = (m: MonitorInfo, name = m.name): Output =>
+  output(name, { type: 'Display', monitorName: m.name, monitorX: m.x, monitorY: m.y }, m.width, m.height);
+
+export const windowOutput = (name: string, x: number, y: number, width: number, height: number): Output =>
+  output(name, { type: 'Window', x, y }, width, height);
+
+/** A 1920×1080 screen placed right of the current layout. */
+export function newScreen(screens: Screen[]): Screen {
+  const b = layoutBounds(screens);
+  return { id: uuid(), name: `Screen ${screens.length + 1}`, width: 1920, height: 1080, layoutX: screens.length ? b.x + b.w : 0, layoutY: screens.length ? b.y : 0 };
+}
+
+/** The whole screen onto the whole output. */
+export const newMapping = (s: Screen, o: Output): Mapping =>
+  ({ id: uuid(), screenId: s.id, src: { x: 0, y: 0, w: s.width, h: s.height }, outputId: o.id, dst: { x: 0, y: 0, w: o.width, h: o.height } });
+
+/** The ops that turn `before` (the show) into `after` (the edited copy), only for what changed.
+ *  Mapping removes come before output/screen removes; outputs and screens exist before the
+ *  mappings that use them. Removing a screen also drops its layers from every cue (show cascade). */
+export function setupOps(before: Setup, after: Setup): ShowOp[] {
+  const diff = <T extends { id: string }>(a: T[], b: T[]) => ({
+    gone: a.filter((x) => !b.some((y) => y.id === x.id)),
+    added: b.filter((y) => !a.some((x) => x.id === y.id)),
+    changed: b.filter((y) => a.some((x) => x.id === y.id && !same(x, y))),
+  });
+  const [o, s, m] = [diff(before.outputs, after.outputs), diff(before.screens, after.screens), diff(before.mappings, after.mappings)];
+  return [
+    ...m.gone.map((x): ShowOp => ({ op: 'RemoveMapping', id: x.id })),
+    ...o.gone.map((x): ShowOp => ({ op: 'RemoveOutput', id: x.id })),
+    ...s.gone.map((x): ShowOp => ({ op: 'RemoveScreen', id: x.id })),
+    ...o.added.map((output): ShowOp => ({ op: 'AddOutput', output })),
+    ...o.changed.map((output): ShowOp => ({ op: 'UpdateOutput', output })),
+    ...s.added.map((screen): ShowOp => ({ op: 'AddScreen', screen })),
+    ...s.changed.map((screen): ShowOp => ({ op: 'UpdateScreen', screen })),
+    ...[...m.added, ...m.changed].map((mapping): ShowOp => ({ op: 'SetMapping', mapping })),
+  ];
 }

@@ -93,4 +93,58 @@ eq(L.rgbaToHex([1, 0, 0.502, 1]), '#ff0080', 'rgba → hex');
 eq(L.engineUrl({ port: 5, token: 'ab', adopted: false, held: false }, '/preview/pvw.mjpg'), 'http://127.0.0.1:5/preview/pvw.mjpg?token=ab', 'engine url');
 eq(L.engineUrl(null, '/x'), null, 'no engine, no url');
 
+// Screen Management (T13): numeric fields, defaults, and the ops Apply sends.
+eq([L.parseNum('12.5'), L.parseNum(' -3 '), L.parseNum('1920', { int: true, min: 1 })], [12.5, -3, 1920], 'valid numbers');
+eq(
+  ['', 'abc', 'NaN', 'Infinity', '1e7', '0', '1.5'].map((t, i) => typeof L.parseNum(t, i >= 5 ? { int: true, min: 1 } : {})),
+  ['string', 'string', 'string', 'string', 'string', 'string', 'string'], 'invalid numbers give a message',
+);
+eq([L.parseNum('0.5', { min: 1 }), L.parseNum('2e6', { int: true })], ['Enter a number from 1 to 1000000', 'Enter a whole number from -1000000 to 1000000'], 'message names the rule');
+eq(L.same({ a: 1, b: { c: [1, 2] } }, { b: { c: [1, 2] }, a: 1 }) && !L.same({ a: 1 }, { a: 1, b: 2 }) && !L.same([1, 2], [2, 1]), true, 'deep equal, key order ignored');
+eq(L.onAir({ pvw: null, lastTaken: null, program: {} }), false, 'nothing on air');
+eq([L.onAir({ pvw: null, lastTaken: { groupId: 'g', slot: 0 }, program: {} }), L.onAir({ pvw: null, lastTaken: null, program: { s: [] } })], [true, true], 'taken cue or PGM content is on air');
+{
+  const mon = { name: 'LED', x: 1920, y: 0, width: 3840, height: 1080, scale: 1, refreshMhz: 60000 };
+  const d = L.displayOutput(mon);
+  eq([d.node, d.name, d.target, d.width, d.height, d.brightness], ['local', 'LED', { type: 'Display', monitorName: 'LED', monitorX: 1920, monitorY: 0 }, 3840, 1080, 1], 'display output binds by name + position at the monitor size');
+  const w = L.windowOutput('Win', 10, 20, 960, 540);
+  eq([w.node, w.target, w.width, w.height], ['local', { type: 'Window', x: 10, y: 20 }, 960, 540], 'window output');
+  const s1 = L.newScreen([]);
+  eq([s1.name, s1.width, s1.height, s1.layoutX, s1.layoutY], ['Screen 1', 1920, 1080, 0, 0], 'first screen');
+  const s2 = L.newScreen([s1, { ...s1, id: 'x', name: 'Screen 2', layoutX: -500, layoutY: 40 }]);
+  eq([s2.name, s2.layoutX, s2.layoutY], ['Screen 3', 1920, 0], 'next screen right of the layout');
+  const m = L.newMapping(s1, w);
+  eq([m.screenId, m.outputId, m.src, m.dst], [s1.id, w.id, { x: 0, y: 0, w: 1920, h: 1080 }, { x: 0, y: 0, w: 960, h: 540 }], 'mapping: full screen → full output');
+
+  const before: L.Setup = { outputs: [d], screens: [s1], mappings: [L.newMapping(s1, d)] };
+  const copy = structuredClone(before);
+  eq(L.setupOps(before, copy), [], 'unchanged: no ops');
+  // Same values, other key order (a rebuilt target): still unchanged.
+  copy.outputs[0] = { ...copy.outputs[0], target: { monitorY: 0, monitorX: 1920, monitorName: 'LED', type: 'Display' } };
+  eq(L.setupOps(before, copy), [], 'key order is not a change');
+
+  // Everything new: outputs and screens exist before the mappings that use them.
+  const empty: L.Setup = { outputs: [], screens: [], mappings: [] };
+  eq(L.setupOps(empty, before).map((o) => o.op), ['AddOutput', 'AddScreen', 'SetMapping'], 'adds in dependency order');
+
+  // Remove the screen (the buffer drops its mappings too), add a window output and a new screen
+  // mapped onto it, rename the display, move a mapping: mapping removes come first, then the
+  // output/screen removes, then adds and updates, mappings last.
+  const after: L.Setup = structuredClone(before);
+  after.screens = [s2];
+  after.mappings = [L.newMapping(s2, w)];
+  after.outputs = [{ ...d, name: 'Wall' }, w];
+  const ops = L.setupOps(before, after);
+  eq(ops.map((o) => o.op), ['RemoveMapping', 'RemoveScreen', 'AddOutput', 'UpdateOutput', 'AddScreen', 'SetMapping'], 'mixed edit order');
+  eq(ops[0].op === 'RemoveMapping' && ops[0].id === before.mappings[0].id && ops[1].op === 'RemoveScreen' && ops[1].id === s1.id, true, 'removes name the right ids');
+  const moved = structuredClone(before);
+  moved.mappings[0].dst.x = 100;
+  eq(L.setupOps(before, moved), [{ op: 'SetMapping', mapping: moved.mappings[0] }], 'changed mapping: one SetMapping');
+  const resized = structuredClone(before);
+  resized.screens[0].width = 3840;
+  eq(L.setupOps(before, resized).map((o) => o.op), ['UpdateScreen'], 'screen resize: one UpdateScreen');
+  const gone = { ...before, outputs: [], mappings: [] };
+  eq(L.setupOps(before, gone).map((o) => o.op), ['RemoveMapping', 'RemoveOutput'], 'output removed after its mapping');
+}
+
 console.log('logic: all checks passed');

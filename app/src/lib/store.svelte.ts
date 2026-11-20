@@ -203,6 +203,22 @@ export const redo = action(api.redo);
 export const take = action(api.take);
 export const loadNext = action(api.loadNext);
 export const op = action((o: ShowOp) => api.applyOp(o));
+
+/** Send `ops` one by one (Screen Management's Apply). The first failure stops the rest. Resolves
+ *  to '' when all were applied, else the error, which says how many went through. */
+export function applyOps(ops: ShowOp[]): Promise<string> {
+  let error = '';
+  return action(async () => {
+    for (const [i, o] of ops.entries()) {
+      try {
+        await api.applyOp(o);
+      } catch (e) {
+        error = `${i} of ${ops.length} changes applied, then ${o.op} failed: ${e instanceof Error ? e.message : e}`;
+        throw new Error(error);
+      }
+    }
+  })().then(() => error);
+}
 const setCue = (ref: CueRef, cue: Cue) => api.applyOp({ op: 'SetCue', groupId: ref.groupId, cue });
 
 /** Add a full-screen layer to the PVW cue (on `screen`, else the selected layer's, else the first).
