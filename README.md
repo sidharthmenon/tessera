@@ -69,9 +69,20 @@ Plain `npm run tauri build` still works, but its `.app` and `.dmg` load FFmpeg f
   asks *Recover unsaved work?*. This happens at startup for the untitled autosave, and when you
   open a show whose autosave is newer than the show file. *Recover* opens the work as an
   untitled show; save it to keep it. *Not now* leaves the `.prev` file in place, and you can open
-  it later with Open.
+  it later with Open. An older `.prev` is never overwritten: later ones are kept as
+  `….autosave.<time>.prev`, and the newest is the one offered.
+- **Saving** removes the show's autosave, and quitting writes any edit the 2 s autosave hasn't
+  caught yet.
 - **Engine supervision.** If the engine dies or stops answering for 5 s, the controller kills it,
-  starts a new one and re-sends the config and scenes.
+  starts a new one and re-sends the config, PVW, PGM and the master volume. What a restart
+  restores:
+  - Every clip on PGM starts again **from its first frame** (positions aren't restored).
+  - Clips you paused or stopped come back paused or stopped, on their first frame.
+  - A *Once* clip that had already ended stays off.
+  - **Crash loop:** if the engine dies twice within 10 s of being restarted, the next restart
+    leaves out every media layer (PGM keeps its patterns, PVW is emptied) and the status bar names
+    what was left out. Take the cues again to bring them back. A minute without a crash resets
+    this.
 - **UI force-quit.** The engine survives a force-quit or crash of the UI, and its outputs keep
   playing. On relaunch the controller adopts the engine through
   `~/Library/Application Support/dev.tessera.controller/engine.json` (pid, port and token), so
@@ -79,7 +90,17 @@ Plain `npm run tauri build` still works, but its `.app` and `.dmg` load FFmpeg f
   - The status bar shows *engine held*, and the outputs stay untouched until you open or create
     a show.
   - After that, edits to the on-air cue reach air on the next GO.
-- **Quitting.** Quitting the app normally stops the engine.
+- **Quitting** (⌘Q, or closing the window). With nothing on air the app stops the engine and
+  quits. With something on air (or an adopted engine) it asks:
+  - *Keep outputs running and quit*: the screens stay as they are. The next launch adopts the
+    engine, as after a force-quit.
+  - *Stop outputs and quit*: every output goes black.
+  - *Cancel*.
+
+  A quit that can't ask (the Dock's Quit, logging out) keeps the outputs running if anything is on
+  air.
+- **One instance.** Launching Tessera again (including `npm run tauri dev` on the show Mac) only
+  brings the running window to the front.
 
 ## Show-day checklist
 
@@ -95,10 +116,15 @@ Run this in the release app or in `npm run tauri dev`:
 6. Press Space to fade. The background loop doesn't restart, the overlay starts on Take, and its
    alpha is correct.
 7. Take a cue that touches only screen A. Screen B is untouched.
+   - With the taken cue still in PVW, move a layer on the Preview tab. Program doesn't change: the
+     edit goes to a copy in the first free slot (status bar: *Copied to slot N*). Live edits
+     happen only on the Program tab.
 8. 4× 4K layers hold 60 fps (engine fps in the status bar).
 9. Audio is audible.
 10. Kill the engine process. The controller restarts it and the outputs come back.
-11. Force-quit the UI. The outputs keep playing.
+11. Force-quit the UI. The outputs keep playing. Relaunch: the status bar shows *engine held*.
+    Then press ⌘Q while on air and choose *Keep outputs running and quit*: the outputs keep
+    playing, and the next launch adopts the engine again.
 12. Save, reopen: the show is identical.
 
 On Windows, run the same checklist before the first show there.
@@ -109,8 +135,27 @@ On Windows, run the same checklist before the first show there.
 - [ ] A Display output on a second monitor, checked visually
 - [ ] Output windows actually presenting their halves, and Identify
 - [ ] 4×4K at 60 fps in the release build with both previews watched
+- [ ] A 4K ProRes 422 HQ clip at 60 fps. Make one with
+      `ffmpeg -f lavfi -i testsrc2=s=3840x2160:r=60:d=10 -c:v prores_ks -profile:v 3 -pix_fmt yuv422p10le -color_range tv -colorspace bt709 -color_primaries bt709 -color_trc bt709 prores422hq.mov`
+      (~650 MB, don't commit it). Import it, or put it in the spike clip folder and run
+      `tessera-engine --demo-4k <folder>`, which adds it under the other four clips.
+- [ ] App Nap: leave the engine with no output window visible for 10 minutes (UI in front,
+      outputs covered or none). The status bar must never show *engine restarting*: the engine
+      has to keep sending its 1 s stats.
 - [ ] Windows: D3D11VA decode and surface sizing
 - [ ] Menu bar and Dock behaviour while an output is in simple fullscreen
+
+## Displays and audio
+
+- **Main display.** A Display output on the main display (the one with the menu bar) stays at
+  normal window level, so ⌘-Tab or the Dock icon brings the controller back in front. The menu bar
+  may show over that output. On any other display an output sits above every window, the
+  controller's included. Add Output marks the monitor the controller is on as *Controller
+  display* and asks first.
+- **Audio output.** The engine picks the macOS default output device when it starts. Set the
+  default output (System Settings → Sound) before launching Tessera. After unplugging or
+  replugging the audio interface, restart the engine: `pkill -f tessera-render`. The controller
+  starts a new one, and its clips restart from their first frame (see Engine supervision).
 
 ## Known limits
 

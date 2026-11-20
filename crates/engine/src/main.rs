@@ -124,7 +124,7 @@ fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
 
 /// Perf check: the spike's four 4K clips (`gen_clips.sh` names) as full-screen layers, looped,
 /// ProRes 4444 alpha on top; plus `prores422hq.mov` under it if the folder has one (the README's
-/// hardware checklist has the ffmpeg line; ~1.5 GB, don't commit it).
+/// hardware checklist has the ffmpeg line; ~650 MB, don't commit it).
 fn demo_4k(dir: &Path) -> Vec<ToEngine> {
     let clips = ["h264.mp4", "hevc8.mp4", "hevc10.mp4", "prores422hq.mov", "prores4444a.mov"];
     let clips = clips.into_iter().filter(|clip| *clip != "prores422hq.mov" || dir.join(clip).exists());
