@@ -20,8 +20,6 @@
     const n = (e.currentTarget as HTMLInputElement).valueAsNumber;
     return Number.isFinite(n) ? n : null;
   };
-  /** Selects give Space back to GO once a choice is made. */
-  const blur = (e: Event) => (e.currentTarget as HTMLElement).blur();
 
   function set(patch: Partial<Layer>) {
     if (ui.selected) editLayer(ui.selected, (l) => ({ ...l, ...patch }));
@@ -57,7 +55,6 @@
           onchange={(e) => {
             const kind = e.currentTarget.value as TransitionKind;
             editCue(ref, (c) => ({ ...c, transition: { ...c.transition, kind } }));
-            blur(e);
           }}
         >
           {#each kinds as k (k)}<option value={k}>{k}</option>{/each}
@@ -130,10 +127,7 @@
             <span>Playback</span>
             <select
               value={layer.playback}
-              onchange={(e) => {
-                set({ playback: e.currentTarget.value as Playback });
-                blur(e);
-              }}
+              onchange={(e) => set({ playback: e.currentTarget.value as Playback })}
             >
               {#each playbacks as p (p)}<option value={p}>{p}</option>{/each}
             </select>
@@ -142,7 +136,10 @@
         <label class="row"><span>Visible</span><input type="checkbox" checked={layer.visible} onchange={(e) => set({ visible: e.currentTarget.checked })} /></label>
       {/if}
     {:else}
-      <p class="muted">{ui.canvasTab === 'pvw' ? 'Load a cue into Preview (click a cue), or drag media onto the canvas.' : 'Nothing taken yet.'}</p>
+      <p class="muted">{ui.canvasTab === 'pvw' ? 'Load a cue into Preview (click a cue), or drag media onto the canvas.' : 'No taken cue to edit.'}</p>
+    {/if}
+    {#if !layer && ui.busLayer}
+      <p class="note">“{ui.busLayer.name || 'layer'}” is on air from an earlier cue: transport reaches it; edit it in its own cue.</p>
     {/if}
   </div>
 </section>
@@ -226,6 +223,9 @@
     text-align: left;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .note {
+    color: var(--warn);
   }
   .icon {
     padding: 2px 6px;

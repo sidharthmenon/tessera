@@ -862,6 +862,32 @@ mod tests {
         assert!(events.is_empty(), "skipping a shared player is not an error: {events:?}");
     }
 
+    /// R41: the operator pauses live clips by the ids the controller's PGM scene holds: the taken
+    /// cue's layer ids (a player carried over by sharing is re-keyed by Take), and an earlier cue's
+    /// ids on a screen the taken cue doesn't define.
+    #[test]
+    fn pgm_transport_reaches_shared_and_kept_players() {
+        let [a, c, m1, m2, m3] = ids();
+        let t0 = Instant::now();
+        let mut b = buses();
+        let (bg, side) = (clip(m1), clip(m3));
+        b.set_preview(Scene::from([(a, vec![bg.clone()]), (c, vec![side.clone()])]));
+        b.take(&cut(), t0);
+        let (live, kept) = (pgm(&b, &bg), pgm(&b, &side));
+        let (bg2, overlay) = (clip(m1), clip(m2)); // the next cue: same bg (shared), screen c untouched
+        b.set_preview(Scene::from([(a, vec![bg2.clone(), overlay.clone()])]));
+        b.take(&fade(500), t0);
+        assert!(Arc::ptr_eq(&pgm(&b, &bg2), &live), "bg carried over by sharing");
+        b.transport(Bus::Pgm, Some(bg2.id), TransportAction::Pause, t0);
+        assert!(!playing(&live), "the taken cue's id reaches the shared player");
+        b.transport(Bus::Pgm, Some(side.id), TransportAction::Stop, t0);
+        assert!(!playing(&kept) && lock(&kept).media.stops == 1, "an earlier cue's id reaches its kept player");
+        b.transport(Bus::Pvw, Some(bg2.id), TransportAction::Play, t0);
+        assert!(!playing(&live), "R26: PVW transport still never touches it");
+        let events = b.tick(t0, PERIOD);
+        assert!(!events.iter().any(|e| matches!(e, FromEngine::Error { .. })), "{events:?}");
+    }
+
     #[test]
     fn pending_start_cancelled_when_player_leaves_pgm() {
         let [a, m1, m2] = ids();

@@ -2,7 +2,7 @@
   import type { Layer } from '$lib/bindings/Layer';
   import type { Rect } from '$lib/bindings/Rect';
   import type { Screen } from '$lib/bindings/Screen';
-  import { boxOf, dragRect, engineUrl, fitScale, layoutBounds, mediaOf, screenAt, type DragMode } from '$lib/logic';
+  import { boxOf, dragRect, engineUrl, findLayer, fitScale, layoutBounds, mediaOf, screenAt, type DragMode } from '$lib/logic';
   import { addToPvw, editLayer, fail, ui } from '$lib/store.svelte';
 
   let cw = $state(0);
@@ -18,21 +18,25 @@
   type Drag = { screenId: string; layerId: string; mode: DragMode; x0: number; y0: number; start: Rect; rect: Rect };
   let drag = $state.raw<Drag | null>(null);
 
+  // Everything the bus shows. On PGM, layers outside the last taken cue (left by earlier cues on
+  // screens it doesn't define) can be selected for transport but not edited here.
   const boxes = $derived(
     screens.flatMap((s) =>
-      (cue?.layersByScreen[s.id] ?? []).map((l) => {
+      (ui.busScene[s.id] ?? []).map((l) => {
         const rect = drag?.layerId === l.id ? drag.rect : l.rect;
-        return { s, l, box: boxOf(rect, s, bounds, scale) };
+        const editable = !!cue && !!findLayer(cue.layersByScreen, s.id, l.id);
+        return { s, l, editable, box: boxOf(rect, s, bounds, scale) };
       }),
     ),
   );
 
   const label = (l: Layer) => l.name || (l.source.type === 'Media' ? (mediaOf(ui.show, l)?.name ?? 'media') : l.source.pattern.type);
 
-  function down(e: PointerEvent, s: Screen, l: Layer, mode: DragMode) {
+  function down(e: PointerEvent, s: Screen, l: Layer, mode: DragMode, editable: boolean) {
     if (e.button !== 0) return;
     e.stopPropagation();
     ui.selected = { screenId: s.id, layerId: l.id };
+    if (!editable) return;
     (e.currentTarget as Element).setPointerCapture(e.pointerId);
     drag = { screenId: s.id, layerId: l.id, mode, x0: e.clientX, y0: e.clientY, start: l.rect, rect: l.rect };
   }
@@ -110,19 +114,21 @@
             <span>{s.name}</span>
           </div>
         {/each}
-        {#each boxes as { s, l, box } (l.id)}
+        {#each boxes as { s, l, editable, box } (l.id)}
           <div
             class="box"
             class:sel={ui.selected?.layerId === l.id}
             class:hidden={!l.visible}
+            class:fixed={!editable}
+            title={editable ? '' : 'On air from an earlier cue: select it for transport; edit it in its own cue'}
             style:left="{box.x}px"
             style:top="{box.y}px"
             style:width="{box.w}px"
             style:height="{box.h}px"
-            onpointerdown={(e) => down(e, s, l, 'move')}
+            onpointerdown={(e) => down(e, s, l, 'move', editable)}
           >
             <span class="tag">{label(l)}</span>
-            <div class="handle" onpointerdown={(e) => down(e, s, l, 'resize')}></div>
+            {#if editable}<div class="handle" onpointerdown={(e) => down(e, s, l, 'resize', true)}></div>{/if}
           </div>
         {/each}
       </div>
@@ -213,6 +219,10 @@
   .box.hidden {
     outline-style: dotted;
     opacity: 0.6;
+  }
+  .box.fixed {
+    outline-style: dashed;
+    cursor: pointer;
   }
   .box.sel {
     outline: 2px solid var(--accent);

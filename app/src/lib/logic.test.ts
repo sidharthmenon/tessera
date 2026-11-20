@@ -52,6 +52,9 @@ const hidden = L.withLayer(c, 'b', layer.id, (l) => ({ ...l, visible: false }));
 eq([hidden.layersByScreen.b[0].visible, c.layersByScreen.b[0].visible], [false, true], 'withLayer is immutable');
 eq(L.withLayer(c, 'b', layer.id, () => null).layersByScreen, { b: [] }, 'removing the last layer leaves explicit black');
 eq(L.withScreen(c, 'b', null).layersByScreen, {}, 'released screen');
+// R41: an edit aimed at a layer the cue doesn't hold (e.g. one an earlier cue left on PGM) changes nothing.
+eq(L.withLayer(c, 'a', layer.id, () => null) === c && L.withLayer(c, 'b', 'other', () => null) === c, true, 'foreign layer: cue unchanged');
+eq(L.findLayer(c.layersByScreen, 'b', layer.id)?.id === layer.id && !L.findLayer(c.layersByScreen, 'a', layer.id), true, 'findLayer');
 eq(Object.keys(L.withScreen(c, 'a', []).layersByScreen).sort(), ['a', 'b'], 'cleared screen is defined');
 eq(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(L.uuid()), true, 'uuid v4');
 
@@ -61,11 +64,13 @@ const k = (key: string, m: Partial<{ metaKey: boolean; ctrlKey: boolean; shiftKe
 eq([k(' ', { code: 'Space' }), k('ArrowRight'), k('z', { metaKey: true }), k('Z', { metaKey: true, shiftKey: true }), k('s', { ctrlKey: true }), k('S', { metaKey: true, shiftKey: true })],
   ['take', 'next', 'undo', 'redo', 'save', 'saveAs'], 'hotkeys');
 eq([k('z'), k(' ', { shiftKey: true }), k('ArrowRight', { metaKey: true }), k('z', { metaKey: true, altKey: true })], [null, null, null, null], 'not hotkeys');
+// R40: any focused control keeps the keys (Space must never both work it and GO).
+const el = (tagName: string, role: string | null = null, isContentEditable = false) => ({ tagName, isContentEditable, getAttribute: (n: string) => (n === 'role' ? role : null) });
 eq(
-  [{ tagName: 'INPUT' }, { tagName: 'INPUT', type: 'number' }, { tagName: 'SELECT' }, { tagName: 'TEXTAREA' }, { tagName: 'DIV', isContentEditable: true }].map(L.typingIn),
-  [true, true, true, true, true], 'typing targets',
+  [el('BUTTON'), el('INPUT'), el('SELECT'), el('TEXTAREA'), el('DIV', null, true), el('DIV', 'slider'), el('SPAN', 'button')].map(L.ownsKeys),
+  [true, true, true, true, true, true, true], 'controls own the keys',
 );
-eq([null, { tagName: 'BUTTON' }, { tagName: 'INPUT', type: 'checkbox' }, { tagName: 'INPUT', type: 'range' }].map(L.typingIn), [false, false, false, false], 'Space stays GO');
+eq([null, el('BODY'), el('DIV'), el('DIV', 'img'), { tagName: 'DIV' }].map(L.ownsKeys), [false, false, false, false, false], 'nothing focused: show keys');
 
 eq([L.fmtTime(83500), L.fmtTime(59960), L.fmtTime(0)], ['1:23.5', '1:00.0', '0:00.0'], 'fmtTime');
 eq(L.hexToRgba('#ff0080').map((v) => +v.toFixed(3)), [1, 0, 0.502, 1], 'hex → rgba');

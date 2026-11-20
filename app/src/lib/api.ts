@@ -3,6 +3,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { Bus } from '$lib/bindings/Bus';
+import type { Layer } from '$lib/bindings/Layer';
 import type { FromEngine } from '$lib/bindings/FromEngine';
 import type { Show } from '$lib/bindings/Show';
 import type { ShowOp } from '$lib/bindings/ShowOp';
@@ -10,7 +11,8 @@ import type { TransportAction } from '$lib/bindings/TransportAction';
 
 // App-crate types, not in the generated bindings: controller.rs `CueRef`/`Live`, engine_client.rs `EngineInfo`.
 export type CueRef = { groupId: string; slot: number };
-export type Live = { pvw: CueRef | null; lastTaken: CueRef | null };
+/** `program`: what PGM shows, by screen id, with the engine's layer ids (transport targets these). */
+export type Live = { pvw: CueRef | null; lastTaken: CueRef | null; program: { [screenId: string]: Layer[] } };
 export type EngineInfo = { port: number; token: string; adopted: boolean; held: boolean };
 
 export const getShow = () => invoke<Show>('get_show');

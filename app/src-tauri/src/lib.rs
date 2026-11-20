@@ -2,7 +2,8 @@
 //!
 //! Events to the frontend:
 //! - `show-changed`: the full `Show`, after every show mutation
-//! - `live-changed`: `Live { pvw, lastTaken }` (cue refs or null), after every command that may move them
+//! - `live-changed`: `Live { pvw, lastTaken, program }` (cue refs or null; the PGM scene), after every
+//!   command that may move them
 //! - `engine-event`: every `FromEngine`, plus `Error`s about engine restarts
 //! - `engine-info`: `EngineInfo { port, token, adopted, held }` on connect and when a show is
 //!   loaded (which releases the hold), `null` on disconnect

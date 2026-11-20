@@ -1,7 +1,7 @@
 <script lang="ts">
   import '../app.css';
   import { onMount } from 'svelte';
-  import { hotkey, typingIn, type Hotkey } from '$lib/logic';
+  import { hotkey, ownsKeys, type Hotkey } from '$lib/logic';
   import { init, loadNext, redo, saveShow, take, ui, undo } from '$lib/store.svelte';
   import Prompt from '$lib/Prompt.svelte';
   import Canvas from '$lib/panels/Canvas.svelte';
@@ -29,10 +29,10 @@
   };
 
   function onkeydown(e: KeyboardEvent) {
-    const focus = document.activeElement as HTMLInputElement | null;
-    if (typingIn(focus)) {
+    const focus = document.activeElement as HTMLElement | null;
+    if (ownsKeys(focus)) {
       if (e.key === 'Escape') focus?.blur(); // back to the show keys
-      return;
+      return; // R40: never GO from a focused control
     }
     if (ui.modal) return;
     const key = hotkey(e);
@@ -41,10 +41,24 @@
     if (e.repeat && key !== 'undo' && key !== 'redo') return; // a held Space is one GO
     actions[key]();
   }
+
+  // R40: once a control has been used, hand the keys back to the show, so Space is GO again.
+  // Clicked buttons and toggles lose focus; any control loses it when its value is committed
+  // (`change`: a released slider, a picked option, Enter in a field). Typing keeps focus.
+  const toggles = ['checkbox', 'radio', 'range', 'color', 'button', 'submit', 'reset'];
+  function onclick() {
+    const el = document.activeElement as HTMLInputElement | null;
+    if (el?.tagName === 'BUTTON' || (el?.tagName === 'INPUT' && toggles.includes(el.type))) el.blur();
+  }
+  function onchange(e: Event) {
+    if (e.target === document.activeElement) (e.target as HTMLElement).blur();
+  }
 </script>
 
 <svelte:window
   {onkeydown}
+  {onclick}
+  {onchange}
   ondragover={(e) => e.preventDefault()}
   ondrop={(e) => e.preventDefault()}
 />

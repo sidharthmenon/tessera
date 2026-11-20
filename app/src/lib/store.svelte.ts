@@ -3,7 +3,7 @@
 import { ask, open, save } from '@tauri-apps/plugin-dialog';
 import * as api from './api';
 import type { CueRef, EngineInfo, Live } from './api';
-import { copyScene, cueAt, firstEmptySlot, newCue, newLayer, sameRef, withLayer, withScreen } from './logic';
+import { copyScene, cueAt, findLayer, firstEmptySlot, newCue, newLayer, sameRef, withLayer, withScreen } from './logic';
 import type { Cue } from '$lib/bindings/Cue';
 import type { FromEngine } from '$lib/bindings/FromEngine';
 import type { Layer } from '$lib/bindings/Layer';
@@ -20,7 +20,7 @@ export type Bus = 'pgm' | 'pvw';
 
 class Store {
   show = $state.raw<Show | null>(null);
-  live = $state.raw<Live>({ pvw: null, lastTaken: null });
+  live = $state.raw<Live>({ pvw: null, lastTaken: null, program: {} });
   engine = $state.raw<EngineInfo | null>(null);
   /** The last "engine restarting: …" message, until the engine is back. */
   restarting = $state('');
@@ -47,7 +47,13 @@ class Store {
   /** The cue on the canvas bus: PVW's cue, or the last taken one for PGM. */
   editRef = $derived(this.canvasTab === 'pvw' ? this.live.pvw : this.live.lastTaken);
   editCue = $derived(cueAt(this.show, this.editRef));
-  layer = $derived(this.selected ? this.editCue?.layersByScreen[this.selected.screenId]?.find((l) => l.id === this.selected?.layerId) : undefined);
+  /** The selected layer if it is in `editCue` (editable). */
+  layer = $derived(this.selected && this.editCue ? findLayer(this.editCue.layersByScreen, this.selected.screenId, this.selected.layerId) : undefined);
+  /** What the canvas bus shows. On PGM that is more than the last taken cue: screens it doesn't
+   *  define keep earlier cues' layers, which transport must reach too (R41). */
+  busScene = $derived(this.canvasTab === 'pvw' ? (this.editCue?.layersByScreen ?? {}) : this.live.program);
+  /** The selected layer as the bus has it (transport's target). */
+  busLayer = $derived(this.selected ? findLayer(this.busScene, this.selected.screenId, this.selected.layerId) : undefined);
   /** After a Take the same cue stays in PVW: its edits go to air. */
   pvwLive = $derived(sameRef(this.live.pvw, this.live.lastTaken));
   status = $derived<'connected' | 'held' | 'restarting' | 'connecting'>(
@@ -226,7 +232,8 @@ export const addToPvw = action(async (source: Source, name: string, screen?: Scr
 export const editLayer = action(async (sel: LayerRef, f: (l: Layer) => Layer | null) => {
   const ref = ui.editRef;
   const cue = ui.editCue;
-  if (ref && cue) await setCue(ref, withLayer(cue, sel.screenId, sel.layerId, f));
+  const next = cue && withLayer(cue, sel.screenId, sel.layerId, f);
+  if (ref && next && next !== cue) await setCue(ref, next);
 });
 
 export const editCue = action(async (ref: CueRef, f: (c: Cue) => Cue) => {

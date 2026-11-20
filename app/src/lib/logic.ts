@@ -99,9 +99,13 @@ export function withScreen(cue: Cue, screenId: string, layers: Layer[] | null): 
   return { ...cue, layersByScreen: layers ? { ...rest, [screenId]: layers } : rest };
 }
 
-/** `cue` with one layer replaced by `f(layer)`, or removed when `f` returns null. */
+export const findLayer = (scene: Scene, screenId: string, layerId: string) => scene[screenId]?.find((l) => l.id === layerId);
+
+/** `cue` with one layer replaced by `f(layer)`, or removed when `f` returns null. The same `cue`
+ *  when it has no such layer: an edit aimed elsewhere must never black out one of its screens. */
 export function withLayer(cue: Cue, screenId: string, layerId: string, f: (l: Layer) => Layer | null): Cue {
-  const layers = cue.layersByScreen[screenId] ?? [];
+  const layers = cue.layersByScreen[screenId];
+  if (!layers?.some((l) => l.id === layerId)) return cue;
   return withScreen(cue, screenId, layers.flatMap((l) => (l.id === layerId ? (f(l) ?? []) : [l])));
 }
 
@@ -133,12 +137,15 @@ export function hotkey(e: KeyLike): Hotkey | null {
   return null;
 }
 
-/** Focus where keys belong to the element (text entry, a select), not to the show hotkeys.
- *  Checkboxes, sliders and buttons don't count: Space there must still be GO. */
-export function typingIn(el: { tagName?: string; type?: string; isContentEditable?: boolean } | null): boolean {
+type Focusable = { tagName?: string; isContentEditable?: boolean; getAttribute?: (name: string) => string | null };
+
+/** Focus on any interactive element keeps the keys (R40): Space on a focused button or checkbox
+ *  would work the control *and* GO on air. Nothing focused (body) gives them to the show; the
+ *  page blurs controls after use so that is the usual state. */
+export function ownsKeys(el: Focusable | null): boolean {
   if (!el) return false;
-  if (el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable) return true;
-  return el.tagName === 'INPUT' && !['checkbox', 'radio', 'range', 'button', 'color', 'submit', 'reset'].includes(el.type ?? 'text');
+  if (['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName ?? '') || el.isContentEditable) return true;
+  return ['button', 'slider'].includes(el.getAttribute?.('role') ?? '');
 }
 
 /** "#ff8000" → opaque [1, 0.5, 0, 1] (a `Solid` pattern's rgba), and back. */

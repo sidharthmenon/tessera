@@ -25,6 +25,9 @@ pub struct CueRef {
 pub struct Live {
     pub pvw: Option<CueRef>,
     pub last_taken: Option<CueRef>,
+    /// What PGM shows (the engine's PGM scene, by the same layer ids): the last taken cue's
+    /// screens plus whatever earlier cues left on the others. Transport targets these ids.
+    pub program: Scene,
 }
 
 #[derive(Default)]
@@ -60,7 +63,7 @@ impl Controller {
     }
 
     pub fn live(&self) -> Live {
-        Live { pvw: self.pvw, last_taken: self.last_taken }
+        Live { pvw: self.pvw, last_taken: self.last_taken, program: self.pgm.clone() }
     }
 
     /// The show's render setup. Media paths are absolute: every path that enters is
@@ -393,6 +396,25 @@ mod tests {
         c.load_cue(at(&c, 2)).unwrap();
         assert_eq!(c.take(), vec![ToEngine::Take { transition: Transition { kind: TransitionKind::Cut, duration_ms: 0 } }]);
         assert_eq!(c.pgm, tessera_show::take_merge(&first.layers_by_screen, &only_a));
+    }
+
+    /// R41: the UI addresses live layers (transport) by the ids PGM holds: the last taken cue's on
+    /// the screens it defines, an earlier cue's elsewhere. `live().program` is that scene.
+    #[test]
+    fn live_reports_program_scene() {
+        let mut c = Controller::new();
+        let (a, b) = (screen().id, screen().id);
+        let first = Scene::from([(a, vec![layer()]), (b, vec![layer()])]);
+        let second = Scene::from([(a, vec![layer()])]);
+        set_cue(&mut c, 1, first.clone());
+        set_cue(&mut c, 2, second.clone());
+        assert!(c.live().program.is_empty());
+        c.load_cue(at(&c, 1)).unwrap();
+        c.take();
+        c.load_cue(at(&c, 2)).unwrap();
+        assert_eq!(c.live().program, first, "loading PVW doesn't change PGM");
+        c.take();
+        assert_eq!(c.live().program, Scene::from([(a, second[&a].clone()), (b, first[&b].clone())]));
     }
 
     #[test]

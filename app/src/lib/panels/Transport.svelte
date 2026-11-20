@@ -4,7 +4,8 @@
   import { loadNext, op, take, transport, ui } from '$lib/store.svelte';
 
   const bus = $derived(ui.canvasTab);
-  const layer = $derived(ui.layer);
+  /** As the bus has it: on PGM this reaches layers earlier cues left on air too (R41). */
+  const layer = $derived(ui.busLayer);
   const media = $derived(mediaOf(ui.show, layer));
   /** A pattern has no player to drive; with nothing selected, transport drives the whole bus. */
   const usable = $derived(!!ui.engine && (!layer || layer.source.type === 'Media'));
@@ -38,6 +39,7 @@
         onclick={() => transport(bus, layer?.id ?? null, act)}>{icon}</button
       >
     {/each}
+    {#if bus === 'pvw' && ui.pvwLive}<span class="onair" title="Preview never touches a clip that is on air">live clips: use Program</span>{/if}
     <span class="pos">{pos != null ? fmtTime(pos) : '–:–'}{media?.durationMs != null ? ` / ${fmtTime(media.durationMs)}` : ''}</span>
   </div>
 
@@ -97,6 +99,11 @@
   }
   .tp button.warn {
     color: var(--warn);
+  }
+  .onair {
+    margin-left: 6px;
+    color: var(--warn);
+    font-size: 11px;
   }
   .pos {
     margin-left: 8px;
