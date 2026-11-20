@@ -1,6 +1,8 @@
 use anyhow::Context;
 use wgpu::util::DeviceExt;
 
+/// Cheap to clone (wgpu handles are refcounted), e.g. to upload from a loader thread.
+#[derive(Clone)]
 pub struct Gpu {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,

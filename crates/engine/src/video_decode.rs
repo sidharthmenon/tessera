@@ -32,7 +32,7 @@ pub struct DecodedFrameInfo {
 
 /// Decodes `path` to the end on this thread and describes every frame (tests, diagnostics).
 pub fn decode_all_frames(path: &Path) -> anyhow::Result<Vec<DecodedFrameInfo>> {
-    let mut decoder = Decoder::open(path)?;
+    let mut decoder = Decoder::open(path).with_context(|| path.display().to_string())?;
     let mut frames = vec![];
     while let Some(f) = decoder.next()? {
         frames.push(DecodedFrameInfo { pts_ms: f.pts.as_millis() as u64, format: f.kind, hardware: f.hardware });
@@ -88,7 +88,7 @@ pub(crate) struct Decoder {
 impl Decoder {
     pub fn open(path: &Path) -> anyhow::Result<Decoder> {
         init();
-        let input = ff::format::input(path).with_context(|| format!("cannot open {}", path.display()))?;
+        let input = ff::format::input(path).context("cannot open")?;
         let stream = input.streams().best(ff::media::Type::Video).context("no video stream")?;
         let time_base = f64::from(stream.time_base());
         let start = if stream.start_time() == ffi::AV_NOPTS_VALUE { 0 } else { stream.start_time() };
@@ -97,13 +97,13 @@ impl Decoder {
         } else {
             input.duration() as f64 / ffi::AV_TIME_BASE as f64
         };
-        ensure!(seconds > 0., "{}: unknown duration", path.display());
+        ensure!(seconds > 0., "unknown duration");
         let fps = f64::from(stream.avg_frame_rate());
         let frame_interval = Duration::from_secs_f64(if fps > 0. { 1. / fps } else { 1. / 30. });
         let index = stream.index();
         let mut ctx = ff::codec::Context::from_parameters(stream.parameters())?;
         attach_hw(&mut ctx);
-        let decoder = ctx.decoder().video().with_context(|| format!("{}: unsupported video codec", path.display()))?;
+        let decoder = ctx.decoder().video().context("unsupported video codec")?;
         Ok(Decoder {
             input,
             decoder,

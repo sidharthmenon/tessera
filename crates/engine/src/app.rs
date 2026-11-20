@@ -63,7 +63,7 @@ pub fn event_loop() -> anyhow::Result<(EventLoop<UserEvent>, EngineHandle)> {
 // (players shared across PVW/PGM by refcount) replaces this map.
 enum Media {
     Video(Box<Player>),
-    Image(ImageSource),
+    Image(Box<ImageSource>),
 }
 
 /// Engine state driven by `event_loop().run_app(&mut app)`; replies go out through `events`.
@@ -79,6 +79,8 @@ pub struct App {
     identify: HashMap<Uuid, Instant>,
     /// Program layer id → (media id, source).
     media: HashMap<Uuid, (Uuid, Media)>,
+    /// Newly opened videos, started together once all are ready (show their first frame or failed).
+    starting: Vec<Uuid>,
     clock: FrameClock,
     /// The last frame presented on a Fifo surface (so the next one is one vsync later).
     paced: bool,
@@ -104,6 +106,7 @@ impl App {
             next_poll: Instant::now() + MONITOR_POLL,
             identify: HashMap::new(),
             media: HashMap::new(),
+            starting: vec![],
             clock: FrameClock::new(period(FALLBACK_MHZ), Instant::now()),
             paced: false,
             presented: 0,
@@ -157,9 +160,9 @@ impl App {
         }
     }
 
-    /// Opens a source for every program media layer that lacks one and drops the sources of layers
-    /// that are gone. New videos start together once all are open (opening blocks; a late start
-    /// would skip frames). Failures are reported and the layer stays empty.
+    /// Opens a source for every program media layer that lacks one (without blocking: R22) and
+    /// drops the sources of layers that are gone. New videos start together once all are ready
+    /// (see `start_ready`), so none skips its opening frames.
     fn sync_media(&mut self) {
         let wanted: HashMap<Uuid, Uuid> = (self.program.values().flatten())
             .filter_map(|l| match l.source {
@@ -168,7 +171,6 @@ impl App {
             })
             .collect();
         self.media.retain(|layer, (media, _)| wanted.get(layer) == Some(media));
-        let mut opened = vec![];
         for layer in self.program.values().flatten() {
             let Source::Media { media_id } = layer.source else { continue };
             if self.media.contains_key(&layer.id) {
@@ -177,13 +179,20 @@ impl App {
             match self.open_media(layer, media_id) {
                 Ok(media) => {
                     self.media.insert(layer.id, (media_id, media));
-                    opened.push(layer.id);
+                    self.starting.push(layer.id);
                 }
                 Err(e) => self.send(FromEngine::Error { message: format!("layer {}: {e:#}", layer.id) }),
             }
         }
-        let now = Instant::now();
-        for id in opened {
+    }
+
+    /// Plays the newly opened videos at `now` once every one of them is ready.
+    fn start_ready(&mut self, now: Instant) {
+        let waiting = |id| matches!(self.media.get(id), Some((_, Media::Video(player))) if !player.ready());
+        if self.starting.iter().any(waiting) {
+            return;
+        }
+        for id in std::mem::take(&mut self.starting) {
             if let Some((_, Media::Video(player))) = self.media.get_mut(&id) {
                 player.play(now);
             }
@@ -195,16 +204,21 @@ impl App {
         let path = Path::new(&item.path);
         Ok(match item.kind {
             MediaKind::Video => Media::Video(Box::new(Player::open(path, layer.playback.clone())?)),
-            MediaKind::Image => Media::Image(ImageSource::open(&self.gpu, path)?),
+            MediaKind::Image => Media::Image(Box::new(ImageSource::open(&self.gpu, path)?)),
         })
     }
 
-    /// Forwards player errors; once a second reports presented fps and total dropped frames.
+    /// Forwards media errors; once a second reports presented fps and total dropped frames.
     fn report(&mut self, real: Instant) {
         for (_, media) in self.media.values_mut() {
-            let Media::Video(player) = media else { continue };
-            self.dropped += player.take_dropped();
-            if let Some(message) = player.take_error() {
+            let error = match media {
+                Media::Video(player) => {
+                    self.dropped += player.take_dropped();
+                    player.take_error()
+                }
+                Media::Image(image) => image.take_error(),
+            };
+            if let Some(message) = error {
                 let _ = self.events.send(FromEngine::Error { message });
             }
         }
@@ -228,10 +242,11 @@ impl App {
         for screen in &self.config.screens {
             let layers: Vec<(Layer, Option<LayerTexture>)> = (self.program.get(&screen.id).into_iter().flatten())
                 .map(|l| {
+                    // Hidden layers too: polling collects decode errors and keeps the queue moving.
                     let frame = match self.media.get_mut(&l.id) {
-                        Some((_, Media::Video(player))) if l.visible => player.current_frame(&self.gpu, now, period),
-                        Some((_, Media::Image(image))) => Some(image.texture()),
-                        _ => None,
+                        Some((_, Media::Video(player))) => player.current_frame(&self.gpu, now, period),
+                        Some((_, Media::Image(image))) => image.texture(),
+                        None => None,
                     };
                     (l.clone(), frame)
                 })
@@ -286,6 +301,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.identify.retain(|_, until| *until > real);
         let now = self.clock.tick(real, self.paced);
         self.paced = self.render(now);
+        self.start_ready(now);
         self.report(real);
         let flow = if self.paced { ControlFlow::Poll } else { ControlFlow::WaitUntil(real + IDLE_TICK) };
         event_loop.set_control_flow(flow);
