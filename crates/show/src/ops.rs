@@ -3,7 +3,8 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 use crate::cue::{delete_cue, duplicate_cue, move_cue, set_cue};
-use crate::model::{Cue, Group, Mapping, MediaItem, Output, Screen, Show, Source};
+use crate::geom::Rect;
+use crate::model::{Cue, Group, Mapping, MediaItem, Output, Pattern, Screen, Show, Source};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "op", rename_all_fields = "camelCase")]
@@ -43,9 +44,32 @@ fn add<T>(v: &mut Vec<T>, item: T, key: impl Fn(&T) -> Uuid, what: &str) -> Resu
     Ok(())
 }
 
+/// Every float `op` carries (they must all be finite).
+fn floats(op: &ShowOp) -> Vec<f32> {
+    let rect = |r: &Rect| [r.x, r.y, r.w, r.h];
+    match op {
+        ShowOp::AddOutput { output } | ShowOp::UpdateOutput { output } => vec![output.brightness],
+        ShowOp::SetMapping { mapping } => [rect(&mapping.src), rect(&mapping.dst)].concat(),
+        ShowOp::SetCue { cue, .. } => cue.layers_by_screen.values().flatten()
+            .flat_map(|l| {
+                let solid = match &l.source {
+                    Source::Pattern { pattern: Pattern::Solid { rgba } } => &rgba[..],
+                    _ => &[],
+                };
+                [&rect(&l.rect)[..], &[l.opacity, l.brightness, l.contrast, l.saturation, l.volume], solid].concat()
+            })
+            .collect(),
+        ShowOp::SetMasterVolume { volume } => vec![*volume],
+        _ => vec![],
+    }
+}
+
 impl Show {
     /// Apply `op`. On `Err` the show is unchanged.
     pub fn apply(&mut self, op: ShowOp) -> Result<(), String> {
+        if floats(&op).iter().any(|v| !v.is_finite()) {
+            return Err("non-finite number in op".into());
+        }
         match op {
             ShowOp::AddOutput { output } => add(&mut self.outputs, output, |o| o.id, "output"),
             ShowOp::UpdateOutput { output } => {
@@ -153,8 +177,7 @@ impl Show {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geom::Rect;
-    use crate::model::{Layer, MediaKind, OutputTarget, Pattern, Scene, Transition, TransitionKind};
+    use crate::model::{Layer, MediaKind, OutputTarget, Scene, Transition, TransitionKind};
 
     fn rect() -> Rect { Rect { x: 0., y: 0., w: 10., h: 10. } }
     fn screen() -> Screen { Screen { id: Uuid::new_v4(), name: "S".into(), width: 10, height: 10, layout_x: 0, layout_y: 0 } }
@@ -272,6 +295,48 @@ mod tests {
         show.apply(ShowOp::DeleteCue { group_id: g, slot: 2 }).unwrap();
         assert_eq!(show.groups[0].cues.len(), 1);
         assert_eq!(show.groups[0].cues[0].slot, 3);
+    }
+
+    #[test]
+    fn non_finite_floats_rejected() {
+        let mut show = Show::new();
+        let (s, o) = (screen(), output());
+        show.apply(ShowOp::AddScreen { screen: s.clone() }).unwrap();
+        show.apply(ShowOp::AddOutput { output: o.clone() }).unwrap();
+        let g = show.groups[0].id;
+        let before = show.clone();
+        let layer = || Layer::new(Source::Pattern { pattern: Pattern::Bars }, rect());
+        let with_layer = |l: Layer| ShowOp::SetCue { group_id: g, cue: cue(0, Scene::from([(s.id, vec![l])])) };
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut ops = vec![ShowOp::SetMasterVolume { volume: bad }];
+            let mut out = o.clone();
+            out.brightness = bad;
+            ops.push(ShowOp::UpdateOutput { output: out.clone() });
+            out.id = Uuid::new_v4();
+            ops.push(ShowOp::AddOutput { output: out });
+            let mut m = mapping(s.id, o.id);
+            m.src.w = bad;
+            ops.push(ShowOp::SetMapping { mapping: m.clone() });
+            m.src = rect();
+            m.dst.y = bad;
+            ops.push(ShowOp::SetMapping { mapping: m });
+            let mut l = layer();
+            l.rect.x = bad;
+            ops.push(with_layer(l));
+            for f in 0..5 {
+                let mut l = layer();
+                *[&mut l.opacity, &mut l.brightness, &mut l.contrast, &mut l.saturation, &mut l.volume][f] = bad;
+                ops.push(with_layer(l));
+            }
+            let solid = Layer::new(Source::Pattern { pattern: Pattern::Solid { rgba: [0., bad, 0., 1.] } }, rect());
+            ops.push(with_layer(solid));
+            for op in ops {
+                assert!(show.apply(op.clone()).is_err(), "accepted {op:?}");
+                assert_eq!(show, before);
+            }
+        }
+        // finite values still pass
+        show.apply(with_layer(layer())).unwrap();
     }
 
     #[test]

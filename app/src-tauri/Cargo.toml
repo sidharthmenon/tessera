@@ -1,0 +1,31 @@
+[package]
+name = "tessera-app"
+version = "0.1.0"
+description = "Tessera controller"
+edition = "2024"
+
+[lib]
+# Distinct from the bin name (cargo#8519). Desktop only, so no staticlib/cdylib.
+name = "tessera_app_lib"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tessera-show = { path = "../../crates/show" }
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+getrandom = "0.4"
+tokio = { version = "1", features = ["time", "sync", "macros"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
