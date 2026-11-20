@@ -206,7 +206,7 @@ impl<O: Opener> Buses<O> {
             }
         }
         let old = std::mem::replace(&mut self.pgm, BusState::new(scene, players));
-        self.start_new(&old, now);
+        self.hand_over(&old, now);
         drop(old);
         self.pool.gc();
         self.pool.start_ready(now);
@@ -231,7 +231,7 @@ impl<O: Opener> Buses<O> {
             players.extend(layers.iter().filter_map(|l| Some((l.id, from.players.get(&l.id)?.clone()))));
         }
         let old = std::mem::replace(&mut self.pgm, BusState::new(scene, players));
-        self.start_new(&old, now);
+        self.hand_over(&old, now);
         eprintln!("take: {:?} {} ms, {} screen(s) change", t.kind, t.duration_ms, screens.len());
         let duration = Duration::from_millis(t.duration_ms.into());
         if t.kind == TransitionKind::Cut || duration.is_zero() || screens.is_empty() {
@@ -244,15 +244,21 @@ impl<O: Opener> Buses<O> {
         self.pool.start_ready(now);
     }
 
-    /// Play/Pause/Stop/Restart one layer's player on `bus`, or (`None`) every player on it.
+    /// Play/Pause/Stop/Restart one layer's player on `bus`, or (`None`) every player on it. PVW
+    /// transport never touches a player live output also shows (R26): cueing in the PVW panel
+    /// must not pause, stop or restart PGM.
     pub fn transport(&mut self, bus: Bus, layer: Option<Uuid>, action: TransportAction, now: Instant) {
         let state = match bus {
             Bus::Pgm => &self.pgm,
             Bus::Pvw => &self.pvw,
         };
         let mut found = false;
-        for (_, h) in state.players.iter().filter(|(id, _)| layer.is_none_or(|l| l == **id)) {
+        for (id, h) in state.players.iter().filter(|(id, _)| layer.is_none_or(|l| l == **id)) {
             found = true;
+            if bus == Bus::Pvw && self.live(h) {
+                eprintln!("transport: PVW layer {id} is shared with PGM, not touched");
+                continue;
+            }
             let mut e = lock(h);
             e.start = false; // the operator's call wins over a pending start
             match action {
@@ -353,12 +359,21 @@ impl<O: Opener> Buses<O> {
         }
     }
 
-    /// Marks PGM's players that `old` didn't have to start.
-    fn start_new(&mut self, old: &BusState<O::Media>, now: Instant) {
+    /// PGM changed from `old`: its new players are marked to start; players that left it before
+    /// starting stay paused (R27: PVW players wait for their Take).
+    fn hand_over(&mut self, old: &BusState<O::Media>, now: Instant) {
         for h in self.pgm.players.values().filter(|h| !old.holds(h)) {
             lock(h).start = true;
             self.pool.start_by.get_or_insert(now + START_WAIT);
         }
+        for h in old.players.values().filter(|h| !self.pgm.holds(h)) {
+            lock(h).start = false;
+        }
+    }
+
+    /// On an output: PGM's, or the fading-out scene's.
+    fn live(&self, h: &Handle<O::Media>) -> bool {
+        self.pgm.holds(h) || self.outgoing.as_ref().is_some_and(|o| o.bus.holds(h))
     }
 
     fn open(&mut self, media_id: Uuid, layer: &Layer) -> Option<Handle<O::Media>> {
@@ -794,6 +809,60 @@ mod tests {
         b.transport(Bus::Pgm, Some(Uuid::new_v4()), TransportAction::Play, t0);
         let events = b.tick(t0, PERIOD);
         assert_eq!(events.iter().filter(|e| matches!(e, FromEngine::Error { .. })).count(), 2, "{events:?}");
+    }
+
+    #[test]
+    fn pvw_transport_never_touches_pgm_player() {
+        let [a, m1, m2] = ids();
+        let t0 = Instant::now();
+        let mut b = buses();
+        let bg = clip(m1);
+        b.set_program(Scene::from([(a, vec![bg.clone()])]), t0);
+        let (bg2, overlay) = (clip(m1), clip(m2));
+        b.set_preview(Scene::from([(a, vec![bg2.clone(), overlay.clone()])]));
+        let live = pgm(&b, &bg);
+        for action in [TransportAction::Pause, TransportAction::Stop, TransportAction::Restart] {
+            b.transport(Bus::Pvw, Some(bg2.id), action, t0);
+            b.transport(Bus::Pvw, None, action, t0);
+        }
+        assert!(playing(&live) && lock(&live).media.stops == 0, "live output untouched");
+        b.transport(Bus::Pvw, None, TransportAction::Play, t0);
+        assert!(playing(&pvw(&b, &overlay)), "a PVW-only player plays");
+        b.transport(Bus::Pvw, None, TransportAction::Pause, t0);
+        assert!(!playing(&pvw(&b, &overlay)), "and pauses");
+        assert!(playing(&live));
+        let events = b.tick(t0, PERIOD);
+        assert!(events.is_empty(), "skipping a shared player is not an error: {events:?}");
+    }
+
+    #[test]
+    fn pending_start_cancelled_when_player_leaves_pgm() {
+        let [a, m1, m2] = ids();
+        let t0 = Instant::now();
+        let mut b = buses();
+        b.pool.opener.slow.insert(m1);
+        let x = clip(m1);
+        b.set_preview(Scene::from([(a, vec![x.clone()])]));
+        b.take(&cut(), t0);
+        let player = pgm(&b, &x);
+        assert!(lock(&player).start, "waiting to start");
+        b.set_program(Scene::new(), t0); // gone from PGM; PVW still holds it
+        lock(&player).media.ready = true;
+        b.tick(t0 + ms(100), PERIOD);
+        b.tick(t0 + START_WAIT * 2, PERIOD);
+        assert!(!playing(&player), "SetProgram dropped it: stays paused in PVW");
+
+        // A Take that replaces it: it fades out paused instead of starting in the outgoing scene.
+        b.pool.opener.slow.insert(m2);
+        let y = clip(m2);
+        b.set_preview(Scene::from([(a, vec![y.clone()])]));
+        b.take(&cut(), t0 + ms(200));
+        let leaving = pgm(&b, &y);
+        b.set_preview(Scene::from([(a, vec![bars()])]));
+        b.take(&fade(1000), t0 + ms(300));
+        lock(&leaving).media.ready = true;
+        b.tick(t0 + ms(400), PERIOD);
+        assert!(!playing(&leaving) && !lock(&leaving).start);
     }
 
     #[test]
