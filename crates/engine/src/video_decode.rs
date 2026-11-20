@@ -87,6 +87,8 @@ pub(crate) struct Decoder {
 
 impl Decoder {
     pub fn open(path: &Path) -> anyhow::Result<Decoder> {
+        // ffmpeg-next unwraps the path as a CString.
+        ensure!(!path.as_os_str().as_encoded_bytes().contains(&0), "path contains a NUL byte");
         init();
         let input = ff::format::input(path).context("cannot open")?;
         let stream = input.streams().best(ff::media::Type::Video).context("no video stream")?;

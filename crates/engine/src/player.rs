@@ -65,8 +65,7 @@ impl Player {
         let (tx, frames) = mpsc::sync_channel(QUEUE);
         let (seek, seeks) = mpsc::channel();
         let (owned, looping) = (path.to_path_buf(), playback == Playback::Loop);
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        std::thread::Builder::new().name(format!("decode {name}")).spawn(move || {
+        std::thread::Builder::new().name(thread_name("decode", path)).spawn(move || {
             let result = Decoder::open(&owned).and_then(|d| {
                 let _ = tx.send(Msg::Opened(d.duration));
                 decode(d, looping, &tx, &seeks)
@@ -234,6 +233,11 @@ fn decode(mut d: Decoder, looping: bool, tx: &SyncSender<Msg>, seeks: &Receiver<
     }
 }
 
+/// `kind` + file name. `Builder::name` panics on a NUL, and paths come from unvalidated JSON.
+fn thread_name(kind: &str, path: &Path) -> String {
+    format!("{kind} {}", path.file_name().unwrap_or_default().to_string_lossy()).replace('\0', "")
+}
+
 /// Larger than the GPU's 2D texture limit can't be uploaded (R20): error, layer transparent.
 fn check_size(gpu: &Gpu, w: u32, h: u32) -> anyhow::Result<()> {
     let max = gpu.device.limits().max_texture_dimension_2d;
@@ -341,8 +345,7 @@ impl ImageSource {
     pub fn open(gpu: &Gpu, path: &Path) -> anyhow::Result<ImageSource> {
         let (tx, loaded) = mpsc::sync_channel(1);
         let (gpu, owned) = (gpu.clone(), path.to_path_buf());
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        std::thread::Builder::new().name(format!("image {name}")).spawn(move || {
+        std::thread::Builder::new().name(thread_name("image", path)).spawn(move || {
             let _ = tx.send(load_image(&gpu, &owned).with_context(|| owned.display().to_string()));
         })?;
         Ok(ImageSource { loaded: Some(loaded), layer: None, error: None })

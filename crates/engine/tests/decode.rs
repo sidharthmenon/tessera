@@ -136,6 +136,18 @@ fn open_missing_file_is_err() {
 }
 
 #[test]
+fn nul_in_path_is_error_not_panic() {
+    // MediaItem.path is unvalidated JSON: a NUL must not panic (thread name, CString), only error.
+    let gpu = gpu();
+    let mut player = Player::open(Path::new("/tmp/bad\0clip.mp4"), Playback::Loop).unwrap();
+    let error = frame(&mut player, &gpu, Instant::now()).unwrap_err();
+    assert!(error.contains("/tmp/bad\0clip.mp4") && error.contains("NUL"), "{error:?}");
+    let mut image = ImageSource::open(&gpu, Path::new("/tmp/bad\0still.png")).unwrap();
+    let error = image_frame(&mut image).unwrap_err();
+    assert!(error.contains("/tmp/bad\0still.png") && error.contains("NUL"), "{error:?}");
+}
+
+#[test]
 #[cfg(unix)]
 fn open_does_not_block() {
     // Opening a FIFO blocks until a writer shows up, so an open on the caller's thread hangs here.
