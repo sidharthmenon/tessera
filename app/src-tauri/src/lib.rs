@@ -129,15 +129,32 @@ pub(crate) fn engine_event(app: &AppHandle, event: FromEngine) {
     let _ = app.emit("engine-event", event);
 }
 
-/// Writes the autosave if the show changed since the last write. Called with the controller
-/// locked, so a save (which removes the autosave) can't race it.
+/// Writes the show if it changed since the last write: a show with a file to that file itself (so
+/// the file always has the latest changes), an untitled one to the data dir's autosave. If the
+/// show's file can't be written, the work goes to `<show>.autosave` (offered back when the show is
+/// opened), else to the data dir's autosave (offered at startup), and the error says where.
+/// Called with the controller locked, so a save can't race it.
 // ponytail: the write (with fsync) holds the controller lock for a few ms; move it off the lock
 // with a generation counter if that ever delays a GO.
 fn write_autosave(ctl: &mut Controller, data_dir: &Path) -> Res<bool> {
     if !ctl.dirty {
         return Ok(false);
     }
-    files::save_atomic(&files::autosave_path(ctl.path.as_deref(), data_dir), &ctl.show)?;
+    let autosave = files::autosave_path(ctl.path.as_deref(), data_dir);
+    match ctl.path.clone() {
+        Some(path) => match files::save_atomic(&path, &ctl.show) {
+            // An older fallback would come back next launch as "unsaved work" (M1).
+            Ok(()) => _ = std::fs::remove_file(&autosave),
+            Err(e) => {
+                let untitled = files::autosave_path(None, data_dir);
+                let kept = [autosave, untitled].into_iter().find(|p| files::save_atomic(p, &ctl.show).is_ok());
+                let kept = kept.ok_or_else(|| format!("{e}; and no autosave could be written either"))?;
+                ctl.dirty = false;
+                return Err(format!("{e}; the changes are kept in {}", kept.display()));
+            }
+        },
+        None => files::save_atomic(&autosave, &ctl.show)?,
+    }
     ctl.dirty = false;
     Ok(true)
 }
@@ -149,7 +166,16 @@ async fn autosave(app: AppHandle) {
         while tokio::time::timeout(AUTOSAVE_DEBOUNCE, state.autosave.notified()).await.is_ok() {}
         if let Err(e) = write_autosave(&mut state.ctl(), &state.data_dir) {
             log!("autosave: {e}");
+            let _ = app.emit("engine-event", FromEngine::Error { message: format!("autosave: {e}") });
         }
+    }
+}
+
+/// Before another show replaces this one: its last edits (within the 2 s debounce) are written.
+fn flush_autosave(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if let Err(e) = write_autosave(&mut state.ctl(), &state.data_dir) {
+        log!("autosave before switching shows: {e}");
     }
 }
 
@@ -268,6 +294,7 @@ fn import_media(app: AppHandle, paths: Vec<PathBuf>) -> Res<()> {
 #[tauri::command]
 fn open_show(app: AppHandle, path: PathBuf) -> Res<()> {
     let show = files::open(&path)?;
+    flush_autosave(&app);
     release_hold(&app);
     let titled = !files::is_autosave(&path);
     let state = app.state::<AppState>();
@@ -283,6 +310,7 @@ fn open_show(app: AppHandle, path: PathBuf) -> Res<()> {
 /// A fresh untitled show. Like `open_show`: history and PVW clear, PGM keeps running.
 #[tauri::command]
 fn new_show(app: AppHandle) -> Res<()> {
+    flush_autosave(&app);
     release_hold(&app);
     dispatch(&app, Change::Load, |c| Ok(c.open(Show::new(), None)))
 }
@@ -480,6 +508,35 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A show with a file autosaves into that file; an untitled one into the data dir; a file that
+    /// can't be written keeps the work in its `.autosave` and says so.
+    #[test]
+    fn autosave_writes_the_show_file() {
+        let dir = std::env::temp_dir().join(format!("tessera-autosave-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ctl = Controller::new();
+        ctl.apply(tessera_show::ShowOp::SetMasterVolume { volume: 0.5 }).unwrap();
+        assert!(write_autosave(&mut ctl, &dir).unwrap(), "untitled");
+        assert!(dir.join("untitled.tshow.autosave").exists());
+        let show = dir.join("show.tshow");
+        ctl.path = Some(show.clone());
+        std::fs::write(dir.join("show.tshow.autosave"), b"older fallback").unwrap();
+        ctl.apply(tessera_show::ShowOp::SetMasterVolume { volume: 0.25 }).unwrap();
+        assert!(write_autosave(&mut ctl, &dir).unwrap());
+        assert_eq!(files::open(&show).unwrap().master_volume, 0.25, "the show file has the latest change");
+        assert!(!dir.join("show.tshow.autosave").exists(), "no stale fallback left");
+        assert!(!write_autosave(&mut ctl, &dir).unwrap(), "nothing new: no write");
+        // The file can't be written (its folder is gone, so its .autosave can't be either): the
+        // work goes to the data dir, which startup offers back.
+        let gone = dir.join("missing").join("show.tshow");
+        ctl.path = Some(gone.clone());
+        ctl.apply(tessera_show::ShowOp::SetMasterVolume { volume: 0.75 }).unwrap();
+        let err = write_autosave(&mut ctl, &dir).unwrap_err();
+        assert!(err.contains("untitled.tshow.autosave"), "{err}");
+        assert_eq!(files::open(&dir.join("untitled.tshow.autosave")).unwrap().master_volume, 0.75);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn quit_asks_only_when_on_air() {

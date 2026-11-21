@@ -62,17 +62,20 @@ Plain `npm run tauri build` still works, but its `.app` and `.dmg` load FFmpeg f
 
 - **Show files.** A show is a `.tshow` file (JSON) saved wherever you choose. Media inside the
   show's folder is stored as a relative path. Every save is atomic (temp file + rename).
-- **Autosave.** Tessera autosaves 2 s after the last edit:
-  - titled show: to `<show>.tshow.autosave` next to it;
-  - untitled show: to `~/Library/Application Support/dev.tessera.controller/untitled.tshow.autosave`.
+- **Autosave.** Tessera saves 2 s after the last edit (and on quit, and before opening or
+  creating another show):
+  - a show that has a file (saved once): **into that file**, so it always has the latest changes;
+  - an untitled show: to `~/Library/Application Support/dev.tessera.controller/untitled.tshow.autosave`.
+  - If the show's file can't be written (a disconnected drive), the changes go to
+    `<show>.tshow.autosave` next to it, else to the untitled autosave, and the status bar says
+    where; they are offered back as recovery.
 - **Recovery.** Unsaved work from an earlier session is moved to `….autosave.prev`. The app then
   asks *Recover unsaved work?*. This happens at startup for the untitled autosave, and when you
   open a show whose autosave is newer than the show file. *Recover* opens the work as an
   untitled show; save it to keep it. *Not now* leaves the `.prev` file in place, and you can open
   it later with Open. An older `.prev` is never overwritten: later ones are kept as
   `….autosave.<time>.prev`, and the newest is the one offered.
-- **Saving** removes the show's autosave, and quitting writes any edit the 2 s autosave hasn't
-  caught yet.
+- **Save As** gives the show a file (or a new one); from then on it saves into that file.
 - **Engine supervision.** If the engine dies or stops answering for 5 s, the controller kills it,
   starts a new one and re-sends the config, PVW, PGM and the master volume. What a restart
   restores:

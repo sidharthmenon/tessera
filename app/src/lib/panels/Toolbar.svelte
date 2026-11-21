@@ -17,7 +17,7 @@
     <button onclick={() => redo()} title="⇧⌘Z">Redo</button>
   </div>
   <button onclick={() => (ui.modal = 'screens')}>Screen Management…</button>
-  <span class="name" title={ui.path ?? ''}>{name}</span>
+  <span class="name" title={ui.path ? `${ui.path}\nChanges are saved here automatically (2 s after each edit)` : 'Save the show once and every change is then saved to its file automatically'}>{name}</span>
 </header>
 
 <style>

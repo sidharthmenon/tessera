@@ -197,11 +197,14 @@ const showFilters = [{ name: 'Tessera show', extensions: ['tshow'] }];
 /** Also lets a kept autosave be opened by hand. */
 const openFilters = [{ name: 'Tessera show or autosave', extensions: ['tshow', 'autosave', 'prev'] }];
 
+/** A show with a file autosaves into it, so only an untitled one has changes to lose. */
+const unsavedNote = () => (ui.path ? ` (${ui.path.split(/[\\/]/).pop()} keeps its latest changes)` : ', and this untitled show is not kept: save it first to keep it');
+
 /** Opening keeps PGM running, but the outputs switch to the opened show's setup (I6). */
 async function openShowAt(path: string) {
   if (onAir(ui.live)) {
     const name = path.split(/[\\/]/).pop();
-    const yes = await ask(`Open ${name}? What is on air keeps playing, but outputs, screens and mappings switch to that show's setup now, and unsaved changes here are lost.`, {
+    const yes = await ask(`Open ${name}? What is on air keeps playing, but outputs, screens and mappings switch to that show's setup now${unsavedNote()}.`, {
       title: 'Open while on air', kind: 'warning', okLabel: 'Open',
     });
     if (!yes) return;
@@ -212,7 +215,7 @@ async function openShowAt(path: string) {
 }
 
 export const newShow = action(async () => {
-  const yes = await ask('Start a new, empty show? Outputs close until screens are set up again, and unsaved changes are lost.', {
+  const yes = await ask(`Start a new, empty show? Outputs close until screens are set up again${unsavedNote()}.`, {
     title: 'New show', kind: 'warning', okLabel: 'New show',
   });
   if (!yes) return;
