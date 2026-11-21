@@ -249,7 +249,7 @@ impl Controller {
         let (scene, transition) = (self.pvw.scene.clone(), self.pvw.transition.clone());
         let cue = match cue_at(&self.show, Some(at)) {
             Some(c) => Cue { layers_by_screen: scene, transition, ..c.clone() },
-            None => Cue { id: Uuid::new_v4(), name: format!("Cue {}", at.slot + 1), slot: at.slot, layers_by_screen: scene, transition },
+            None => Cue { id: Uuid::new_v4(), name: format!("Cue {}", at.slot + 1), slot: at.slot, layers_by_screen: scene, transition, hotkey: None },
         };
         let out = self.apply(ShowOp::SetCue { group_id: at.group_id, cue })?;
         self.pvw.cue = Some(at);
@@ -471,7 +471,7 @@ mod tests {
     fn screen() -> Screen { Screen { id: Uuid::new_v4(), name: "S".into(), width: 10, height: 10, layout_x: 0, layout_y: 0 } }
     fn cue(slot: u32, scene: Scene) -> Cue {
         Cue { id: Uuid::new_v4(), name: format!("c{slot}"), slot, layers_by_screen: scene,
-            transition: Transition { kind: TransitionKind::Cut, duration_ms: 0 } }
+            transition: Transition { kind: TransitionKind::Cut, duration_ms: 0 }, hotkey: None }
     }
     fn group(c: &Controller) -> Uuid { c.show.groups[0].id }
     fn set_cue(c: &mut Controller, slot: u32, scene: Scene) -> Vec<ToEngine> {

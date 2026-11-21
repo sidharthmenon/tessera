@@ -2,4 +2,8 @@
 import type { Layer } from "./Layer";
 import type { Transition } from "./Transition";
 
-export type Cue = { id: string, name: string, slot: number, layersByScreen: { [key in string]: Array<Layer> }, transition: Transition, };
+export type Cue = { id: string, name: string, slot: number, layersByScreen: { [key in string]: Array<Layer> }, transition: Transition, 
+/**
+ * A key that loads this cue into Preview: `A`–`Z`, `0`–`9` or `F1`–`F12`, unique in its group.
+ */
+hotkey: string | null, };

@@ -155,10 +155,7 @@ impl Show {
                 self.groups.remove(i);
                 Ok(())
             }
-            ShowOp::SetCue { group_id, cue } => {
-                set_cue(self.group_mut(group_id)?, cue);
-                Ok(())
-            }
+            ShowOp::SetCue { group_id, cue } => set_cue(self.group_mut(group_id)?, cue),
             ShowOp::MoveCue { group_id, from, to } => move_cue(self.group_mut(group_id)?, from, to),
             ShowOp::DuplicateCue { group_id, from, to } => duplicate_cue(self.group_mut(group_id)?, from, to),
             ShowOp::DeleteCue { group_id, slot } => {
@@ -198,7 +195,7 @@ mod tests {
     }
     fn cue(slot: u32, scene: Scene) -> Cue {
         Cue { id: Uuid::new_v4(), name: "c".into(), slot, layers_by_screen: scene,
-            transition: Transition { kind: TransitionKind::Cut, duration_ms: 0 } }
+            transition: Transition { kind: TransitionKind::Cut, duration_ms: 0 }, hotkey: None }
     }
 
     #[test]

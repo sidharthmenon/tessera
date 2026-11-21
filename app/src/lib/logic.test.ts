@@ -31,7 +31,7 @@ eq(L.dragRect({ x: 10, y: 10, w: 50, h: 50 }, 5.4, -3.6, 'move'), { x: 15, y: 6,
 eq(L.dragRect({ x: 10, y: 10, w: 50, h: 50 }, -80, 10, 'resize'), { x: 10, y: 10, w: 1, h: 60 }, 'resize keeps >= 1');
 
 // Slots.
-const cue = (slot: number, layersByScreen: L.Scene = {}): Cue => ({ id: `c${slot}`, name: `Cue ${slot + 1}`, slot, layersByScreen, transition: { kind: 'Fade', durationMs: 500 } });
+const cue = (slot: number, layersByScreen: L.Scene = {}): Cue => ({ id: `c${slot}`, name: `Cue ${slot + 1}`, slot, layersByScreen, transition: { kind: 'Fade', durationMs: 500 }, hotkey: null });
 const g: Group = { id: 'g', name: 'G', cues: [cue(0), cue(1), cue(3)] };
 eq(L.firstEmptySlot(g), 2, 'first gap');
 eq(L.firstEmptySlot(g, 1), 2, 'after 1');
@@ -213,6 +213,8 @@ eq(L.fitInto(16 / 9, 3840, 1080), { x: 960, y: 0, w: 1920, h: 1080 }, 'fit 16:9 
   const uses = L.mediaUses(show, live);
   eq([uses.get('m1'), uses.get('m2'), uses.get('m3'), uses.has('m4')], [{ cues: 2, pvw: true, pgm: false }, { cues: 1, pvw: false, pgm: false }, { cues: 0, pvw: false, pgm: true }, false], 'media uses: cues, Preview, Program, unused');
 }
+eq(['h', 'H', '7', 'F1', 'F12'].map((key) => L.cueKey({ key })), ['H', 'H', '7', 'F1', 'F12'], 'cue keys, letters upper-cased');
+eq([' ', 'ArrowRight', 'Enter', 'Escape', 'F13', 'é', '/'].map((key) => L.cueKey({ key })), [null, null, null, null, null, null, null], 'keys a cue cannot take');
 eq(L.patternFill({ type: 'Bars' }), 'url(#cue-bars)', 'bars fill');
 
 console.log('logic: all checks passed');

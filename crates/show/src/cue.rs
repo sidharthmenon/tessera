@@ -5,11 +5,30 @@ use uuid::Uuid;
 use crate::model::{Cue, Group, Scene, Source};
 
 /// Insert `cue`, replacing any existing cue in the same slot.
-pub fn set_cue(group: &mut Group, cue: Cue) {
+/// Whether `key` can be a cue shortcut: `A`–`Z`, `0`–`9` or `F1`–`F12` (other keys run the show).
+pub fn valid_hotkey(key: &str) -> bool {
+    let b = key.as_bytes();
+    match b {
+        [c] => c.is_ascii_uppercase() || c.is_ascii_digit(),
+        [b'F', n @ ..] => matches!(std::str::from_utf8(n).ok().and_then(|n| n.parse::<u8>().ok()), Some(1..=12)) && n[0] != b'0',
+        _ => false,
+    }
+}
+
+pub fn set_cue(group: &mut Group, cue: Cue) -> Result<(), String> {
+    if let Some(key) = &cue.hotkey {
+        if !valid_hotkey(key) {
+            return Err(format!("shortcut {key:?}: use A–Z, 0–9 or F1–F12"));
+        }
+        if let Some(other) = group.cues.iter().find(|c| c.slot != cue.slot && c.hotkey.as_ref() == Some(key)) {
+            return Err(format!("shortcut {key} is already cue {}'s", other.slot + 1));
+        }
+    }
     match group.cues.iter_mut().find(|c| c.slot == cue.slot) {
         Some(existing) => *existing = cue,
         None => group.cues.push(cue),
     }
+    Ok(())
 }
 
 /// Move the cue at `from` to `to`; swaps with the occupant of `to` if any.
@@ -34,6 +53,7 @@ pub fn duplicate_cue(group: &mut Group, from: u32, to: u32) -> Result<(), String
     let mut copy = group.cues.iter().find(|c| c.slot == from).ok_or(format!("no cue in slot {from}"))?.clone();
     copy.id = Uuid::new_v4();
     copy.slot = to;
+    copy.hotkey = None; // shortcuts are unique in a group
     copy.layers_by_screen.values_mut().flatten().for_each(|l| l.id = Uuid::new_v4());
     group.cues.push(copy);
     Ok(())
@@ -88,7 +108,7 @@ mod tests {
     fn pattern() -> Layer { Layer::new(Source::Pattern { pattern: Pattern::Bars }, rect()) }
     fn cue(slot: u32, scene: Scene) -> Cue {
         Cue { id: Uuid::new_v4(), name: format!("c{slot}"), slot, layers_by_screen: scene,
-            transition: Transition { kind: TransitionKind::Cut, duration_ms: 0 } }
+            transition: Transition { kind: TransitionKind::Cut, duration_ms: 0 }, hotkey: None }
     }
     fn group(slots: &[u32]) -> Group {
         Group { id: Uuid::new_v4(), name: "g".into(), cues: slots.iter().map(|s| cue(*s, Scene::new())).collect() }
@@ -122,6 +142,24 @@ mod tests {
     }
 
     #[test]
+    fn hotkeys_valid_and_unique() {
+        for ok in ["A", "Z", "0", "9", "F1", "F12"] {
+            assert!(valid_hotkey(ok), "{ok}");
+        }
+        for bad in ["", "a", " ", "AB", "F0", "F01", "F13", "Space", "ArrowRight", "é"] {
+            assert!(!valid_hotkey(bad), "{bad}");
+        }
+        let mut g = group(&[]);
+        let keyed = |slot, key: &str| Cue { hotkey: Some(key.into()), ..cue(slot, Scene::new()) };
+        set_cue(&mut g, keyed(1, "H")).unwrap();
+        assert!(set_cue(&mut g, keyed(2, "H")).is_err(), "taken by cue 2");
+        set_cue(&mut g, keyed(1, "H")).unwrap(); // the same cue again
+        assert!(set_cue(&mut g, keyed(3, "space")).is_err());
+        duplicate_cue(&mut g, 1, 4).unwrap();
+        assert_eq!(g.cues.iter().find(|c| c.slot == 4).unwrap().hotkey, None, "a copy has no shortcut");
+    }
+
+    #[test]
     fn duplicate_to_occupied_is_err() {
         let mut g = group(&[1, 2]);
         assert!(duplicate_cue(&mut g, 1, 2).is_err());
@@ -131,9 +169,9 @@ mod tests {
     #[test]
     fn set_and_delete() {
         let mut g = group(&[1]);
-        set_cue(&mut g, cue(1, Scene::new()));
+        set_cue(&mut g, cue(1, Scene::new())).unwrap();
         assert_eq!(g.cues.len(), 1);
-        set_cue(&mut g, cue(2, Scene::new()));
+        set_cue(&mut g, cue(2, Scene::new())).unwrap();
         assert_eq!(g.cues.len(), 2);
         delete_cue(&mut g, 1);
         assert_eq!(g.cues.len(), 1);

@@ -1,8 +1,8 @@
 <script lang="ts">
   import '../app.css';
   import { onMount } from 'svelte';
-  import { hotkey, ownsKeys, type Hotkey } from '$lib/logic';
-  import { init, loadNext, redo, saveShow, take, ui, undo } from '$lib/store.svelte';
+  import { cueKey, hotkey, ownsKeys, type Hotkey } from '$lib/logic';
+  import { clickSlot, init, loadNext, redo, saveShow, take, ui, undo } from '$lib/store.svelte';
   import Prompt from '$lib/Prompt.svelte';
   import Canvas from '$lib/panels/Canvas.svelte';
   import CueGrid from '$lib/panels/CueGrid.svelte';
@@ -36,10 +36,21 @@
     }
     if (ui.modal) return;
     const key = hotkey(e);
-    if (!key) return;
+    if (!key) return cueShortcut(e);
     e.preventDefault(); // also keeps Space from clicking a focused button
     if (e.repeat && key !== 'undo' && key !== 'redo') return; // a held Space is one GO
     actions[key]();
+  }
+
+  /** A cue's shortcut (active group) loads it into Preview, as a click on its tile does. */
+  function cueShortcut(e: KeyboardEvent) {
+    if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey || e.repeat) return;
+    const k = cueKey(e);
+    const group = ui.group;
+    const cue = k && group?.cues.find((c) => c.hotkey === k);
+    if (!cue || !group) return;
+    e.preventDefault();
+    clickSlot({ groupId: group.id, slot: cue.slot });
   }
 
   // R40: once a control has been used, hand the keys back to the show, so Space is GO again.

@@ -154,7 +154,7 @@ mod tests {
 
     fn cue(slot: u32) -> Cue {
         Cue { id: Uuid::new_v4(), name: "c".into(), slot, layers_by_screen: Scene::new(),
-            transition: Transition { kind: TransitionKind::Cut, duration_ms: 0 } }
+            transition: Transition { kind: TransitionKind::Cut, duration_ms: 0 }, hotkey: None }
     }
 
     #[test]

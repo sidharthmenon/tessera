@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Cue } from '$lib/bindings/Cue';
-  import { engineUrl, firstEmptySlot, layoutBounds, mediaOf, patternFill, sameRef, slotCount, withScreen } from '$lib/logic';
+  import { cueKey, engineUrl, firstEmptySlot, layoutBounds, mediaOf, patternFill, sameRef, slotCount, withScreen } from '$lib/logic';
   import { addGroup, clickSlot, confirmAsk, editCue, fire, op, promptText, ui, updateCue } from '$lib/store.svelte';
   import type { CueRef } from '$lib/api';
 
@@ -51,6 +51,36 @@
   const clearScreen = (cue: Cue, s: { id: string }) => editCue(ref(cue.slot), (c) => ({ ...c, layersByScreen: withScreen(c.layersByScreen, s.id, []) }));
   const leaveScreen = (cue: Cue, s: { id: string }) => editCue(ref(cue.slot), (c) => ({ ...c, layersByScreen: withScreen(c.layersByScreen, s.id, null) }));
 
+  // Shortcut dialog: the next key press becomes the cue's shortcut (ui.modal keeps it from the show).
+  let keyFor = $state<Cue | null>(null);
+  let keyNote = $state('');
+  function askKey(cue: Cue) {
+    keyFor = cue;
+    keyNote = '';
+    ui.modal = 'prompt';
+  }
+  function closeKey() {
+    keyFor = null;
+    if (ui.modal === 'prompt') ui.modal = null;
+  }
+  /** Sets `cue`'s shortcut; a key another cue in the group has moves here. */
+  async function setKey(cue: Cue, key: string | null) {
+    const other = key ? group?.cues.find((c) => c.slot !== cue.slot && c.hotkey === key) : undefined;
+    if (other) await editCue(ref(other.slot), (c) => ({ ...c, hotkey: null }));
+    await editCue(ref(cue.slot), (c) => ({ ...c, hotkey: key }));
+  }
+  function keyPressed(e: KeyboardEvent) {
+    const cue = keyFor;
+    if (!cue) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.key === 'Escape') return closeKey();
+    if (e.key === 'Backspace' || e.key === 'Delete') return void (setKey(cue, null), closeKey());
+    const k = e.metaKey || e.ctrlKey || e.altKey || e.shiftKey ? null : cueKey(e);
+    if (k) return void (setKey(cue, k), closeKey());
+    if (!['Shift', 'Control', 'Alt', 'Meta'].includes(e.key)) keyNote = `“${e.key === ' ' ? 'Space' : e.key}” can't be a shortcut: use A–Z, 0–9 or F1–F12, without modifiers.`;
+  }
+
   async function renameCue(cue: Cue) {
     const name = await promptText(`Rename cue ${cue.slot + 1}`, cue.name);
     if (name) editCue(ref(cue.slot), (c) => ({ ...c, name }));
@@ -77,6 +107,7 @@
 <svelte:window
   onclick={closeMenu}
   onkeydown={(e) => {
+    if (keyFor) return keyPressed(e);
     if (menu && e.key === 'Escape') closeMenu();
   }}
 />
@@ -152,6 +183,7 @@
         title={cue ? cue.name : 'Empty: click to store Preview here'}
       >
         <span class="num">{slot + 1}</span>
+        {#if cue?.hotkey}<span class="key" title="Shortcut: loads this cue into Preview">{cue.hotkey}</span>{/if}
         {#if cue}
           {@render thumb(cue)}
           <span class="cname">{cue.name}</span>
@@ -166,12 +198,25 @@
   </div>
 </section>
 
+{#if keyFor}
+  <div class="backdrop">
+    <div class="dialog" role="dialog" aria-label="Cue shortcut">
+      <h3>Shortcut for cue {keyFor.slot + 1} “{keyFor.name}”</h3>
+      <p>Press a key: A–Z, 0–9 or F1–F12. It loads this cue into Preview while its group is open. A key another cue in this group has moves here.</p>
+      <p class="muted">Now: {keyFor.hotkey ?? 'none'} · Backspace clears · Esc cancels</p>
+      {#if keyNote}<p class="warn">{keyNote}</p>{/if}
+      <div class="actions"><button onclick={closeKey}>Cancel</button></div>
+    </div>
+  </div>
+{/if}
+
 {#if menu}
   {@const cue = menu.cue}
   <div class="menu" class:up={menu.y > innerHeight / 2} class:left={menu.x > innerWidth - 240} style:left="{menu.x}px" style:top="{menu.y}px">
     {#if sameRef(ui.live.lastTaken, ref(cue.slot))}<div class="air"><span class="badge live">ON AIR</span> cue {cue.slot + 1} is on Program</div>{/if}
     <button onclick={() => updateCue(ref(cue.slot))} disabled={!Object.keys(ui.live.preview).length} title="Replace this cue's layers and transition with what Preview shows now">Update with current view</button>
     <button onclick={() => renameCue(cue)}>Rename…</button>
+    <button onclick={() => askKey(cue)}>Shortcut…{cue.hotkey ? ` (${cue.hotkey})` : ''}</button>
     <button onclick={() => group && op({ op: 'DuplicateCue', groupId: group.id, from: cue.slot, to: firstEmptySlot(group, cue.slot) })}>Duplicate</button>
     <button onclick={() => deleteCue(cue)}>Delete</button>
     {#each ui.show?.screens ?? [] as s (s.id)}
@@ -256,6 +301,20 @@
     color: var(--muted);
     background: rgba(0, 0, 0, 0.6);
     padding: 0 3px;
+    border-radius: 2px;
+  }
+  .warn {
+    color: var(--warn);
+  }
+  .key {
+    position: absolute;
+    top: 3px;
+    left: 26px;
+    font-size: 10px;
+    font-weight: 700;
+    color: #000;
+    background: var(--accent);
+    padding: 0 4px;
     border-radius: 2px;
   }
   .thumb {

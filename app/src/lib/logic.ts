@@ -166,6 +166,13 @@ export function shiftLayer(scene: Scene, screenId: string, layerId: string, by: 
   return withScreen(scene, screenId, next);
 }
 
+/** A cue shortcut from a key press (`A`–`Z`, `0`–`9`, `F1`–`F12`, as the show's `valid_hotkey`
+ *  takes them), else null. */
+export function cueKey(e: Pick<KeyboardEvent, 'key'>): string | null {
+  const k = e.key.length === 1 ? e.key.toUpperCase() : e.key;
+  return /^([A-Z0-9]|F([1-9]|1[0-2]))$/.test(k) ? k : null;
+}
+
 export type MediaUse = { cues: number; pvw: boolean; pgm: boolean };
 
 /** Where each media item is used: in how many cues, and whether Preview or Program shows it. An

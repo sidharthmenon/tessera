@@ -118,6 +118,9 @@ pub struct Cue {
     pub slot: u32,
     pub layers_by_screen: Scene,
     pub transition: Transition,
+    /// A key that loads this cue into Preview: `A`–`Z`, `0`–`9` or `F1`–`F12`, unique in its group.
+    #[serde(default)]
+    pub hotkey: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
@@ -197,6 +200,14 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    /// Fields added after a show was saved load with their defaults.
+    #[test]
+    fn older_cue_json_loads() {
+        let json = r#"{"id":"00000000-0000-4000-8000-000000000001","name":"C","slot":0,"layersByScreen":{},"transition":{"kind":"Cut","durationMs":0}}"#;
+        let cue: Cue = serde_json::from_str(json).unwrap();
+        assert_eq!(cue.hotkey, None);
+    }
+
     #[test]
     fn show_json_roundtrip() {
         let mut show = Show::new();
@@ -208,7 +219,7 @@ mod tests {
         show.mappings.push(Mapping { id: Uuid::new_v4(), screen_id: scr.id, src: full.clone(), output_id: out.id, dst: full.clone() });
         let layer = Layer::new(Source::Pattern { pattern: Pattern::Solid { rgba: [1., 0., 0., 1.] } }, full);
         let mut cue = Cue { id: Uuid::new_v4(), name: "C".into(), slot: 0, layers_by_screen: Scene::new(),
-            transition: Transition { kind: TransitionKind::Fade, duration_ms: 500 } };
+            transition: Transition { kind: TransitionKind::Fade, duration_ms: 500 }, hotkey: Some("H".into()) };
         cue.layers_by_screen.insert(scr.id, vec![layer]);
         show.groups[0].cues.push(cue);
         show.outputs.push(out);
