@@ -49,6 +49,12 @@ export const openShow = (path: string) => invoke<null>('open_show', { path });
 /** `path: null` saves to the current file (rejects for an untitled show). */
 export const saveShow = (path: string | null) => invoke<null>('save_show', { path });
 export const engineInfo = () => invoke<EngineInfo | null>('engine_info');
+/** Stop the engine (every output goes black) until `engineStart`. */
+export const engineStop = () => invoke<null>('engine_stop');
+export const engineStart = () => invoke<null>('engine_start');
+/** Replace the engine; the new one gets the show, Preview and Program back on connect. */
+export const engineRestart = () => invoke<null>('engine_restart');
+export const engineStopped = () => invoke<boolean>('engine_stopped');
 /** Unsaved work from an earlier session. Read it before any `openShow`, which resets it. */
 export const getRecovery = () => invoke<string | null>('get_recovery');
 
@@ -59,6 +65,8 @@ type Events = {
   /** Port and token change on every engine respawn: rebuild preview/thumbnail URLs. */
   'engine-info': EngineInfo | null;
   'recovery-available': string;
+  /** The operator stopped (true) or started (false) the engine. */
+  'engine-stopped': boolean;
 };
 
 export const on = <K extends keyof Events>(event: K, f: (payload: Events[K]) => void): Promise<UnlistenFn> =>

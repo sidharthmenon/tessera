@@ -83,6 +83,9 @@ Plain `npm run tauri build` still works, but its `.app` and `.dmg` load FFmpeg f
     leaves out every media layer (PGM keeps its patterns, PVW is emptied) and the status bar names
     what was left out. Take the cues again to bring them back. A minute without a crash resets
     this.
+  - **By hand:** the **Engine** button at the left of the status bar restarts the engine (same
+    restore as above; it asks first while something is on air) or stops it: every output goes
+    black, and no engine runs until you choose **Start engine**. Neither counts as a crash.
 - **UI force-quit.** The engine survives a force-quit or crash of the UI, and its outputs keep
   playing. On relaunch the controller adopts the engine through
   `~/Library/Application Support/dev.tessera.controller/engine.json` (pid, port and token), so
@@ -157,8 +160,8 @@ On Windows, run the same checklist before the first show there.
   display* and asks first.
 - **Audio output.** The engine picks the macOS default output device when it starts. Set the
   default output (System Settings → Sound) before launching Tessera. After unplugging or
-  replugging the audio interface, restart the engine: `pkill -f tessera-render`. The controller
-  starts a new one, and its clips restart from their first frame (see Engine supervision).
+  replugging the audio interface, restart the engine: status bar → Engine → Restart engine. Its
+  clips restart from their first frame (see Engine supervision).
 
 ## Live inputs
 

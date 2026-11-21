@@ -1,5 +1,11 @@
 <script lang="ts">
-  import { ui } from '$lib/store.svelte';
+  import { restartEngine, startEngine, stopEngine, ui } from '$lib/store.svelte';
+
+  let menu = $state<{ x: number; y: number } | null>(null);
+  function openMenu(e: MouseEvent) {
+    e.stopPropagation();
+    menu = menu ? null : { x: e.clientX, y: e.clientY };
+  }
 
   const text = $derived(
     {
@@ -7,12 +13,21 @@
       held: 'engine held: kept from an earlier session, outputs untouched until you open or create a show',
       restarting: ui.restarting || 'engine restarting',
       connecting: 'engine connecting…',
+      stopped: 'engine stopped: outputs are black (Engine → Start)',
     }[ui.status],
   );
   const bound = $derived(ui.outputs.filter((o) => o.bound).length);
 </script>
 
+<svelte:window
+  onclick={() => (menu = null)}
+  onkeydown={(e) => {
+    if (menu && e.key === 'Escape') menu = null;
+  }}
+/>
+
 <footer class="status">
+  <button class="engine-menu" onclick={openMenu} title="Start, stop or restart the render engine">Engine ▴</button>
   <span class="engine {ui.status}"><span class="dot"></span>{text}</span>
   {#if ui.stats}
     <span>{ui.stats.fps.toFixed(1)} fps</span>
@@ -25,7 +40,22 @@
   {/if}
 </footer>
 
+{#if menu}
+  <div class="menu up" style:left="{menu.x}px" style:top="{menu.y - 6}px">
+    {#if ui.engineStopped}
+      <button onclick={() => startEngine()}>Start engine</button>
+    {:else}
+      <button onclick={() => restartEngine()} title="Replace the engine; the show, Preview and Program come back">Restart engine</button>
+      <button onclick={() => stopEngine()} title="Every output goes black until Start">Stop engine…</button>
+    {/if}
+  </div>
+{/if}
+
 <style>
+  .engine-menu {
+    padding: 0 6px;
+    font-size: 11px;
+  }
   .status {
     grid-area: status;
     display: flex;
@@ -57,8 +87,12 @@
     background: var(--warn);
   }
   .held,
-  .restarting {
+  .restarting,
+  .stopped {
     color: var(--warn);
+  }
+  .stopped .dot {
+    background: var(--live);
   }
   .restarting .dot {
     background: var(--live);

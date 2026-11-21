@@ -145,6 +145,13 @@ pub struct Engine {
     hold: AtomicBool,
     /// The app is quitting: no more engines.
     stopping: AtomicBool,
+    /// Stopped by the operator: no engine runs until `start`.
+    paused: AtomicBool,
+    /// The operator ended the current engine (stop or restart): not a crash, so it doesn't count
+    /// toward the crash-loop breaker or show as "restarting".
+    requested: AtomicBool,
+    /// Wakes the supervisor out of `paused`.
+    wake: tokio::sync::Notify,
     /// `engine.json`
     file: PathBuf,
     breaker: Mutex<Breaker>,
@@ -160,6 +167,9 @@ impl Engine {
             adopted: AtomicBool::new(false),
             hold: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            requested: AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
             file,
             breaker: Mutex::new(Breaker::default()),
         };
@@ -230,11 +240,54 @@ impl Engine {
         let mut proc = self.proc.lock().unwrap_or_else(|e| e.into_inner());
         *proc = Some((pid, child));
         drop(proc);
-        if self.stopping.load(Ordering::SeqCst) {
+        if self.stopping.load(Ordering::SeqCst) || self.paused.load(Ordering::SeqCst) {
             self.kill(true);
             return false;
         }
         true
+    }
+
+    /// Operator: stop the engine (every output goes black) and keep it stopped until `start`.
+    pub fn stop(&self, app: &AppHandle) {
+        self.paused.store(true, Ordering::SeqCst);
+        self.requested.store(true, Ordering::SeqCst);
+        self.kill(true); // as `shutdown`: the supervisor takes the record as soon as it's reaped
+        let _ = std::fs::remove_file(&self.file); // nothing for a next controller to adopt
+        let _ = app.emit("engine-stopped", true);
+    }
+
+    /// Operator: start an engine again after `stop` (it gets the full state on connect).
+    pub fn start(&self, app: &AppHandle) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.wake.notify_one();
+        let _ = app.emit("engine-stopped", false);
+    }
+
+    /// Operator: replace the engine now; the new one gets the full state on connect. (Between
+    /// engines, or stopped, there is nothing to replace.)
+    pub fn restart(&self) {
+        let running = self.proc.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        if running && !self.stopped() {
+            self.requested.store(true, Ordering::SeqCst);
+            self.kill(true);
+        }
+    }
+
+    /// Stopped by the operator.
+    pub fn stopped(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    /// After an engine ended: whether the operator ended it (else it died: count it, say so). A
+    /// stop that came while an engine was still starting ends it too.
+    fn ended(&self, app: &AppHandle, why: &str) -> bool {
+        if self.requested.swap(false, Ordering::SeqCst) || self.stopped() {
+            log!("engine: {why} (operator {})", if self.stopped() { "stop" } else { "restart" });
+            return true;
+        }
+        self.breaker().died(std::time::Instant::now());
+        restarting(app, why);
+        false
     }
 
     /// The current engine was adopted from an earlier controller (we don't know its PGM).
@@ -270,16 +323,21 @@ impl Engine {
 /// answers its token; then one fresh engine after another.
 pub async fn supervise(app: AppHandle, mut rx: mpsc::UnboundedReceiver<ToEngine>) {
     let file = app.state::<Engine>().file.clone();
+    let engine = app.state::<Engine>();
     if let Some(rec) = adoptable(&file, |port, token| async move { connect(port, &token).await }).await {
         let (_, why) = adopt(&app, &mut rx, rec).await;
-        app.state::<Engine>().breaker().died(std::time::Instant::now());
-        restarting(&app, &why);
+        engine.ended(&app, &why);
     }
     let mut delay = MIN_BACKOFF;
-    while !app.state::<Engine>().stopping.load(Ordering::SeqCst) {
+    while !engine.stopping.load(Ordering::SeqCst) {
+        while engine.stopped() {
+            engine.wake.notified().await;
+        }
         let (connected, why) = run_engine(&app, &mut rx).await;
-        app.state::<Engine>().breaker().died(std::time::Instant::now());
-        restarting(&app, &why);
+        if engine.ended(&app, &why) {
+            delay = MIN_BACKOFF;
+            continue;
+        }
         // A crash loop (e.g. the binary can't start) backs off to one try per 2 s.
         delay = if connected { MIN_BACKOFF } else { (delay * 2).min(MAX_BACKOFF) };
         sleep(delay).await;
@@ -302,7 +360,7 @@ async fn adopt(app: &AppHandle, rx: &mut mpsc::UnboundedReceiver<ToEngine>, rec:
     engine.adopted.store(true, Ordering::SeqCst);
     engine.hold.store(true, Ordering::SeqCst);
     if !engine.set_proc(rec.pid, None) {
-        return (false, "app quitting".into());
+        return (false, "stopped".into());
     }
     let (exit_tx, mut exited) = watch::channel(false);
     let pid = rec.pid;
@@ -337,7 +395,7 @@ async fn run_engine(app: &AppHandle, rx: &mut mpsc::UnboundedReceiver<ToEngine>)
     let pid = child.pid(); // before the pump's wait thread can sit on shared_child's lock
     log!("engine: spawned pid {pid}");
     if !engine.set_proc(pid, Some(child)) {
-        return (false, "app quitting".into());
+        return (false, "stopped".into());
     }
     let (port_rx, mut exited) = pump(events);
     let port = tokio::select! {

@@ -7,6 +7,7 @@
 //! - `engine-event`: every `FromEngine`, plus `Error`s about engine restarts
 //! - `engine-info`: `EngineInfo { port, token, adopted, held }` on connect and when a show is
 //!   loaded (which releases the hold), `null` on disconnect
+//! - `engine-stopped`: `true` when the operator stops the engine, `false` when they start it
 //! - `recovery-available`: path of unsaved work from an earlier session (also `get_recovery`)
 //!
 //! Quitting (⌘Q, closing the window) asks first while something is on air (C1).
@@ -220,6 +221,31 @@ fn list_monitors(app: AppHandle) -> Res<()> {
     dispatch(&app, Change::Live, |_| Ok(vec![ToEngine::ListMonitors]))
 }
 
+/// Operator: stop the engine (outputs black) until `engine_start`.
+#[tauri::command]
+fn engine_stop(app: AppHandle) -> Res<()> {
+    app.state::<Engine>().stop(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn engine_start(app: AppHandle) -> Res<()> {
+    app.state::<Engine>().start(&app);
+    Ok(())
+}
+
+/// Operator: replace the engine; the new one gets everything back on connect.
+#[tauri::command]
+fn engine_restart(engine: State<Engine>) -> Res<()> {
+    engine.restart();
+    Ok(())
+}
+
+#[tauri::command]
+fn engine_stopped(engine: State<Engine>) -> Res<bool> {
+    Ok(engine.stopped())
+}
+
 /// The reply comes as an `engine-event` `Inputs`.
 #[tauri::command]
 fn list_inputs(app: AppHandle) -> Res<()> {
@@ -431,7 +457,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_show, get_live, apply_op, undo, redo, load_cue, set_preview, store_preview, set_program, take, load_next, transport, list_monitors, list_inputs,
-            identify, import_media, new_show, open_show, get_recovery, save_show, engine_info
+            identify, import_media, new_show, open_show, get_recovery, save_show, engine_info, engine_stop, engine_start, engine_restart, engine_stopped
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

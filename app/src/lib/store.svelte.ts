@@ -24,6 +24,8 @@ class Store {
   show = $state.raw<Show | null>(null);
   live = $state.raw<Live>({ pvw: null, lastTaken: null, program: {}, preview: {}, transition: { kind: 'Fade', durationMs: 500 } });
   engine = $state.raw<EngineInfo | null>(null);
+  /** The operator stopped the engine (outputs black) until they start it. */
+  engineStopped = $state(false);
   /** The last "engine restarting: …" message, until the engine is back. */
   restarting = $state('');
   stats = $state.raw<{ fps: number; dropped: number } | null>(null);
@@ -66,8 +68,8 @@ class Store {
   pvwLive = $derived(sameRef(this.live.pvw, this.live.lastTaken));
   /** Resizing on the canvas keeps a layer's shape (Shift while dragging does the other). */
   keepAspect = $state(true);
-  status = $derived<'connected' | 'held' | 'restarting' | 'connecting'>(
-    this.engine ? (this.engine.held ? 'held' : 'connected') : this.restarting ? 'restarting' : 'connecting',
+  status = $derived<'connected' | 'held' | 'restarting' | 'connecting' | 'stopped'>(
+    this.engineStopped ? 'stopped' : this.engine ? (this.engine.held ? 'held' : 'connected') : this.restarting ? 'restarting' : 'connecting',
   );
 }
 
@@ -158,10 +160,12 @@ export async function init(): Promise<() => void> {
         api.on('live-changed', (l) => (ui.live = l)),
         api.on('engine-event', engineEvent),
         api.on('engine-info', setEngine),
+        api.on('engine-stopped', (stopped) => (ui.engineStopped = stopped)),
         api.on('recovery-available', (p) => offerRecovery(p)),
       ])),
     );
-    const [show, live, info] = await Promise.all([api.getShow(), api.getLive(), api.engineInfo()]);
+    const [show, live, info, stopped] = await Promise.all([api.getShow(), api.getLive(), api.engineInfo(), api.engineStopped()]);
+    ui.engineStopped = stopped;
     ui.show = show;
     ui.live = live;
     setEngine(info);
@@ -232,6 +236,18 @@ export const take = action(api.take);
 export const loadNext = action(api.loadNext);
 export const op = action((o: ShowOp) => api.applyOp(o));
 export const listInputs = action(api.listInputs);
+
+/** Stops the engine after asking: every output goes black until Start. */
+export const stopEngine = action(async () => {
+  if (await confirmAsk('Stop the engine? Every output goes black and stays black until you start it again.', 'Stop engine')) await api.engineStop();
+});
+export const startEngine = action(api.engineStart);
+/** Restarts the engine; asks first while something is on air (outputs blink, clips restart). */
+export const restartEngine = action(async () => {
+  const air = onAir(ui.live) || ui.engine?.adopted;
+  if (air && !(await confirmAsk('Restart the engine? The outputs go black for a moment, then Program comes back with its clips from their first frame.', 'Restart engine'))) return;
+  await api.engineRestart();
+});
 
 /** Send `ops` one by one (Screen Management's Apply). The first failure stops the rest. Resolves
  *  to '' when all were applied, else the error, which says how many went through. */
