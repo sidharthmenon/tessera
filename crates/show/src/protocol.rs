@@ -42,6 +42,8 @@ pub enum ToEngine {
     ListMonitors,
     Probe { media_id: Uuid, path: String },
     Identify { output_id: Uuid },
+    /// Answered with `Inputs`.
+    ListInputs,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
@@ -54,6 +56,18 @@ pub struct MonitorInfo {
     pub height: u32,
     pub scale: f64,
     pub refresh_mhz: Option<u32>,
+}
+
+/// A live input the engine can open: a media item of `kind` with `path = id`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct InputInfo {
+    pub kind: MediaKind,
+    pub id: String,
+    pub name: String,
+    /// The device's current format (0 when unknown).
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
@@ -94,6 +108,8 @@ pub enum FromEngine {
         dropped: u64,
     },
     Error { message: String },
+    /// The live inputs found; `error` says why a kind couldn't be listed.
+    Inputs { inputs: Vec<InputInfo>, error: Option<String> },
 }
 
 #[cfg(test)]

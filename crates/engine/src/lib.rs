@@ -17,9 +17,11 @@ macro_rules! log {
 pub mod app;
 pub mod audio;
 pub mod buses;
+pub mod capture;
 pub mod compositor;
 pub mod frame_clock;
 pub mod gpu;
+pub mod live;
 pub mod net;
 pub mod outputs;
 pub mod player;

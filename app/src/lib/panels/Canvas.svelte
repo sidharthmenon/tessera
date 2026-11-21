@@ -175,8 +175,9 @@
           >
             <span class="tag">{label(l)}</span>
             {#if l.source.type === 'Media'}
-              {@const t = clipTime(mediaOf(ui.show, l), l, ui.positions[l.id])}
-              <span class="flags">{l.muted ? '🔇 ' : ''}{t ? { Loop: '⟲', Once: '→', HoldLast: '⇥' }[l.playback] : ''}</span>
+              {@const m = mediaOf(ui.show, l)}
+              {@const t = clipTime(m, l, ui.positions[l.id])}
+              <span class="flags">{m?.kind === 'Capture' ? 'LIVE' : ''}{l.muted ? '🔇 ' : ''}{t ? { Loop: '⟲', Once: '→', HoldLast: '⇥' }[l.playback] : ''}</span>
               {#if t && box.h > 28}
                 <span class="time">{fmtTime(t.elapsed)}<span class="rem">−{fmtTime(t.remaining)}</span></span>
                 <span class="bar"><span style:width="{t.fraction * 100}%"></span></span>

@@ -303,15 +303,22 @@ impl Player {
     }
 
     fn upload(&mut self, gpu: &Gpu, frame: &Frame) -> anyhow::Result<()> {
-        let (w, h) = frame.size();
-        check_size(gpu, w, h)?;
-        if self.gpu.as_ref().is_none_or(|g| g.key != (frame.kind, w, h)) {
-            self.gpu = Some(GpuFrame::new(gpu, frame.kind, w, h));
-        }
-        let g = self.gpu.as_mut().context("no textures")?;
-        g.layer.full_range = frame.full_range;
-        g.upload(gpu, frame)
+        upload_into(&mut self.gpu, gpu, frame).map(drop)
     }
+}
+
+/// Uploads `frame` into `slot`'s textures (made, or remade when the format or size changes) and
+/// returns them as a layer texture.
+pub(crate) fn upload_into(slot: &mut Option<GpuFrame>, gpu: &Gpu, frame: &Frame) -> anyhow::Result<LayerTexture> {
+    let (w, h) = frame.size();
+    check_size(gpu, w, h)?;
+    if slot.as_ref().is_none_or(|g| g.key != (frame.kind, w, h)) {
+        *slot = Some(GpuFrame::new(gpu, frame.kind, w, h));
+    }
+    let g = slot.as_mut().context("no textures")?;
+    g.layer.full_range = frame.full_range;
+    g.upload(gpu, frame)?;
+    Ok(g.layer.clone())
 }
 
 /// Decode thread: frames in order into `tx` (blocking when the queue is full); Loop rewinds at
@@ -394,10 +401,10 @@ fn layout(kind: PixelFormatKind) -> &'static [(F, (u32, u32), u32)] {
 }
 
 /// A player's GPU side, reused frame to frame until the format or size changes.
-struct GpuFrame {
+pub(crate) struct GpuFrame {
     key: (PixelFormatKind, u32, u32),
     textures: Vec<wgpu::Texture>,
-    layer: LayerTexture,
+    pub(crate) layer: LayerTexture,
     /// Persistent staging (R20): `Queue::write_texture` allocates a staging buffer per call.
     belt: StagingBelt,
 }

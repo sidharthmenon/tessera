@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Live inputs (capture cards, USB capture, cameras): without this macOS stops the engine
+	     when it opens a camera. Tauri merges this file into the bundle's Info.plist. -->
+	<key>NSCameraUsageDescription</key>
+	<string>Tessera shows capture cards and cameras as live inputs on your screens.</string>
+</dict>
+</plist>

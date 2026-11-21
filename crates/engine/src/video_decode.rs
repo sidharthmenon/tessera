@@ -56,6 +56,19 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
+    /// A solid `w`×`h` RGBA frame, for tests.
+    #[cfg(test)]
+    pub(crate) fn test_rgba(w: u32, h: u32, rgba: [u8; 4]) -> Frame {
+        let mut frame = ff::frame::Video::new(ff::format::Pixel::RGBA, w, h);
+        let stride = frame.stride(0);
+        for row in frame.data_mut(0).chunks_mut(stride) {
+            for px in row[..w as usize * 4].chunks_mut(4) {
+                px.copy_from_slice(&rgba);
+            }
+        }
+        Frame { pts: Duration::ZERO, kind: PixelFormatKind::Rgba, hardware: false, full_range: false, frame }
+    }
+
     pub fn size(&self) -> (u32, u32) {
         (self.frame.width(), self.frame.height())
     }
@@ -104,15 +117,25 @@ impl Decoder {
         ensure!(!path.as_os_str().as_encoded_bytes().contains(&0), "path contains a NUL byte");
         init();
         let input = ff::format::input(path).context("cannot open")?;
+        let d = Decoder::from_input(input, audio, path, false)?;
+        ensure!(d.duration > Duration::ZERO, "unknown duration");
+        Ok(d)
+    }
+
+    /// Decodes `input`'s best video stream (and audio, given a tap). `live`: a capture device, which
+    /// has no duration and must not queue frames for frame threads (that would add latency).
+    pub fn from_input(input: ff::format::context::Input, audio: Option<AudioTap>, path: &Path, live: bool) -> anyhow::Result<Decoder> {
         let stream = input.streams().best(ff::media::Type::Video).context("no video stream")?;
         let time_base = f64::from(stream.time_base());
         let start = if stream.start_time() == ffi::AV_NOPTS_VALUE { 0 } else { stream.start_time() };
-        let seconds = if stream.duration() > 0 {
+        let seconds = if live {
+            0.
+        } else if stream.duration() > 0 {
             stream.duration() as f64 * time_base
         } else {
             input.duration() as f64 / ffi::AV_TIME_BASE as f64
-        };
-        ensure!(seconds > 0., "unknown duration");
+        }
+        .max(0.);
         let fps = f64::from(stream.avg_frame_rate());
         let frame_interval = Duration::from_secs_f64(if fps > 0. { 1. / fps } else { 1. / 30. });
         let index = stream.index();
@@ -122,7 +145,7 @@ impl Decoder {
             unsafe {
                 // Software only (e.g. FFV1, DNxHD): frame threads on every core, so a 4K clip keeps up.
                 (*ctx.as_mut_ptr()).thread_count = 0;
-                (*ctx.as_mut_ptr()).thread_type = ffi::FF_THREAD_FRAME | ffi::FF_THREAD_SLICE;
+                (*ctx.as_mut_ptr()).thread_type = if live { ffi::FF_THREAD_SLICE } else { ffi::FF_THREAD_FRAME | ffi::FF_THREAD_SLICE };
             }
         }
         let decoder = ctx.decoder().video().context("unsupported video codec")?;

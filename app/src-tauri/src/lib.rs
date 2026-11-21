@@ -220,6 +220,12 @@ fn list_monitors(app: AppHandle) -> Res<()> {
     dispatch(&app, Change::Live, |_| Ok(vec![ToEngine::ListMonitors]))
 }
 
+/// The reply comes as an `engine-event` `Inputs`.
+#[tauri::command]
+fn list_inputs(app: AppHandle) -> Res<()> {
+    dispatch(&app, Change::Live, |_| Ok(vec![ToEngine::ListInputs]))
+}
+
 #[tauri::command]
 fn identify(app: AppHandle, output_id: Uuid) -> Res<()> {
     dispatch(&app, Change::Live, |_| Ok(vec![ToEngine::Identify { output_id }]))
@@ -424,7 +430,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            get_show, get_live, apply_op, undo, redo, load_cue, set_preview, store_preview, set_program, take, load_next, transport, list_monitors,
+            get_show, get_live, apply_op, undo, redo, load_cue, set_preview, store_preview, set_program, take, load_next, transport, list_monitors, list_inputs,
             identify, import_media, new_show, open_show, get_recovery, save_show, engine_info
         ])
         .build(tauri::generate_context!())

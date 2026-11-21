@@ -143,6 +143,8 @@ On Windows, run the same checklist before the first show there.
       outputs covered or none). The status bar must never show *engine restarting*: the engine
       has to keep sending its 1 s stats.
 - [ ] Windows: D3D11VA decode and surface sizing
+- [ ] A USB capture device (Magewell/Elgato) as a live input: add, show, unplug and replug
+- [ ] Windows: DirectShow capture listing and opening
 - [ ] Menu bar and Dock behaviour while an output is in simple fullscreen
 
 ## Displays and audio
@@ -156,6 +158,22 @@ On Windows, run the same checklist before the first show there.
   default output (System Settings → Sound) before launching Tessera. After unplugging or
   replugging the audio interface, restart the engine: `pkill -f tessera-render`. The controller
   starts a new one, and its clips restart from their first frame (see Engine supervision).
+
+## Live inputs
+
+Capture devices (USB capture such as Magewell or Elgato, capture cards whose drivers present a
+camera, webcams) appear under Resources → **Inputs**. **Add** puts one in Media as a live input;
+drag it onto a screen like a clip. Play shows it live; Pause and Stop freeze it. If it stops
+sending (unplugged), its layers go transparent, the status bar says so once, and it reconnects
+by itself. Video only for now.
+
+- **macOS** lists devices with AVFoundation and opens them through FFmpeg's avfoundation input
+  (NV12, else UYVY). macOS asks for camera access the first time: allow it for Tessera (in dev
+  runs, for the terminal that started `npm run tauri dev`). Turned off later? System Settings →
+  Privacy & Security → Camera.
+- **Windows** uses FFmpeg's DirectShow input: devices are listed by their stable device path.
+  Allow desktop apps to use the camera (Settings → Privacy → Camera), and close any other app
+  using the device: DirectShow devices are exclusive. Not yet tried on a Windows PC.
 
 ## Known limits
 

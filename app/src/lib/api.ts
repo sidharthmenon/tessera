@@ -39,6 +39,8 @@ export const transport = (bus: Bus, layer: string | null, action: TransportActio
   invoke<null>('transport', { bus, layer, action });
 /** The reply comes as an `engine-event` `Monitors`. */
 export const listMonitors = () => invoke<null>('list_monitors');
+/** The reply comes as an `engine-event` `Inputs`. */
+export const listInputs = () => invoke<null>('list_inputs');
 export const identify = (outputId: string) => invoke<null>('identify', { outputId });
 export const importMedia = (paths: string[]) => invoke<null>('import_media', { paths });
 export const newShow = () => invoke<null>('new_show');

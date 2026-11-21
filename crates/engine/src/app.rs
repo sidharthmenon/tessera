@@ -185,7 +185,7 @@ impl App {
                     log!("identify: unknown output {output_id}");
                 }
             }
-            ToEngine::Probe { .. } => log!("probe: answered by the network server (net::serve), ignored here"),
+            ToEngine::Probe { .. } | ToEngine::ListInputs => log!("probe/inputs: answered by the network server (net::serve), ignored here"),
         }
     }
 

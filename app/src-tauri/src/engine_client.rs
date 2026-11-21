@@ -182,7 +182,7 @@ impl Engine {
     /// Checked as each message goes out.
     fn allowed(&self, msg: &ToEngine) -> bool {
         if self.hold.load(Ordering::SeqCst) {
-            matches!(msg, ToEngine::ListMonitors | ToEngine::Probe { .. } | ToEngine::Identify { .. })
+            matches!(msg, ToEngine::ListMonitors | ToEngine::ListInputs | ToEngine::Probe { .. } | ToEngine::Identify { .. })
         } else {
             !(self.adopted.load(Ordering::SeqCst) && matches!(msg, ToEngine::SetProgram { .. }))
         }
@@ -563,7 +563,7 @@ mod tests {
         engine.adopted.store(true, Ordering::SeqCst);
         engine.hold.store(true, Ordering::SeqCst);
         assert!(!engine.allowed(&program) && !engine.allowed(&preview), "no show loaded yet");
-        assert!(engine.allowed(&probe) && engine.allowed(&ToEngine::ListMonitors));
+        assert!(engine.allowed(&probe) && engine.allowed(&ToEngine::ListMonitors) && engine.allowed(&ToEngine::ListInputs));
         engine.release_hold();
         assert!(engine.allowed(&preview));
         assert!(!engine.allowed(&program), "never rewrite an adopted engine's PGM");

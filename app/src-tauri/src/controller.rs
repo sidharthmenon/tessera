@@ -141,7 +141,8 @@ impl Controller {
     /// Apply a user edit (one undo step). PVW and PGM change only where the show lost what they
     /// show (a screen or media removed); editing a cue changes neither.
     pub fn apply(&mut self, op: ShowOp) -> Result<Vec<ToEngine>, String> {
-        let relative = |m: &MediaItem| Path::new(&m.path).is_relative();
+        // A live input's path is a device id.
+        let relative = |m: &MediaItem| !m.kind.is_live() && Path::new(&m.path).is_relative();
         if match &op {
             ShowOp::AddMedia { items } => items.iter().any(relative),
             ShowOp::UpdateMedia { item } => relative(item),
@@ -442,7 +443,8 @@ impl Controller {
     pub fn open(&mut self, show: Show, path: Option<PathBuf>) -> Vec<ToEngine> {
         let (pgm, held, positions) = (std::mem::take(&mut self.pgm), std::mem::take(&mut self.held), std::mem::take(&mut self.positions));
         *self = Controller { show, path, pgm, held, positions, ..Controller::default() };
-        let probes = self.show.media.iter().map(|m| ToEngine::Probe { media_id: m.id, path: m.path.clone() });
+        let files = self.show.media.iter().filter(|m| !m.kind.is_live());
+        let probes = files.map(|m| ToEngine::Probe { media_id: m.id, path: m.path.clone() });
         [
             ToEngine::SetConfig { config: self.engine_config() },
             ToEngine::SetPreview { scene: Scene::new() },
@@ -874,7 +876,10 @@ mod tests {
         assert_eq!(c.show.media[1].width, 64);
         assert_eq!(c.show.master_volume, 1.0);
         // Opening a show probes its media again: metadata and thumbnails from an older engine, or a
-        // cleared thumbnail cache, catch up.
+        // cleared thumbnail cache, catch up. A live input (a device id, not a file) is never probed.
+        let camera = tessera_show::MediaItem { id: Uuid::new_v4(), name: "Camera".into(), path: "1FD4B3A2-camera".into(), kind: MediaKind::Capture,
+            width: 1920, height: 1080, duration_ms: None, has_audio: false, has_alpha: false, thumb: None };
+        c.apply(ShowOp::AddMedia { items: vec![camera] }).expect("a device id is not a relative path");
         let msgs = c.open(c.show.clone(), None);
         assert_eq!(msgs[3..], [
             ToEngine::Probe { media_id: img.id, path: "/shows/a.PNG".into() },

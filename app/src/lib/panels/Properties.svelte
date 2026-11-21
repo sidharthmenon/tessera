@@ -97,7 +97,7 @@
               <!-- Listed top first: the first row is the top layer. -->
               <button class="icon" title="Move up (in front)" disabled={i === 0} onclick={() => moveLayer({ screenId: s.id, layerId: l.id }, 1)}>▲</button>
               <button class="icon" title="Move down (behind)" disabled={i === scene[s.id].length - 1} onclick={() => moveLayer({ screenId: s.id, layerId: l.id }, -1)}>▼</button>
-              {#if l.source.type === 'Media'}
+              {#if mediaOf(ui.show, l)?.kind === 'Video'}
                 <button class="icon" title={l.muted ? 'Unmute' : 'Mute'} onclick={() => editLayer({ screenId: s.id, layerId: l.id }, (x) => ({ ...x, muted: !x.muted }))}>{l.muted ? '🔇' : '🔈'}</button>
               {/if}
               <button
@@ -140,7 +140,7 @@
             </span>
           </div>
         {/if}
-        {#if layer.source.type === 'Media'}
+        {#if media?.kind === 'Video'}
           <label class="row">
             <span>End mode</span>
             <select value={layer.playback} onchange={(e) => set({ playback: e.currentTarget.value as Playback })}>

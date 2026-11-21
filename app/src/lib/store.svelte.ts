@@ -7,6 +7,7 @@ import { cueAt, findLayer, isAutosave, losesPicture, newLayer, onAir, same, same
 import type { Cue } from '$lib/bindings/Cue';
 import type { FromEngine } from '$lib/bindings/FromEngine';
 import type { Layer } from '$lib/bindings/Layer';
+import type { InputInfo } from '$lib/bindings/InputInfo';
 import type { MonitorInfo } from '$lib/bindings/MonitorInfo';
 import type { OutputState } from '$lib/bindings/OutputState';
 import type { Screen } from '$lib/bindings/Screen';
@@ -30,6 +31,8 @@ class Store {
   positions = $state.raw<Record<string, number>>({});
   outputs = $state.raw<OutputState[]>([]);
   monitors = $state.raw<MonitorInfo[]>([]);
+  /** The engine's last `Inputs` reply (null: not asked yet). */
+  inputs = $state.raw<{ list: InputInfo[]; error: string | null } | null>(null);
   error = $state('');
   /** A passing note for the status bar (`toast`). */
   notice = $state('');
@@ -112,6 +115,9 @@ function engineEvent(ev: FromEngine) {
       break;
     case 'Monitors':
       ui.monitors = ev.monitors;
+      break;
+    case 'Inputs':
+      ui.inputs = { list: ev.inputs, error: ev.error };
       break;
     case 'Probed':
       if (ev.error) fail(`probe: ${ev.error}`);
@@ -225,6 +231,7 @@ export const redo = action(api.redo);
 export const take = action(api.take);
 export const loadNext = action(api.loadNext);
 export const op = action((o: ShowOp) => api.applyOp(o));
+export const listInputs = action(api.listInputs);
 
 /** Send `ops` one by one (Screen Management's Apply). The first failure stops the rest. Resolves
  *  to '' when all were applied, else the error, which says how many went through. */

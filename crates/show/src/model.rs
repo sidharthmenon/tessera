@@ -100,6 +100,15 @@ pub struct MediaItem {
 pub enum MediaKind {
     Image,
     Video,
+    /// A live capture device (camera, capture card): `path` is its id (`InputInfo::id`).
+    Capture,
+}
+
+impl MediaKind {
+    /// A live input rather than a file: its `path` is a device id, never probed or made absolute.
+    pub fn is_live(&self) -> bool {
+        matches!(self, MediaKind::Capture)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]

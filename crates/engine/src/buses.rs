@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use tessera_show::{
@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::audio::{AudioTap, lock};
 use crate::compositor::{LayerTexture, ScreenSlot};
 use crate::gpu::Gpu;
+use crate::live::{Feed, LiveMedia};
 use crate::player::{ImageSource, Player};
 
 /// Players newly on PGM wait for each other (so they start in sync) this long at most: one that
@@ -476,6 +477,8 @@ fn push_once<M>(gains: &mut Vec<(Handle<M>, f32)>, h: &Handle<M>, gain: f32) {
 pub enum FileMedia {
     Video { player: Box<Player>, gpu: Gpu },
     Image(Box<ImageSource>),
+    /// A capture device: no timeline (Play is live, Pause/Stop freeze).
+    Live { live: Box<LiveMedia>, gpu: Gpu },
 }
 
 impl Media for FileMedia {
@@ -487,6 +490,7 @@ impl Media for FileMedia {
             FileMedia::Image(image) => {
                 let _ = image.texture(); // collects the loader's result (and error)
             }
+            FileMedia::Live { live, .. } => live.poll(),
         }
     }
 
@@ -494,24 +498,31 @@ impl Media for FileMedia {
         match self {
             FileMedia::Video { player, gpu } => player.texture(gpu),
             FileMedia::Image(image) => image.texture(),
+            FileMedia::Live { live, gpu } => live.texture(gpu),
         }
     }
 
     fn play(&mut self, now: Instant) {
-        if let FileMedia::Video { player, .. } = self {
-            player.play(now);
+        match self {
+            FileMedia::Video { player, .. } => player.play(now),
+            FileMedia::Live { live, .. } => live.set_live(true),
+            FileMedia::Image(_) => {}
         }
     }
 
     fn pause(&mut self, now: Instant) {
-        if let FileMedia::Video { player, .. } = self {
-            player.pause(now);
+        match self {
+            FileMedia::Video { player, .. } => player.pause(now),
+            FileMedia::Live { live, .. } => live.set_live(false),
+            FileMedia::Image(_) => {}
         }
     }
 
     fn stop(&mut self) {
-        if let FileMedia::Video { player, .. } = self {
-            player.stop();
+        match self {
+            FileMedia::Video { player, .. } => player.stop(),
+            FileMedia::Live { live, .. } => live.set_live(false),
+            FileMedia::Image(_) => {}
         }
     }
 
@@ -519,6 +530,7 @@ impl Media for FileMedia {
         match self {
             FileMedia::Video { player, .. } => player.ready(),
             FileMedia::Image(_) => true, // nothing to start
+            FileMedia::Live { live, .. } => live.ready(),
         }
     }
 
@@ -526,6 +538,7 @@ impl Media for FileMedia {
         match self {
             FileMedia::Video { player, .. } => player.failed(),
             FileMedia::Image(image) => image.failed(),
+            FileMedia::Live { live, .. } => live.failed(),
         }
     }
 
@@ -533,27 +546,28 @@ impl Media for FileMedia {
         match self {
             FileMedia::Video { player, .. } => player.take_error(),
             FileMedia::Image(image) => image.take_error(),
+            FileMedia::Live { live, .. } => live.take_error(),
         }
     }
 
     fn take_dropped(&mut self) -> u64 {
         match self {
             FileMedia::Video { player, .. } => player.take_dropped(),
-            FileMedia::Image(_) => 0,
+            FileMedia::Image(_) | FileMedia::Live { .. } => 0,
         }
     }
 
     fn audio(&self) -> Option<AudioTap> {
         match self {
             FileMedia::Video { player, .. } => player.audio(),
-            FileMedia::Image(_) => None,
+            FileMedia::Image(_) | FileMedia::Live { .. } => None,
         }
     }
 
     fn position_ms(&self, now: Instant) -> Option<u64> {
         match self {
             FileMedia::Video { player, .. } => Some(player.position_ms(now)),
-            FileMedia::Image(_) => None,
+            FileMedia::Image(_) | FileMedia::Live { .. } => None,
         }
     }
 
@@ -571,11 +585,26 @@ pub struct FileOpener {
     /// The mixer's (sample rate, channels); `None`: no audio.
     audio: Option<(u32, u16)>,
     pub media: Vec<MediaItem>,
+    /// Open live inputs by (media id, device id): layers showing one input share its session.
+    feeds: HashMap<(Uuid, String), Weak<Feed>>,
 }
 
 impl FileOpener {
     pub fn new(gpu: Gpu, audio: Option<(u32, u16)>) -> FileOpener {
-        FileOpener { gpu, audio, media: vec![] }
+        FileOpener { gpu, audio, media: vec![], feeds: HashMap::new() }
+    }
+
+    /// The input's running feed, or a new one.
+    fn feed(&mut self, item: &MediaItem) -> anyhow::Result<Arc<Feed>> {
+        let key = (item.id, item.path.clone());
+        if let Some(feed) = self.feeds.get(&key).and_then(Weak::upgrade).filter(|f| f.running()) {
+            return Ok(feed);
+        }
+        self.feeds.retain(|_, f| f.strong_count() > 0);
+        let id = item.path.clone();
+        let feed = Feed::spawn(&item.name, Box::new(move || crate::capture::open(&id)))?;
+        self.feeds.insert(key, Arc::downgrade(&feed));
+        Ok(feed)
     }
 }
 
@@ -583,13 +612,14 @@ impl Opener for FileOpener {
     type Media = FileMedia;
 
     fn open(&mut self, media_id: Uuid, layer: &Layer) -> Result<FileMedia, String> {
-        let item = self.media.iter().find(|m| m.id == media_id);
+        let item = self.media.iter().find(|m| m.id == media_id).cloned();
         let item = item.ok_or_else(|| format!("layer {}: media {media_id} is not in the config", layer.id))?;
         let path = Path::new(&item.path);
         let media = match item.kind {
             MediaKind::Video => Player::open_trimmed(path, layer.playback.clone(), self.audio, layer.trim_in_ms, layer.trim_out_ms)
                 .map(|player| FileMedia::Video { player: Box::new(player), gpu: self.gpu.clone() }),
             MediaKind::Image => ImageSource::open(&self.gpu, path).map(|image| FileMedia::Image(Box::new(image))),
+            MediaKind::Capture => self.feed(&item).map(|feed| FileMedia::Live { live: Box::new(LiveMedia::new(feed)), gpu: self.gpu.clone() }),
         };
         media.map_err(|e| format!("{}: {e:#}", item.path))
     }

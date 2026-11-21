@@ -25,7 +25,8 @@ pub fn open(path: &Path) -> Result<Show, String> {
         }
     }
     let dir = path.parent().unwrap_or(Path::new(""));
-    for m in &mut show.media {
+    // A live input's path is a device id, not a file.
+    for m in show.media.iter_mut().filter(|m| !m.kind.is_live()) {
         m.path = normalize(&dir.join(&m.path)).to_string_lossy().into(); // join keeps an absolute path
     }
     Ok(show)
@@ -37,7 +38,7 @@ pub fn save_atomic(path: &Path, show: &Show) -> Result<(), String> {
     let abs = std::path::absolute(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let dir = normalize(abs.parent().unwrap_or(Path::new("")));
     let mut show = show.clone();
-    for m in &mut show.media {
+    for m in show.media.iter_mut().filter(|m| !m.kind.is_live()) {
         // Normalized first, so a relative path never climbs out with "..".
         let media = normalize(Path::new(&m.path));
         m.path = match media.strip_prefix(&dir) {
@@ -245,6 +246,12 @@ mod tests {
         assert_eq!(raw.media[0].path, inside.to_string_lossy());
         assert_eq!(raw.media[1].path, "logo.png");
         assert_eq!(open(&moved).unwrap(), show);
+        // A live input's path is a device id: saved and opened as it is.
+        let camera = MediaItem { kind: MediaKind::Capture, path: "1FD4B3A2-camera".into(), ..media(&inside) };
+        show.media = vec![camera.clone()];
+        save_atomic(&moved, &show).unwrap();
+        let raw: Show = serde_json::from_str(&std::fs::read_to_string(&moved).unwrap()).unwrap();
+        assert_eq!((raw.media[0].path.as_str(), open(&moved).unwrap().media[0].path.as_str()), ("1FD4B3A2-camera", "1FD4B3A2-camera"));
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::remove_dir_all(elsewhere).unwrap();
     }

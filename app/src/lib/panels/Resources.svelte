@@ -2,10 +2,11 @@
   import type { MediaItem } from '$lib/bindings/MediaItem';
   import type { Pattern } from '$lib/bindings/Pattern';
   import type { Source } from '$lib/bindings/Source';
-  import { engineUrl, fmtTime, hexToRgba, mediaUses } from '$lib/logic';
-  import { addToPvw, confirmAsk, importMedia, op, ui } from '$lib/store.svelte';
+  import type { InputInfo } from '$lib/bindings/InputInfo';
+  import { engineUrl, fmtTime, hexToRgba, mediaUses, uuid } from '$lib/logic';
+  import { addToPvw, confirmAsk, importMedia, listInputs, op, ui } from '$lib/store.svelte';
 
-  let tab = $state<'media' | 'patterns'>('media');
+  let tab = $state<'media' | 'inputs' | 'patterns'>('media');
   let solid = $state('#ff8a1f');
 
   const patterns = $derived<{ name: string; pattern: Pattern }[]>([
@@ -19,6 +20,7 @@
   const pattern = (p: Pattern): Source => ({ type: 'Pattern', pattern: p });
 
   function meta(m: MediaItem) {
+    if (m.kind === 'Capture') return `live input${m.width ? ` · ${m.width}×${m.height}` : ''}`;
     if (!m.width) return 'probing…';
     const parts = [`${m.width}×${m.height}`];
     if (m.durationMs != null) parts.push(fmtTime(m.durationMs));
@@ -60,6 +62,17 @@
     }
   }
 
+  /** The media item already made for input `i`, if any. */
+  const added = (i: InputInfo) => ui.show?.media.find((m) => m.kind === i.kind && m.path === i.id);
+  function addInput(i: InputInfo) {
+    const item: MediaItem = { id: uuid(), name: i.name, path: i.id, kind: i.kind, width: i.width, height: i.height, durationMs: null, hasAudio: false, hasAlpha: false, thumb: null };
+    op({ op: 'AddMedia', items: [item] });
+  }
+  function showInputs() {
+    tab = 'inputs';
+    listInputs();
+  }
+
   function dragStart(e: DragEvent, source: Source, name: string) {
     ui.dragging = { source, name };
     e.dataTransfer?.setData('text/plain', name);
@@ -97,18 +110,51 @@
 <section class="panel resources">
   <div class="panel-head">
     <div class="tabs">
-      <button class:on={tab === 'media'} onclick={() => (tab = 'media')}>Local media</button>
+      <button class:on={tab === 'media'} onclick={() => (tab = 'media')}>Media</button>
+      <button class:on={tab === 'inputs'} onclick={showInputs}>Inputs</button>
       <button class:on={tab === 'patterns'} onclick={() => (tab = 'patterns')}>Patterns</button>
     </div>
-    {#if tab === 'media'}<button class="import" onclick={() => importMedia()}>Import…</button>{/if}
   </div>
+  {#if tab !== 'patterns'}
+    <div class="tools">
+      {#if tab === 'media'}
+        <button onclick={() => importMedia()}>Import…</button>
+      {:else}
+        <span class="muted">Capture devices</span>
+        <button onclick={() => listInputs()} title="Look for capture devices again">Refresh</button>
+      {/if}
+    </div>
+  {/if}
   <ul>
     {#if tab === 'media'}
       {#each ui.show?.media ?? [] as m (m.id)}
-        {@render row(media(m), m.name, meta(m), m.thumb ? engineUrl(ui.engine, `/thumb/${encodeURIComponent(m.thumb)}`) : null, m.kind === 'Video' ? '▶' : '▣', m)}
+        {@render row(media(m), m.name, meta(m), m.thumb ? engineUrl(ui.engine, `/thumb/${encodeURIComponent(m.thumb)}`) : null, { Video: '▶', Image: '▣', Capture: '◉' }[m.kind], m)}
       {:else}
         <p class="muted empty">No media yet. Import images or videos.</p>
       {/each}
+    {:else if tab === 'inputs'}
+      {#if !ui.inputs}
+        <p class="muted empty">Looking for capture devices…</p>
+      {:else}
+        {#each ui.inputs.list as i (i.id)}
+          {@const item = added(i)}
+          <li class="input">
+            <span class="thumb">◉</span>
+            <span class="text">
+              <span class="name">{i.name}</span>
+              <span class="sub">{i.width ? `${i.width}×${i.height}` : 'capture device'}</span>
+            </span>
+            {#if item}
+              <span class="tag" title="In Media: drag it onto a screen from there">added</span>
+            {:else}
+              <button onclick={() => addInput(i)} title="Add to Media as a live input">Add</button>
+            {/if}
+          </li>
+        {:else}
+          <p class="muted empty">No capture devices found. Connect one and press Refresh.</p>
+        {/each}
+        {#if ui.inputs.error}<p class="warn empty">{ui.inputs.error}</p>{/if}
+      {/if}
     {:else}
       {#each patterns as p (p.name)}
         {@render row(pattern(p.pattern), p.name, 'test pattern', null, '▦')}
@@ -136,11 +182,33 @@
   .resources {
     grid-area: res;
   }
-  .import {
-    margin-left: auto;
+  .tools {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+    padding: 4px 8px 0;
+    font-size: 11px;
+  }
+  .tools button {
+    padding: 1px 8px;
+    font-size: 11px;
+  }
+  .tools .muted {
+    margin-right: auto;
   }
   .unused {
     opacity: 0.6;
+  }
+  .input {
+    cursor: default;
+  }
+  .input button {
+    padding: 1px 8px;
+    font-size: 11px;
+  }
+  .warn {
+    color: var(--warn);
   }
   .foot {
     display: flex;

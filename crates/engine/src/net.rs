@@ -190,12 +190,27 @@ impl Shared {
     fn command(&self, command: ToEngine) {
         match command {
             ToEngine::Probe { media_id, path } => self.probe(media_id, path),
+            ToEngine::ListInputs => self.list_inputs(),
             command => {
                 if !self.handle.send(command) {
                     let _ = self.events.send(FromEngine::Error { message: "engine stopped".into() });
                 }
             }
         }
+    }
+
+    /// Answers with `Inputs`, from a blocking thread (listing devices can take a moment).
+    fn list_inputs(&self) {
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let listed = tokio::task::spawn_blocking(crate::capture::list).await;
+            let (inputs, error) = match listed {
+                Ok(Ok(inputs)) => (inputs, None),
+                Ok(Err(e)) => (vec![], Some(format!("capture devices: {e:#}"))),
+                Err(e) => (vec![], Some(format!("capture devices: {e}"))),
+            };
+            let _ = events.send(FromEngine::Inputs { inputs, error });
+        });
     }
 
     /// Answers with `Probed`, `PROBES` at a time, on blocking threads; a failure (even a panic)
