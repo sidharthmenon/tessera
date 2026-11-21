@@ -39,6 +39,8 @@ pub trait Media {
     fn audio(&self) -> Option<AudioTap>;
     /// Playback position; `None` for media without a timeline (stills).
     fn position_ms(&self, now: Instant) -> Option<u64>;
+    /// The layer's speed, changed live (no restart). Media without a timeline ignore it.
+    fn set_speed(&mut self, _speed: f32, _now: Instant) {}
 }
 
 /// Opens a layer's media. The `Err` message names the path (or the unknown media id).
@@ -57,14 +59,20 @@ struct Entry<M> {
     media: M,
     media_id: Uuid,
     playback: Playback,
+    /// The layer's trim `(in, out)` in ms: a different trim needs a different player.
+    trim: (u64, Option<u64>),
     /// Newly on PGM: plays once all such players are ready.
     start: bool,
 }
 
-/// A player can stand in for `layer`: same media, same playback mode, not failed.
+/// A player can stand in for `layer`: same media, playback mode and trim, not failed. (Speed is
+/// changed live, so it doesn't count.)
 fn fits<M: Media>(h: &Handle<M>, layer: &Layer) -> bool {
     let e = lock(h);
-    layer.source == Source::Media { media_id: e.media_id } && layer.playback == e.playback && !e.media.failed()
+    layer.source == Source::Media { media_id: e.media_id }
+        && layer.playback == e.playback
+        && (layer.trim_in_ms, layer.trim_out_ms) == e.trim
+        && !e.media.failed()
 }
 
 struct PlayerPool<O: Opener> {
@@ -77,7 +85,7 @@ struct PlayerPool<O: Opener> {
 impl<O: Opener> PlayerPool<O> {
     fn open(&mut self, media_id: Uuid, layer: &Layer) -> Result<Handle<O::Media>, String> {
         let media = self.opener.open(media_id, layer)?;
-        let entry = Entry { media, media_id, playback: layer.playback.clone(), start: false };
+        let entry = Entry { media, media_id, playback: layer.playback.clone(), trim: (layer.trim_in_ms, layer.trim_out_ms), start: false };
         let handle = Arc::new(Mutex::new(entry));
         self.players.push(handle.clone());
         Ok(handle)
@@ -156,6 +164,17 @@ pub struct Buses<O: Opener> {
     /// Open errors already reported: every SetConfig retries the layers that couldn't open, and
     /// one message per layer/path is enough (M5).
     open_errors: HashSet<String>,
+    /// The last `tick`'s time: when a PVW edit changes a playing player's speed.
+    now: Instant,
+}
+
+/// Each layer's speed to its player, except players `skip` names.
+fn set_speeds<M: Media>(bus: &BusState<M>, now: Instant, skip: impl Fn(&Handle<M>) -> bool) {
+    for l in bus.scene.values().flatten() {
+        if let Some(h) = bus.players.get(&l.id).filter(|h| !skip(h)) {
+            lock(h).media.set_speed(l.speed, now);
+        }
+    }
 }
 
 impl<O: Opener> Buses<O> {
@@ -169,6 +188,7 @@ impl<O: Opener> Buses<O> {
             dropped: 0,
             gains: vec![],
             open_errors: HashSet::new(),
+            now: Instant::now(),
         }
     }
 
@@ -201,6 +221,8 @@ impl<O: Opener> Buses<O> {
             }
         }
         self.pvw = BusState::new(scene, players);
+        // A player PGM shares keeps PGM's speed until the Take (R26: PVW never touches air).
+        set_speeds(&self.pvw, self.now, |h| self.live(h));
         self.pool.gc();
     }
 
@@ -217,6 +239,7 @@ impl<O: Opener> Buses<O> {
             }
         }
         let old = std::mem::replace(&mut self.pgm, BusState::new(scene, players));
+        set_speeds(&self.pgm, now, |_| false);
         self.hand_over(&old, now);
         drop(old);
         self.pool.gc();
@@ -261,6 +284,7 @@ impl<O: Opener> Buses<O> {
             }
         }
         let old = std::mem::replace(&mut self.pgm, BusState::new(scene, players));
+        set_speeds(&self.pgm, now, |_| false);
         self.hand_over(&old, now);
         log!("take: {:?} {} ms, {} screen(s) change", t.kind, t.duration_ms, screens.len());
         let duration = Duration::from_millis(t.duration_ms.into());
@@ -310,6 +334,7 @@ impl<O: Opener> Buses<O> {
     /// polls every player whether or not anything is drawn (so errors and readiness surface) and
     /// starts new players once ready. Returns what to tell the controller.
     pub fn tick(&mut self, now: Instant, period: Duration) -> Vec<FromEngine> {
+        self.now = now;
         if self.outgoing.as_ref().is_some_and(|o| now >= o.start + o.duration) {
             self.outgoing = None;
             self.events.push(FromEngine::TakeDone);
@@ -531,6 +556,12 @@ impl Media for FileMedia {
             FileMedia::Image(_) => None,
         }
     }
+
+    fn set_speed(&mut self, speed: f32, now: Instant) {
+        if let FileMedia::Video { player, .. } = self {
+            player.set_speed(speed, now);
+        }
+    }
 }
 
 /// Opens config media: videos as `Player`s (audio resampled to the mixer's format), images as
@@ -556,7 +587,7 @@ impl Opener for FileOpener {
         let item = item.ok_or_else(|| format!("layer {}: media {media_id} is not in the config", layer.id))?;
         let path = Path::new(&item.path);
         let media = match item.kind {
-            MediaKind::Video => Player::open(path, layer.playback.clone(), self.audio)
+            MediaKind::Video => Player::open_trimmed(path, layer.playback.clone(), self.audio, layer.trim_in_ms, layer.trim_out_ms)
                 .map(|player| FileMedia::Video { player: Box::new(player), gpu: self.gpu.clone() }),
             MediaKind::Image => ImageSource::open(&self.gpu, path).map(|image| FileMedia::Image(Box::new(image))),
         };
@@ -583,6 +614,7 @@ mod tests {
         error: Option<String>,
         stops: u32,
         tap: AudioTap,
+        speed: f32,
     }
 
     impl Media for Fake {
@@ -618,6 +650,9 @@ mod tests {
         fn position_ms(&self, _: Instant) -> Option<u64> {
             Some(self.playing as u64) // 1: playing, 0: paused
         }
+        fn set_speed(&mut self, speed: f32, _: Instant) {
+            self.speed = speed;
+        }
     }
 
     /// Media ids in `fail` don't open; `broken` open but fail (as a missing file does in a real
@@ -642,7 +677,7 @@ mod tests {
             let failed = self.broken.contains(&media);
             let error = failed.then(|| format!("{}: decode error", path(media)));
             let (ready, tap) = (!self.slow.contains(&media), AudioTap::new((48_000, 2)));
-            Ok(Fake { media, playing: false, ready, failed, error, stops: 0, tap })
+            Ok(Fake { media, playing: false, ready, failed, error, stops: 0, tap, speed: 1. })
         }
     }
 
@@ -692,6 +727,47 @@ mod tests {
 
     fn frames(b: &mut Buses<FakeOpener>, slot: ScreenSlot, screen: Uuid) -> Vec<Option<Uuid>> {
         b.layers(slot, screen).iter().map(|(_, f)| *f).collect()
+    }
+
+    /// A trim change needs a seek and a new length: a new player.
+    #[test]
+    fn trim_change_opens_a_new_player() {
+        let [a, m1] = ids();
+        let t0 = Instant::now();
+        let mut b = buses();
+        let mut l = clip(m1);
+        b.set_program(Scene::from([(a, vec![l.clone()])]), t0);
+        let first = pgm(&b, &l);
+        l.trim_in_ms = 500;
+        b.set_program(Scene::from([(a, vec![l.clone()])]), t0);
+        assert!(!Arc::ptr_eq(&first, &pgm(&b, &l)), "new trim, new player");
+        let second = pgm(&b, &l);
+        l.trim_out_ms = Some(900);
+        b.set_program(Scene::from([(a, vec![l.clone()])]), t0);
+        assert!(!Arc::ptr_eq(&second, &pgm(&b, &l)), "new out point, new player");
+    }
+
+    /// Speed is live: a change keeps the player. A PVW edit leaves a player PGM shares at PGM's
+    /// speed until the Take.
+    #[test]
+    fn speed_changes_keep_the_player() {
+        let [a, m1] = ids();
+        let t0 = Instant::now();
+        let mut b = buses();
+        let mut l = clip(m1);
+        b.set_program(Scene::from([(a, vec![l.clone()])]), t0);
+        let h = pgm(&b, &l);
+        l.speed = 2.;
+        b.set_program(Scene::from([(a, vec![l.clone()])]), t0);
+        assert!(Arc::ptr_eq(&h, &pgm(&b, &l)), "same player");
+        assert_eq!(lock(&h).media.speed, 2.);
+        let mut p = clip(m1); // same screen, media and index: PVW shares PGM's player
+        p.speed = 0.5;
+        b.set_preview(Scene::from([(a, vec![p.clone()])]));
+        assert!(Arc::ptr_eq(&h, &pvw(&b, &p)));
+        assert_eq!(lock(&h).media.speed, 2., "PGM's speed until the Take");
+        b.take(&fade(0), t0);
+        assert_eq!(lock(&h).media.speed, 0.5);
     }
 
     #[test]

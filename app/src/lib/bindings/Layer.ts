@@ -7,4 +7,16 @@ export type Layer = { id: string, name: string, source: Source, rect: Rect, opac
 /**
  * Silent, whatever its volume (kept for unmuting).
  */
-muted: boolean, };
+muted: boolean, 
+/**
+ * Degrees clockwise about the rect's centre.
+ */
+rotation: number, 
+/**
+ * Playback rate, 0.25–4 (a clip is silent unless it is 1).
+ */
+speed: number, 
+/**
+ * Play only part of a clip: from `trim_in_ms` into the file to `trim_out_ms` (none: its end).
+ */
+trimInMs: number, trimOutMs: number | null, };

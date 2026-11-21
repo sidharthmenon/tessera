@@ -86,6 +86,21 @@ fn opacity_half() {
     assert_near(px(&data, 100, 50, 50), [128, 128, 128, 128], 2);
 }
 
+/// A 60×20 bar rotated 90° about its centre (50, 50) stands upright: 20 wide, 60 tall.
+#[test]
+fn rotation_turns_about_centre() {
+    let gpu = gpu();
+    let mut c = Compositor::new(&gpu);
+    let s = screen(100, 100);
+    let mut bar = solid(RED, r(20., 40., 60., 20.));
+    bar.0.rotation = 90.;
+    let data = render(&gpu, &mut c, &s, &[bar]);
+    assert_eq!(px(&data, 100, 50, 25), [255, 0, 0, 255], "above the centre: inside after turning");
+    assert_eq!(px(&data, 100, 50, 75), [255, 0, 0, 255], "below the centre");
+    assert_eq!(px(&data, 100, 25, 50), [0, 0, 0, 0], "left end: outside after turning");
+    assert_eq!(px(&data, 100, 75, 50), [0, 0, 0, 0], "right end");
+}
+
 #[test]
 fn layer_effects_apply_in_order() {
     let gpu = gpu();

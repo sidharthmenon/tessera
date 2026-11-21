@@ -35,6 +35,8 @@ struct Ring {
     /// The player's seek epoch: samples decoded before its last stop/seek are dropped.
     epoch: u64,
     playing: bool,
+    /// Samples pushed while set are dropped (a clip at a speed other than 1 is silent).
+    silent: bool,
     /// Why the audio failed, reported once through `Player::take_error`.
     error: Option<String>,
 }
@@ -42,14 +44,14 @@ struct Ring {
 impl AudioTap {
     pub(crate) fn new(format: (u32, u16)) -> AudioTap {
         let capacity = format.0 as usize * format.1 as usize;
-        let ring = Ring { samples: VecDeque::with_capacity(capacity), capacity, epoch: 0, playing: false, error: None };
+        let ring = Ring { samples: VecDeque::with_capacity(capacity), capacity, epoch: 0, playing: false, silent: false, error: None };
         AudioTap { ring: Arc::new(mutex(ring)), format }
     }
 
     /// Decode thread. When full, the oldest samples go: the decoder never waits for the mixer.
     pub(crate) fn push(&self, epoch: u64, samples: &[f32]) {
         let mut ring = lock(&self.ring);
-        if ring.epoch != epoch {
+        if ring.epoch != epoch || ring.silent {
             return;
         }
         let keep = &samples[samples.len().saturating_sub(ring.capacity)..];
@@ -67,6 +69,17 @@ impl AudioTap {
 
     pub(crate) fn set_playing(&self, playing: bool) {
         lock(&self.ring).playing = playing;
+    }
+
+    /// While silent nothing is kept (not even samples already in): a clip off 1× speed. Dropping
+    /// rather than muting keeps the tap from filling and coming back a second late.
+    // ponytail: silent off 1×; varispeed through swr (output rate = rate / speed) later.
+    pub(crate) fn set_silent(&self, silent: bool) {
+        let mut ring = lock(&self.ring);
+        if silent {
+            ring.samples.clear();
+        }
+        ring.silent = silent;
     }
 
     /// Keeps the first error until it is taken.
@@ -252,6 +265,11 @@ fn try_lock<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
 pub(crate) struct AudioDecoder {
     decoder: ff::decoder::Audio,
     stream: usize,
+    /// Seconds per stream tick, and the stream's start.
+    time_base: f64,
+    start: i64,
+    /// A trimmed clip's `[in, out)` in the file: samples outside it are dropped.
+    pub(crate) window: Option<(std::time::Duration, std::time::Duration)>,
     swr: Option<Swr>,
     tap: AudioTap,
     /// Stamped on pushed samples so the tap drops audio decoded before a seek.
@@ -268,7 +286,11 @@ impl AudioDecoder {
         let stream = input.streams().best(ff::media::Type::Audio)?;
         let name = path.display().to_string();
         match ff::codec::Context::from_parameters(stream.parameters()).and_then(|c| c.decoder().audio()) {
-            Ok(decoder) => Some(AudioDecoder { decoder, stream: stream.index(), swr: None, tap, epoch: 0, name, reported: false }),
+            Ok(decoder) => {
+                let start = if stream.start_time() == ffi::AV_NOPTS_VALUE { 0 } else { stream.start_time() };
+                let time_base = f64::from(stream.time_base());
+                Some(AudioDecoder { decoder, stream: stream.index(), time_base, start, window: None, swr: None, tap, epoch: 0, name, reported: false })
+            }
             Err(e) => {
                 tap.fail(format!("{name}: audio: unsupported codec: {e}"));
                 None
@@ -334,12 +356,23 @@ impl AudioDecoder {
                 r = ffi::swr_convert_frame(swr, o, frame.as_ptr());
             }
             ensure!(r >= 0, "resample: {}", ff::Error::from(r));
-            let n = (*o).nb_samples.max(0) as usize * channels as usize;
-            if n > 0 {
-                self.tap.push(self.epoch, std::slice::from_raw_parts((*o).data[0] as *const f32, n));
+            let frames = (*o).nb_samples.max(0) as usize;
+            let samples = std::slice::from_raw_parts((*o).data[0] as *const f32, frames * channels as usize);
+            let (a, b) = self.in_window(frame, frames, rate);
+            if a < b {
+                self.tap.push(self.epoch, &samples[a * channels as usize..b * channels as usize]);
             }
         }
         Ok(())
+    }
+
+    /// Which of a converted frame's `frames` output frames lie inside the trim window (all of them
+    /// untrimmed, or when the frame has no timestamp). ponytail: ignores the resampler's few-ms delay.
+    fn in_window(&self, frame: &ff::frame::Audio, frames: usize, rate: u32) -> (usize, usize) {
+        let (Some((start, end)), Some(pts)) = (self.window, frame.pts()) else { return (0, frames) };
+        let t = (pts - self.start) as f64 * self.time_base;
+        let at = |edge: std::time::Duration| ((edge.as_secs_f64() - t) * rate as f64).round().clamp(0., frames as f64) as usize;
+        (at(start), at(end))
     }
 
     /// Reports the first error only. Later packets are still decoded, so one corrupt packet

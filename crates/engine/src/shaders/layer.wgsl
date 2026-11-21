@@ -11,6 +11,7 @@ struct U {
     contrast: f32,
     saturation: f32,
     yuv_scale: f32,     // normalized → 8-bit code values: 255 (8-bit), 256 (MSB-aligned 16-bit)
+    rotation: f32,      // radians clockwise about the rect's centre
 };
 
 @group(0) @binding(0) var t0: texture_2d<f32>;
@@ -22,7 +23,10 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
 @vertex fn vs(@builtin(vertex_index) i: u32) -> VO {
     var c = array(vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0));
-    let p = u.rect.xy + c[i] * u.rect.zw;
+    // Rotated in pixel space, before NDC, so a rotated layer keeps its shape on any screen.
+    let d = (c[i] - 0.5) * u.rect.zw;
+    let k = vec2(cos(u.rotation), sin(u.rotation));
+    let p = u.rect.xy + u.rect.zw * 0.5 + vec2(d.x * k.x - d.y * k.y, d.x * k.y + d.y * k.x);
     var o: VO;
     o.pos = vec4(p.x / u.screen.x * 2.0 - 1.0, 1.0 - p.y / u.screen.y * 2.0, 0.0, 1.0);
     o.uv = c[i];

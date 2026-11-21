@@ -155,6 +155,23 @@ pub struct Layer {
     /// Silent, whatever its volume (kept for unmuting).
     #[serde(default)]
     pub muted: bool,
+    /// Degrees clockwise about the rect's centre.
+    #[serde(default)]
+    pub rotation: f32,
+    /// Playback rate, 0.25–4 (a clip is silent unless it is 1).
+    #[serde(default = "one")]
+    pub speed: f32,
+    /// Play only part of a clip: from `trim_in_ms` into the file to `trim_out_ms` (none: its end).
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub trim_in_ms: u64,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub trim_out_ms: Option<u64>,
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 impl Layer {
@@ -172,6 +189,10 @@ impl Layer {
             playback: Playback::Loop,
             visible: true,
             muted: false,
+            rotation: 0.0,
+            speed: 1.0,
+            trim_in_ms: 0,
+            trim_out_ms: None,
         }
     }
 }

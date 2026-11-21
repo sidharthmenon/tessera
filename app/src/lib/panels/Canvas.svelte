@@ -170,11 +170,12 @@
             style:top="{box.y}px"
             style:width="{box.w}px"
             style:height="{box.h}px"
+            style:transform={l.rotation ? `rotate(${l.rotation}deg)` : null}
             onpointerdown={(e) => down(e, s, l, 'move')}
           >
             <span class="tag">{label(l)}</span>
             {#if l.source.type === 'Media'}
-              {@const t = clipTime(mediaOf(ui.show, l), ui.positions[l.id])}
+              {@const t = clipTime(mediaOf(ui.show, l), l, ui.positions[l.id])}
               <span class="flags">{l.muted ? '🔇 ' : ''}{t ? { Loop: '⟲', Once: '→', HoldLast: '⇥' }[l.playback] : ''}</span>
               {#if t && box.h > 28}
                 <span class="time">{fmtTime(t.elapsed)}<span class="rem">−{fmtTime(t.remaining)}</span></span>

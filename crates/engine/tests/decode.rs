@@ -411,3 +411,22 @@ fn player_pause_holds_position() {
     player.play(t2);
     assert_eq!(player.position_ms(t2 + ms(100)), 500, "resumes where it paused");
 }
+
+/// Speed scales the timeline live: a change carries on from the current position; pause keeps it.
+#[test]
+fn speed_rebases_the_timeline() {
+    let t0 = Instant::now();
+    // HoldLast: no wrap within the 1 s fixture, so positions read straight.
+    let mut player = Player::open(&fixture("h264_64.mp4"), Playback::HoldLast, None).unwrap();
+    player.play(t0);
+    player.set_speed(2., t0 + ms(200));
+    assert_eq!(player.position_ms(t0 + ms(400)), 600, "200 at 1×, then 200 ms at 2×");
+    player.pause(t0 + ms(400));
+    assert_eq!(player.position_ms(t0 + ms(900)), 600, "paused");
+    player.play(t0 + ms(900));
+    player.set_speed(0.5, t0 + ms(1000));
+    assert_eq!(player.position_ms(t0 + ms(1200)), 900, "600 + 100 ms at 2× + 200 ms at 0.5×");
+    player.set_speed(f32::NAN, t0 + ms(1200));
+    player.set_speed(100., t0 + ms(1200));
+    assert_eq!(player.position_ms(t0 + ms(1225)), 1000, "clamped to 4× (900 + 100), not 100×");
+}

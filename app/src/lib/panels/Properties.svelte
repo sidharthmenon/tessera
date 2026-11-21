@@ -149,7 +149,55 @@
           </label>
           {@render slider('Volume', layer.volume, 0, 1, (volume) => ({ volume }))}
           <label class="row"><span>Mute</span><input type="checkbox" checked={layer.muted} onchange={(e) => set({ muted: e.currentTarget.checked })} /></label>
+          {#if media?.durationMs}
+            {@const pos = ui.positions[layer.id]}
+            {@const end = media.durationMs}
+            <label class="row">
+              <span>Speed ×</span>
+              <input type="number" min="0.25" max="4" step="0.05" value={layer.speed} onchange={(e) => setNum(e, (v) => ({ speed: Math.min(4, Math.max(0.25, v)) }), () => layer.speed)} />
+            </label>
+            {#if layer.speed !== 1}<p class="hint">Audio is silent unless the speed is 1×.</p>{/if}
+            <div class="row">
+              <span>Trim (s)</span>
+              <span class="trim">
+                <input
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  title="In point: seconds into the clip"
+                  value={layer.trimInMs / 1000}
+                  onchange={(e) => setNum(e, (v) => ({ trimInMs: Math.round(Math.max(0, v) * 1000) }), () => layer.trimInMs / 1000)}
+                />
+                <input
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  title="Out point: seconds into the clip (empty: its end)"
+                  placeholder={(end / 1000).toFixed(1)}
+                  value={layer.trimOutMs == null ? '' : layer.trimOutMs / 1000}
+                  onchange={async (e) => {
+                    const el = e.currentTarget;
+                    const v = el.value.trim() === '' ? null : num(e);
+                    if (v === null && el.value.trim() !== '') return void (el.value = layer.trimOutMs == null ? '' : String(layer.trimOutMs / 1000));
+                    await set({ trimOutMs: v === null ? null : Math.round(v * 1000) });
+                  }}
+                />
+              </span>
+            </div>
+            <div class="row">
+              <span></span>
+              <span class="trim">
+                <button disabled={pos == null} title="In point at the clip's current position" onclick={() => pos != null && set({ trimInMs: pos })}>Set in</button>
+                <button disabled={pos == null} title="Out point at the clip's current position" onclick={() => pos != null && set({ trimOutMs: pos })}>Set out</button>
+                <button disabled={!layer.trimInMs && layer.trimOutMs == null} onclick={() => set({ trimInMs: 0, trimOutMs: null })}>Clear</button>
+              </span>
+            </div>
+          {/if}
         {/if}
+        <label class="row">
+          <span>Rotation °</span>
+          <input type="number" step="1" value={layer.rotation} onchange={(e) => setNum(e, (rotation) => ({ rotation }), () => layer.rotation)} />
+        </label>
         <div class="grid">
           {@render field('X', layer.rect.x, (x) => ({ rect: { ...layer.rect, x } }))}
           {@render field('Y', layer.rect.y, (y) => ({ rect: { ...layer.rect, y } }))}
@@ -263,5 +311,23 @@
   .order {
     display: flex;
     gap: 3px;
+  }
+  .trim {
+    display: flex;
+    gap: 4px;
+    min-width: 0;
+  }
+  .trim input {
+    width: 0;
+    flex: 1;
+  }
+  .trim button {
+    padding: 1px 6px;
+    font-size: 11px;
+  }
+  .hint {
+    margin: 0 0 4px;
+    font-size: 11px;
+    color: var(--muted);
   }
 </style>

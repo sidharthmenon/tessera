@@ -322,8 +322,10 @@ impl Controller {
         let ended = |l: &tessera_show::Layer| {
             let Source::Media { media_id } = l.source else { return false };
             let duration = self.show.media.iter().find(|m| m.id == media_id).and_then(|m| m.duration_ms);
+            // Positions are in the file: a trimmed clip ends at its out point.
+            let end = duration.map(|d| l.trim_out_ms.map_or(d, |o| o.min(d)));
             l.playback == Playback::Once
-                && duration.zip(self.positions.get(&l.id)).is_some_and(|(d, &pos)| pos + ENDED_SLACK_MS >= d)
+                && end.zip(self.positions.get(&l.id)).is_some_and(|(d, &pos)| pos + ENDED_SLACK_MS >= d)
         };
         self.pgm.iter().map(|(s, layers)| (*s, layers.iter().filter(|l| !ended(l)).cloned().collect())).collect()
     }
@@ -758,6 +760,22 @@ mod tests {
         assert_eq!(transports(&c.resync_messages()), [(Some(bg2.id), TransportAction::Stop)]);
         c.transport(Bus::Pgm, Some(bg2.id), TransportAction::Restart);
         assert!(transports(&c.resync_messages()).is_empty());
+    }
+
+    /// A trimmed Once clip has ended at its out point, not the file's end.
+    #[test]
+    fn trimmed_once_clip_ends_at_out_point() {
+        let mut c = Controller::new();
+        let s = screen().id;
+        let m = item(Some(1000));
+        c.apply(ShowOp::AddMedia { items: vec![m.clone()] }).unwrap();
+        let once = Layer { trim_out_ms: Some(500), ..clip(&m, Playback::Once) };
+        set_cue(&mut c, 1, Scene::from([(s, vec![once.clone()])]));
+        c.load_cue(at(&c, 1)).unwrap();
+        c.take();
+        c.positions(&BTreeMap::from([(once.id, 450)]));
+        let program = match &c.resync_messages()[1] { ToEngine::SetProgram { scene } => scene.clone(), m => panic!("{m:?}") };
+        assert_eq!(program, Scene::from([(s, vec![])]), "450 of a 500 ms trim: ended, left off");
     }
 
     /// I5: after a crash loop the resync keeps PGM's patterns only, and PVW empties.

@@ -88,7 +88,14 @@ pub(crate) struct Decoder {
     flushing: bool,
     sws: Option<Sws>,
     audio: Option<AudioDecoder>,
+    /// The file's length.
     pub duration: Duration,
+    /// Trim: frames before `trim_in` are decoded but not returned, and with `trim_out` set the
+    /// stream ends there. Returned pts are measured from `trim_in`.
+    trim_in: Duration,
+    trim_out: Option<Duration>,
+    /// What plays: `[trim_in, trim_out or duration)`.
+    pub length: Duration,
 }
 
 impl Decoder {
@@ -132,7 +139,29 @@ impl Decoder {
             sws: None,
             audio,
             duration: Duration::from_secs_f64(seconds),
+            trim_in: Duration::ZERO,
+            trim_out: None,
+            length: Duration::from_secs_f64(seconds),
         })
+    }
+
+    /// Plays only `[in_ms, out_ms)` of the file (`out_ms` none, or past the end: to the end), and
+    /// seeks to `in_ms`. Audio outside it is dropped too.
+    pub fn trimmed(mut self, in_ms: u64, out_ms: Option<u64>) -> anyhow::Result<Decoder> {
+        let start = Duration::from_millis(in_ms);
+        let out = out_ms.map(Duration::from_millis).filter(|&o| o < self.duration);
+        let end = out.unwrap_or(self.duration);
+        ensure!(start < end, "trim: in point {in_ms} ms is not before the out point/end ({} ms)", end.as_millis());
+        (self.trim_in, self.trim_out, self.length) = (start, out, end - start);
+        if let Some(audio) = &mut self.audio
+            && (!start.is_zero() || out.is_some())
+        {
+            audio.window = Some((start, end));
+        }
+        if !start.is_zero() {
+            self.rewind()?;
+        }
+        Ok(self)
     }
 
     /// Next frame in presentation order; `None` at the end of the stream.
@@ -140,7 +169,16 @@ impl Decoder {
         let mut hw = ff::frame::Video::empty();
         loop {
             match self.decoder.receive_frame(&mut hw) {
-                Ok(()) => return self.convert(hw).map(Some),
+                Ok(()) => {
+                    let pts = self.pts(&hw);
+                    if pts + self.frame_interval <= self.trim_in {
+                        continue; // before the in point (decoded from the keyframe before it)
+                    }
+                    if self.trim_out.is_some_and(|out| pts >= out) {
+                        return Ok(None);
+                    }
+                    return self.convert(hw, pts.saturating_sub(self.trim_in)).map(Some);
+                }
                 Err(ff::Error::Eof) => return Ok(None),
                 Err(ff::Error::Other { errno: ff::util::error::EAGAIN }) if !self.flushing => self.feed()?,
                 Err(e) => return Err(e).context("decode"),
@@ -148,9 +186,15 @@ impl Decoder {
         }
     }
 
-    /// Back to the first frame (Loop wrap: audio continues without a gap).
+    /// Back to the first frame, or the keyframe at or before the in point (Loop wrap: audio
+    /// continues without a gap).
     pub fn rewind(&mut self) -> anyhow::Result<()> {
-        self.input.seek(0, ..).context("seek")?;
+        if self.trim_in.is_zero() {
+            self.input.seek(0, ..).context("seek")?;
+        } else {
+            let ts = (self.trim_in.as_secs_f64() * ffi::AV_TIME_BASE as f64) as i64;
+            self.input.seek(ts, ..ts).context("seek to the in point")?;
+        }
         self.decoder.flush();
         if let Some(audio) = &mut self.audio {
             audio.rewind();
@@ -190,12 +234,17 @@ impl Decoder {
         }
     }
 
-    fn convert(&mut self, decoded: ff::frame::Video) -> anyhow::Result<Frame> {
+    /// `decoded`'s time in the file (a frame without one follows the last).
+    fn pts(&mut self, decoded: &ff::frame::Video) -> Duration {
         let pts = match decoded.timestamp() {
             Some(ts) => Duration::from_secs_f64(((ts - self.start) as f64 * self.time_base).max(0.)),
             None => self.last_pts.map_or(Duration::ZERO, |p| p + self.frame_interval),
         };
         self.last_pts = Some(pts);
+        pts
+    }
+
+    fn convert(&mut self, decoded: ff::frame::Video, pts: Duration) -> anyhow::Result<Frame> {
         // SAFETY: plain field reads/writes on live frames; `map_hw` only runs on hardware frames.
         unsafe {
             let hardware = HW.is_some_and(|(_, f)| (*decoded.as_ptr()).format == f as i32);
@@ -359,4 +408,46 @@ fn pix_name(format: ffi::AVPixelFormat) -> String {
     // SAFETY: returns a static string or null.
     let name = unsafe { ffi::av_get_pix_fmt_name(format) };
     if name.is_null() { format!("{format:?}") } else { unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+    }
+
+    fn pts_ms(d: &mut Decoder) -> Vec<u64> {
+        std::iter::from_fn(|| d.next().unwrap()).map(|f| f.pts.as_millis() as u64).collect()
+    }
+
+    /// 1 s, 30 fps: trimmed to [300, 700) it plays 12 frames, timed from the in point, and a
+    /// rewind starts at the in point again.
+    #[test]
+    fn trim_plays_only_the_window() {
+        let mut d = Decoder::open(&fixture("h264_64.mp4"), None).unwrap().trimmed(300, Some(700)).unwrap();
+        assert_eq!(d.length, Duration::from_millis(400));
+        let first = pts_ms(&mut d);
+        assert_eq!(first.len(), 12, "{first:?}");
+        assert!(first[0] <= 1 && *first.last().unwrap() < 400, "{first:?}");
+        d.rewind().unwrap();
+        assert_eq!(pts_ms(&mut d), first, "the next pass is the same window");
+        // No out point: to the file's end.
+        let mut tail = Decoder::open(&fixture("h264_64.mp4"), None).unwrap().trimmed(900, None).unwrap();
+        assert_eq!((tail.length, pts_ms(&mut tail).len()), (Duration::from_millis(100), 3));
+        for (a, b) in [(700, Some(300)), (1000, None), (0, Some(0))] {
+            assert!(Decoder::open(&fixture("h264_64.mp4"), None).unwrap().trimmed(a, b).is_err(), "{a} {b:?}");
+        }
+    }
+
+    /// The trimmed audio is the window's length, not the file's (nor from the keyframe before it).
+    #[test]
+    fn trim_cuts_audio_to_the_window() {
+        let tap = AudioTap::new((48_000, 2));
+        let mut d = Decoder::open(&fixture("h264_64.mp4"), Some(tap.clone())).unwrap().trimmed(300, Some(700)).unwrap();
+        while d.next().unwrap().is_some() {}
+        let seconds = tap.buffered() as f64 / (48_000. * 2.);
+        assert!((seconds - 0.4).abs() < 0.05, "{seconds} s of audio for a 0.4 s window");
+    }
 }

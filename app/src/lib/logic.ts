@@ -135,6 +135,7 @@ export function newLayer(source: Source, screen: Screen, name: string): Layer {
   return {
     id: uuid(), name, source, rect: { x: 0, y: 0, w: screen.width, h: screen.height },
     opacity: 1, brightness: 0, contrast: 1, saturation: 1, volume: 1, playback: 'Loop', visible: true, muted: false,
+    rotation: 0, speed: 1, trimInMs: 0, trimOutMs: null,
   };
 }
 
@@ -174,12 +175,20 @@ export function cueKey(e: Pick<KeyboardEvent, 'key'>): string | null {
 }
 
 /** A clip's progress for its canvas box, from the engine's reported position (ms into the file):
- *  elapsed, remaining and the fraction played. Null for stills and unprobed media. */
-export function clipTime(media: MediaItem | undefined, pos: number | undefined): { elapsed: number; remaining: number; fraction: number } | null {
+ *  elapsed and remaining in real time (the trimmed part, at the layer's speed) and the fraction
+ *  played. Null for stills and unprobed media. */
+export function clipTime(
+  media: MediaItem | undefined,
+  layer: Pick<Layer, 'trimInMs' | 'trimOutMs' | 'speed'>,
+  pos: number | undefined,
+): { elapsed: number; remaining: number; fraction: number } | null {
   const total = media?.durationMs;
   if (!total) return null;
-  const elapsed = Math.min(Math.max(0, pos ?? 0), total);
-  return { elapsed, remaining: total - elapsed, fraction: elapsed / total };
+  const start = Math.min(layer.trimInMs, total);
+  const length = Math.max(1, Math.min(layer.trimOutMs ?? total, total) - start);
+  const played = Math.min(Math.max(0, (pos ?? start) - start), length);
+  const speed = layer.speed > 0 ? layer.speed : 1;
+  return { elapsed: played / speed, remaining: (length - played) / speed, fraction: played / length };
 }
 
 export type MediaUse = { cues: number; pvw: boolean; pgm: boolean };
@@ -210,7 +219,8 @@ export function mediaOf(show: Show | null, layer: Layer | undefined): MediaItem 
 export function losesPicture(before: Scene, after: Scene): boolean {
   const shown = (sc: Scene, s: string) => (sc[s] ?? []).filter((l) => l.visible && l.opacity > 0);
   const media = (l: Layer) => l.source.type === 'Media';
-  const newPlayer = (a: Layer, b: Layer) => (media(a) || media(b)) && (!same(a.source, b.source) || a.playback !== b.playback);
+  const newPlayer = (a: Layer, b: Layer) =>
+    (media(a) || media(b)) && (!same(a.source, b.source) || a.playback !== b.playback || a.trimInMs !== b.trimInMs || a.trimOutMs !== b.trimOutMs);
   return Object.entries(after).some(([s, layers]) => {
     const now = new Map(shown(after, s).map((l) => [l.id, l]));
     const lost = (l: Layer) => {

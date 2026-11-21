@@ -218,8 +218,11 @@ eq(['h', 'H', '7', 'F1', 'F12'].map((key) => L.cueKey({ key })), ['H', 'H', '7',
 eq([' ', 'ArrowRight', 'Enter', 'Escape', 'F13', 'é', '/'].map((key) => L.cueKey({ key })), [null, null, null, null, null, null, null], 'keys a cue cannot take');
 {
   const clip = { durationMs: 10_000 } as Parameters<typeof L.clipTime>[0];
-  eq(L.clipTime(clip, 2500), { elapsed: 2500, remaining: 7500, fraction: 0.25 }, 'clip time');
-  eq([L.clipTime(clip, undefined)?.elapsed, L.clipTime(clip, 12_000)?.remaining, L.clipTime({ durationMs: null } as typeof clip, 5)], [0, 0, null], 'clip time: no report yet, past the end, still');
+  const plain = { trimInMs: 0, trimOutMs: null, speed: 1 };
+  eq(L.clipTime(clip, plain, 2500), { elapsed: 2500, remaining: 7500, fraction: 0.25 }, 'clip time');
+  eq([L.clipTime(clip, plain, undefined)?.elapsed, L.clipTime(clip, plain, 12_000)?.remaining, L.clipTime({ durationMs: null } as typeof clip, plain, 5)], [0, 0, null], 'clip time: no report yet, past the end, still');
+  eq(L.clipTime(clip, { trimInMs: 2000, trimOutMs: 6000, speed: 2 }, 3000), { elapsed: 500, remaining: 1500, fraction: 0.25 }, 'trimmed to 2–6 s at 2×: 1 s in → 0.5 s played, 1.5 s left');
+  eq(L.losesPicture({ b: [layer] }, { b: [{ ...layer, trimInMs: 100 }] }), false, 'a pattern has no trim to lose');
 }
 eq(L.patternFill({ type: 'Bars' }), 'url(#cue-bars)', 'bars fill');
 

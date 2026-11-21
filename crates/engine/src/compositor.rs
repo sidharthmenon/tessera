@@ -55,7 +55,8 @@ struct LayerUniform {
     contrast: f32,
     saturation: f32,
     yuv_scale: f32,
-    _pad: [f32; 3],
+    rotation: f32,
+    _pad: [f32; 2],
 }
 
 /// Mirrors `U` in shaders/transition.wgsl.
@@ -269,7 +270,8 @@ impl Compositor {
             contrast: l.contrast,
             saturation: l.saturation,
             yuv_scale: 255.,
-            _pad: [0.; 3],
+            rotation: if l.rotation.is_finite() { l.rotation.to_radians() } else { 0. },
+            _pad: [0.; 2],
         };
         let (a, b) = match (&l.source, tex) {
             (Source::Pattern { pattern }, _) => {

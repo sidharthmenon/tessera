@@ -35,15 +35,19 @@ enum Msg {
 #[derive(Clone, Copy)]
 enum State {
     Paused(Duration),
-    /// Timeline position 0 was at this instant.
-    Playing(Instant),
+    /// At `at` the timeline was at `from`; it advances by `speed` × wall time since.
+    Playing { at: Instant, from: Duration },
 }
 
 /// One playing video file. Starts paused on its first frame. All timing comes in as `now`
 /// (the render loop's frame clock), so the player never reads the wall clock itself.
 pub struct Player {
     playback: Playback,
-    /// Known once the decode thread has opened the file.
+    /// Where the trimmed part starts in the file (position reports are in the file).
+    trim_in: Duration,
+    /// Timeline rate (0.25–4).
+    speed: f32,
+    /// What plays (the trimmed part), known once the decode thread has opened the file.
     duration: Option<Duration>,
     frames: Receiver<Msg>,
     seek: Sender<u64>,
@@ -76,14 +80,20 @@ impl Player {
     /// the thread can't be spawned. `audio`: the mixer's (sample rate, channels), which the decode
     /// thread resamples the file's audio to (see `audio()`); `None` skips audio.
     pub fn open(path: &Path, playback: Playback, audio: Option<(u32, u16)>) -> anyhow::Result<Player> {
+        Player::open_trimmed(path, playback, audio, 0, None)
+    }
+
+    /// `open`, playing only `[trim_in_ms, trim_out_ms)` of the file (see `Decoder::trimmed`):
+    /// Loop, Once and HoldLast use that part; positions are still reported in the file.
+    pub fn open_trimmed(path: &Path, playback: Playback, audio: Option<(u32, u16)>, trim_in_ms: u64, trim_out_ms: Option<u64>) -> anyhow::Result<Player> {
         let (tx, frames) = mpsc::sync_channel(QUEUE);
         let (seek, seeks) = mpsc::channel();
         let (owned, looping) = (path.to_path_buf(), playback == Playback::Loop);
         let audio = audio.map(AudioTap::new);
         let tap = audio.clone();
         std::thread::Builder::new().name(thread_name("decode", path)).spawn(move || {
-            let result = Decoder::open(&owned, tap).and_then(|d| {
-                let _ = tx.send(Msg::Opened(d.duration));
+            let result = Decoder::open(&owned, tap).and_then(|d| d.trimmed(trim_in_ms, trim_out_ms)).and_then(|d| {
+                let _ = tx.send(Msg::Opened(d.length));
                 decode(d, looping, &tx, &seeks, &owned)
             });
             if let Err(e) = result {
@@ -93,6 +103,8 @@ impl Player {
         let state = State::Paused(Duration::ZERO);
         Ok(Player {
             playback,
+            trim_in: Duration::from_millis(trim_in_ms),
+            speed: 1.,
             duration: None,
             frames,
             seek,
@@ -113,8 +125,8 @@ impl Player {
     }
 
     pub fn play(&mut self, at: Instant) {
-        if let State::Paused(t) = self.state {
-            self.state = State::Playing(at.checked_sub(t).unwrap_or(at));
+        if let State::Paused(from) = self.state {
+            self.state = State::Playing { at, from };
         }
         if let Some(tap) = &self.audio {
             tap.set_playing(true);
@@ -139,6 +151,22 @@ impl Player {
         (self.state, self.pending, self.due, self.ended, self.stale) = (State::Paused(Duration::ZERO), None, None, false, true);
     }
 
+    /// Changes the rate live: the position carries on from where it is at `now`. Audio is silent
+    /// unless the speed is 1.
+    pub fn set_speed(&mut self, speed: f32, now: Instant) {
+        let speed = if speed.is_finite() { speed.clamp(0.25, 4.) } else { 1. };
+        if speed == self.speed {
+            return;
+        }
+        if let State::Playing { .. } = self.state {
+            self.state = State::Playing { at: now, from: self.elapsed(now) };
+        }
+        self.speed = speed;
+        if let Some(tap) = &self.audio {
+            tap.set_silent(speed != 1.);
+        }
+    }
+
     pub fn restart(&mut self, at: Instant) {
         self.stop();
         self.play(at);
@@ -151,7 +179,7 @@ impl Player {
             (Playback::Loop, Some(d)) => Duration::from_nanos((t.as_nanos() % d.as_nanos().max(1)) as u64),
             (Playback::Once | Playback::HoldLast, Some(d)) => t.min(d),
         };
-        position.as_millis() as u64
+        (self.trim_in + position).as_millis() as u64
     }
 
     /// Its first frame is decoded (or it failed): waiting longer won't change how it starts.
@@ -177,7 +205,7 @@ impl Player {
         if self.failed || self.over {
             return;
         }
-        let due = t + period / 2;
+        let due = t + period.mul_f32(self.speed) / 2;
         let mut taken = 0;
         loop {
             let msg = match self.pending.take() {
@@ -204,9 +232,17 @@ impl Player {
         if !shown {
             return;
         }
-        if taken > 1 {
-            self.dropped += taken - 1; // the ones before the newest are never shown
-        } else if taken == 0 && matches!(self.state, State::Playing(_)) && self.showing() && self.pending.is_none() && !self.ended {
+        // Above 1× some frames are skipped on purpose, below 1× some repeat: neither counts.
+        let skipped = self.speed.ceil() as u64;
+        if taken > skipped {
+            self.dropped += taken - skipped; // the ones before the newest are never shown
+        } else if taken == 0
+            && self.speed >= 1.
+            && matches!(self.state, State::Playing { .. })
+            && self.showing()
+            && self.pending.is_none()
+            && !self.ended
+        {
             self.dropped += 1; // the decoder is late: the frame repeats
         }
     }
@@ -258,7 +294,7 @@ impl Player {
     fn elapsed(&self, now: Instant) -> Duration {
         match self.state {
             State::Paused(t) => t,
-            State::Playing(start) => now.saturating_duration_since(start),
+            State::Playing { at, from } => from + now.saturating_duration_since(at).mul_f32(self.speed),
         }
     }
 
@@ -316,8 +352,8 @@ fn decode(mut d: Decoder, looping: bool, tx: &SyncSender<Msg>, seeks: &Receiver<
                 // Cut short: the next pass follows the last frame shown, not a freeze until the
                 // clip's full duration.
                 offset += match last.filter(|_| cut) {
-                    Some(pts) => (pts + d.frame_interval).min(d.duration),
-                    None => d.duration,
+                    Some(pts) => (pts + d.frame_interval).min(d.length),
+                    None => d.length,
                 };
                 last = None;
                 d.rewind()?;
