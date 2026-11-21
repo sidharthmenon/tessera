@@ -205,6 +205,14 @@ eq(L.snapDrag({ x: 0, y: 0, w: 1914, h: 200 }, 'resize', [], 1920, 1080, 1, 16 /
 eq(L.snapDrag({ x: 0, y: 0, w: 1000, h: 200 }, 'resize', [], 1920, 1080, 1), { x: 0, y: 0, w: 1000, h: 200 }, 'free resize');
 eq(L.fitInto(16 / 9, 2360, 1640), { x: 0, y: 156, w: 2360, h: 1328 }, 'fit 16:9 into a taller output');
 eq(L.fitInto(16 / 9, 3840, 1080), { x: 960, y: 0, w: 1920, h: 1080 }, 'fit 16:9 into a wider output');
+{
+  const lay = (mediaId: string) => L.newLayer({ type: 'Media', mediaId }, b, mediaId);
+  const show = { version: 1, outputs: [], screens: [], mappings: [], media: [], masterVolume: 1,
+    groups: [{ id: 'g', name: 'G', cues: [cue(0, { b: [lay('m1'), lay('m2')] }), cue(1, { b: [lay('m1')] })] }] };
+  const live = { pvw: null, lastTaken: null, program: { b: [lay('m3')] }, preview: { b: [lay('m1')] }, transition: { kind: 'Cut' as const, durationMs: 0 } };
+  const uses = L.mediaUses(show, live);
+  eq([uses.get('m1'), uses.get('m2'), uses.get('m3'), uses.has('m4')], [{ cues: 2, pvw: true, pgm: false }, { cues: 1, pvw: false, pgm: false }, { cues: 0, pvw: false, pgm: true }, false], 'media uses: cues, Preview, Program, unused');
+}
 eq(L.patternFill({ type: 'Bars' }), 'url(#cue-bars)', 'bars fill');
 
 console.log('logic: all checks passed');

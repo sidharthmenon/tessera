@@ -290,44 +290,10 @@
     display: flex;
     gap: 2px;
   }
-  .menu {
-    position: fixed;
-    z-index: 40;
-    min-width: 200px;
-    background: var(--panel-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 4px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-    display: flex;
-    flex-direction: column;
-  }
-  .menu.up {
-    transform: translateY(-100%);
-  }
-  .menu.left {
-    translate: -100% 0;
-  }
   .air {
     padding: 3px 8px 5px;
     color: #ffb4ae;
     border-bottom: 1px solid var(--border);
     margin-bottom: 3px;
-  }
-  .menu button {
-    background: none;
-    border: none;
-    text-align: left;
-    padding: 4px 8px;
-  }
-  .menu button:hover {
-    background: var(--accent-bg);
-    color: var(--accent-2);
-  }
-  .menu hr {
-    border: none;
-    border-top: 1px solid var(--border);
-    margin: 3px 0;
-    width: 100%;
   }
 </style>

@@ -19,7 +19,8 @@ pub enum ShowOp {
     RemoveMapping { id: Uuid },
     AddMedia { items: Vec<MediaItem> },
     UpdateMedia { item: MediaItem },
-    RemoveMedia { id: Uuid },
+    /// Several at once ("remove unused" is one undo step).
+    RemoveMedia { ids: Vec<Uuid> },
     AddGroup { name: String },
     RenameGroup { id: Uuid, name: String },
     RemoveGroup { id: Uuid },
@@ -125,12 +126,15 @@ impl Show {
                 self.media[i] = item;
                 Ok(())
             }
-            ShowOp::RemoveMedia { id } => {
-                let i = find(&self.media, id, |m| m.id, "media")?;
-                self.media.remove(i);
+            ShowOp::RemoveMedia { ids } => {
+                // Validate all first so a failure leaves the show unchanged.
+                for &id in &ids {
+                    find(&self.media, id, |m| m.id, "media")?;
+                }
+                self.media.retain(|m| !ids.contains(&m.id));
                 for cue in self.groups.iter_mut().flat_map(|g| &mut g.cues) {
                     for layers in cue.layers_by_screen.values_mut() {
-                        layers.retain(|l| !matches!(&l.source, Source::Media { media_id } if *media_id == id));
+                        layers.retain(|l| !matches!(&l.source, Source::Media { media_id } if ids.contains(media_id)));
                     }
                 }
                 Ok(())
@@ -240,10 +244,18 @@ mod tests {
         show.groups[0].cues.push(cue(1, Scene::from([(s, vec![l1])])));
         let id = m1.id;
         show.media = vec![m1, m2];
-        show.apply(ShowOp::RemoveMedia { id }).unwrap();
+        show.apply(ShowOp::RemoveMedia { ids: vec![id] }).unwrap();
         assert_eq!(show.media.len(), 1);
-        assert_eq!(show.groups[0].cues[0].layers_by_screen[&s], vec![l2, lp]);
+        assert_eq!(show.groups[0].cues[0].layers_by_screen[&s], vec![l2, lp.clone()]);
         assert!(show.groups[0].cues[1].layers_by_screen[&s].is_empty());
+        // Several at once; an unknown id leaves the show unchanged.
+        let m2 = show.media[0].id;
+        let before = show.clone();
+        assert!(show.apply(ShowOp::RemoveMedia { ids: vec![m2, Uuid::new_v4()] }).is_err());
+        assert_eq!(show, before);
+        show.apply(ShowOp::RemoveMedia { ids: vec![m2] }).unwrap();
+        assert!(show.media.is_empty());
+        assert_eq!(show.groups[0].cues[0].layers_by_screen[&s], vec![lp]);
     }
 
     #[test]

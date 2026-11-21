@@ -166,6 +166,20 @@ export function shiftLayer(scene: Scene, screenId: string, layerId: string, by: 
   return withScreen(scene, screenId, next);
 }
 
+export type MediaUse = { cues: number; pvw: boolean; pgm: boolean };
+
+/** Where each media item is used: in how many cues, and whether Preview or Program shows it. An
+ *  item missing from the map is unused. */
+export function mediaUses(show: Show | null, live: Live): Map<string, MediaUse> {
+  const uses = new Map<string, MediaUse>();
+  const use = (id: string) => uses.get(id) ?? uses.set(id, { cues: 0, pvw: false, pgm: false }).get(id)!;
+  const ids = (sc: Scene) => new Set(Object.values(sc).flatMap((ls) => ls.flatMap((l) => (l.source.type === 'Media' ? [l.source.mediaId] : []))));
+  for (const c of show?.groups.flatMap((g) => g.cues) ?? []) for (const id of ids(c.layersByScreen)) use(id).cues++;
+  for (const id of ids(live.preview)) use(id).pvw = true;
+  for (const id of ids(live.program)) use(id).pgm = true;
+  return uses;
+}
+
 /** The media item a layer plays, if it plays one. */
 export function mediaOf(show: Show | null, layer: Layer | undefined): MediaItem | undefined {
   const src = layer?.source;

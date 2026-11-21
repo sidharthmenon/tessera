@@ -84,10 +84,10 @@ fn cue_at(show: &Show, cue: Option<CueRef>) -> Option<&Cue> {
 fn prune(scene: &mut Scene, op: &ShowOp) -> bool {
     match *op {
         ShowOp::RemoveScreen { id } => scene.remove(&id).is_some(),
-        ShowOp::RemoveMedia { id } => {
+        ShowOp::RemoveMedia { ref ids } => {
             let before = scene.clone();
             for layers in scene.values_mut() {
-                layers.retain(|l| !matches!(l.source, Source::Media { media_id } if media_id == id));
+                layers.retain(|l| !matches!(l.source, Source::Media { media_id } if ids.contains(&media_id)));
             }
             *scene != before
         }
@@ -662,7 +662,7 @@ mod tests {
         let live = Scene::from([(a.id, vec![bars.clone(), bg.clone()])]);
         assert_eq!(c.set_program(live.clone()), vec![ToEngine::SetProgram { scene: live.clone() }]);
         assert!(c.set_program(live).is_empty());
-        let msgs = c.apply(ShowOp::RemoveMedia { id: m.id }).unwrap();
+        let msgs = c.apply(ShowOp::RemoveMedia { ids: vec![m.id] }).unwrap();
         assert_eq!(c.pgm, Scene::from([(a.id, vec![bars])]), "removed media leaves PGM");
         assert!(has(&msgs, |x| *x == ToEngine::SetProgram { scene: c.pgm.clone() }));
     }

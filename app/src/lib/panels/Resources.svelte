@@ -2,8 +2,8 @@
   import type { MediaItem } from '$lib/bindings/MediaItem';
   import type { Pattern } from '$lib/bindings/Pattern';
   import type { Source } from '$lib/bindings/Source';
-  import { engineUrl, fmtTime, hexToRgba } from '$lib/logic';
-  import { addToPvw, importMedia, ui } from '$lib/store.svelte';
+  import { engineUrl, fmtTime, hexToRgba, mediaUses } from '$lib/logic';
+  import { addToPvw, confirmAsk, importMedia, op, ui } from '$lib/store.svelte';
 
   let tab = $state<'media' | 'patterns'>('media');
   let solid = $state('#ff8a1f');
@@ -27,6 +27,39 @@
     return parts.join(' · ');
   }
 
+  const uses = $derived(mediaUses(ui.show, ui.live));
+  const unused = $derived((ui.show?.media ?? []).filter((m) => !uses.has(m.id)));
+  const n = (k: number, what: string) => `${k} ${what}${k === 1 ? '' : 's'}`;
+
+  let menu = $state<{ x: number; y: number; item: MediaItem } | null>(null);
+  function openMenu(e: MouseEvent, item: MediaItem) {
+    e.preventDefault();
+    menu = { x: e.clientX, y: e.clientY, item };
+    ui.modal = 'menu';
+  }
+  function closeMenu() {
+    menu = null;
+    if (ui.modal === 'menu') ui.modal = null;
+  }
+
+  /** Removes `item`; when cues, Preview or Program use it, asks first (their layers go with it). */
+  async function remove(item: MediaItem) {
+    const u = uses.get(item.id);
+    if (u) {
+      const where = [u.cues && `${n(u.cues, 'cue')}`, u.pvw && 'Preview', u.pgm && 'Program'].filter(Boolean).join(', ');
+      const air = u.pgm ? ' It disappears from Program now.' : '';
+      if (!(await confirmAsk(`“${item.name}” is used by ${where}. Removing it removes those layers.${air} (Undo brings it back.)`, 'Remove'))) return;
+    }
+    op({ op: 'RemoveMedia', ids: [item.id] });
+  }
+
+  async function removeUnused() {
+    const ids = unused.map((m) => m.id);
+    if (ids.length && (await confirmAsk(`Remove ${n(ids.length, 'media item')} that no cue, Preview or Program uses? (Undo brings them back.)`, 'Remove'))) {
+      op({ op: 'RemoveMedia', ids });
+    }
+  }
+
   function dragStart(e: DragEvent, source: Source, name: string) {
     ui.dragging = { source, name };
     e.dataTransfer?.setData('text/plain', name);
@@ -34,14 +67,28 @@
   }
 </script>
 
-{#snippet row(source: Source, name: string, sub: string, thumb: string | null, icon: string)}
-  <li draggable="true" ondragstart={(e) => dragStart(e, source, name)} ondragend={() => (ui.dragging = null)} title="Drag onto a screen in the canvas to fill it, or onto a layer to replace it">
+<svelte:window
+  onclick={closeMenu}
+  onkeydown={(e) => {
+    if (menu && e.key === 'Escape') closeMenu();
+  }}
+/>
+
+{#snippet row(source: Source, name: string, sub: string, thumb: string | null, icon: string, item?: MediaItem)}
+  <li
+    draggable="true"
+    class:unused={item && !uses.has(item.id)}
+    ondragstart={(e) => dragStart(e, source, name)}
+    ondragend={() => (ui.dragging = null)}
+    oncontextmenu={(e) => item && openMenu(e, item)}
+    title="Drag onto a screen in the canvas to fill it, or onto a layer to replace it{item ? ' · right-click: remove' : ''}"
+  >
     <span class="thumb">
       {#if thumb}<img src={thumb} alt="" draggable="false" />{:else}{icon}{/if}
     </span>
     <span class="text">
       <span class="name">{name}</span>
-      <span class="sub">{sub}</span>
+      <span class="sub">{sub}{#if item && !uses.has(item.id)}<span class="tag"> · unused</span>{/if}</span>
     </span>
     <button class="add" onclick={() => addToPvw(source, name)} title="Add to the Preview cue, filling the highlighted screen (click a screen on the canvas to pick it)">+ PVW</button>
   </li>
@@ -58,7 +105,7 @@
   <ul>
     {#if tab === 'media'}
       {#each ui.show?.media ?? [] as m (m.id)}
-        {@render row(media(m), m.name, meta(m), m.thumb ? engineUrl(ui.engine, `/thumb/${encodeURIComponent(m.thumb)}`) : null, m.kind === 'Video' ? '▶' : '▣')}
+        {@render row(media(m), m.name, meta(m), m.thumb ? engineUrl(ui.engine, `/thumb/${encodeURIComponent(m.thumb)}`) : null, m.kind === 'Video' ? '▶' : '▣', m)}
       {:else}
         <p class="muted empty">No media yet. Import images or videos.</p>
       {/each}
@@ -69,7 +116,21 @@
       <li class="solid"><label>Solid colour <input type="color" bind:value={solid} /></label></li>
     {/if}
   </ul>
+  {#if tab === 'media' && unused.length}
+    <div class="foot">
+      <span class="muted">{n(unused.length, 'item')} unused</span>
+      <button onclick={removeUnused} title="Remove every media item no cue, Preview or Program uses">Remove unused</button>
+    </div>
+  {/if}
 </section>
+
+{#if menu}
+  {@const item = menu.item}
+  <div class="menu" class:up={menu.y > innerHeight / 2} style:left="{menu.x}px" style:top="{menu.y}px">
+    <button onclick={() => addToPvw(media(item), item.name)}>Add to Preview</button>
+    <button onclick={() => remove(item)}>Remove{uses.has(item.id) ? '…' : ''}</button>
+  </div>
+{/if}
 
 <style>
   .resources {
@@ -77,6 +138,25 @@
   }
   .import {
     margin-left: auto;
+  }
+  .unused {
+    opacity: 0.6;
+  }
+  .foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    padding: 4px 8px;
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+  }
+  .foot button {
+    padding: 1px 7px;
+    font-size: 11px;
+  }
+  .tag {
+    color: var(--accent);
   }
   ul {
     list-style: none;
