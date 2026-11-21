@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tessera_show::{
     Bus, Cue, EngineConfig, MediaItem, MediaKind, Playback, ProbeInfo, Scene, Show, ShowOp, Source, ToEngine, Transition,
-    TransitionKind, TransportAction, next_cue_slot, resolve_shared, take_merge,
+    TransitionKind, TransportAction, next_cue_slot, prev_cue_slot, resolve_shared, take_merge,
 };
 use uuid::Uuid;
 
@@ -371,6 +371,42 @@ impl Controller {
             Some(slot) => self.load_cue(CueRef { group_id: group.id, slot }).unwrap_or_default(),
             None => vec![],
         }
+    }
+
+    /// The previous occupied slot before the PVW cue (first group's last cue when PVW has none).
+    pub fn load_prev(&mut self) -> Vec<ToEngine> {
+        let (group, before) = match self.pvw.cue {
+            Some(r) => (self.show.groups.iter().find(|g| g.id == r.group_id), Some(r.slot)),
+            None => (self.show.groups.first(), None),
+        };
+        let Some(group) = group else { return vec![] };
+        match prev_cue_slot(group, before) {
+            Some(slot) => self.load_cue(CueRef { group_id: group.id, slot }).unwrap_or_default(),
+            None => vec![],
+        }
+    }
+
+    /// The Program clip that ends last (the visible video layer with the most time left at its
+    /// speed, within its trim), from the engine's last position report: (elapsed, remaining) in
+    /// real-time ms and the clip's name. None when no video plays on Program.
+    pub fn program_time(&self) -> Option<(u64, u64, String)> {
+        let mut best: Option<(u64, u64, String)> = None;
+        for l in self.pgm.values().flatten().filter(|l| l.visible) {
+            let Source::Media { media_id } = l.source else { continue };
+            let Some(m) = self.show.media.iter().find(|m| m.id == media_id) else { continue };
+            let (Some(total), Some(&pos)) = (m.duration_ms, self.positions.get(&l.id)) else { continue };
+            let start = l.trim_in_ms.min(total);
+            let length = (l.trim_out_ms.unwrap_or(total).min(total).saturating_sub(start)).max(1);
+            let played = pos.saturating_sub(start).min(length);
+            let speed = if l.speed.is_finite() && l.speed > 0. { l.speed as f64 } else { 1. };
+            let real = |ms: u64| (ms as f64 / speed).round() as u64;
+            let (elapsed, remaining) = (real(played), real(length - played));
+            if best.as_ref().is_none_or(|b| remaining > b.1) {
+                let name = if l.name.is_empty() { m.name.clone() } else { l.name.clone() };
+                best = Some((elapsed, remaining, name));
+            }
+        }
+        best
     }
 
     /// Everything a freshly (re)started engine needs, in order. Clips restart from their first
@@ -841,6 +877,39 @@ mod tests {
         assert!(c.dirty);
         c.open(Show::new(), None);
         assert!(!c.dirty);
+    }
+
+    #[test]
+    fn load_prev_walks_back() {
+        let mut c = Controller::new();
+        for slot in [7, 2, 4] {
+            set_cue(&mut c, slot, Scene::new());
+        }
+        c.load_prev();
+        assert_eq!(c.pvw.cue, Some(at(&c, 7)), "nothing loaded: the last cue");
+        c.load_prev();
+        c.load_prev();
+        assert_eq!(c.pvw.cue, Some(at(&c, 2)));
+        c.load_prev();
+        assert_eq!(c.pvw.cue, Some(at(&c, 2)), "no wrap");
+    }
+
+    /// The clip that ends last, in real time: trimmed and at its speed.
+    #[test]
+    fn program_time_is_the_clip_ending_last() {
+        let mut c = Controller::new();
+        let s = screen().id;
+        let (short, long) = (item(Some(10_000)), item(Some(60_000)));
+        c.apply(ShowOp::AddMedia { items: vec![short.clone(), long.clone()] }).unwrap();
+        let a = clip(&short, Playback::Loop);
+        let b = Layer { trim_in_ms: 10_000, trim_out_ms: Some(30_000), speed: 2., ..clip(&long, Playback::Once) };
+        set_cue(&mut c, 1, Scene::from([(s, vec![a.clone(), b.clone()])]));
+        c.load_cue(at(&c, 1)).unwrap();
+        c.take();
+        assert_eq!(c.program_time(), None, "no position reported yet");
+        c.positions(&BTreeMap::from([(a.id, 4000), (b.id, 14_000)]));
+        // a: 6 s left. b: 4 s into a 20 s trim at 2×: 2 s played, 8 s left.
+        assert_eq!(c.program_time(), Some((2000, 8000, "clip".into())));
     }
 
     #[test]

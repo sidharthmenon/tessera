@@ -25,6 +25,8 @@ class Store {
   show = $state.raw<Show | null>(null);
   live = $state.raw<Live>({ pvw: null, lastTaken: null, program: {}, preview: {}, transition: { kind: 'Fade', durationMs: 500 } });
   engine = $state.raw<EngineInfo | null>(null);
+  /** Remote control's settings and state (null until read). */
+  remote = $state.raw<api.RemoteStatus | null>(null);
   /** The operator stopped the engine (outputs black) until they start it. */
   engineStopped = $state(false);
   /** The last "engine restarting: …" message, until the engine is back. */
@@ -167,6 +169,7 @@ export async function init(): Promise<() => void> {
         api.on('engine-event', engineEvent),
         api.on('engine-info', setEngine),
         api.on('engine-stopped', (stopped) => (ui.engineStopped = stopped)),
+        api.on('remote-changed', (r) => (ui.remote = r)),
         getCurrentWebview().onDragDropEvent(({ payload }) => {
           ui.fileDrag = payload.type === 'enter' || payload.type === 'over';
           if (payload.type === 'drop') importDropped(payload.paths);
@@ -174,8 +177,9 @@ export async function init(): Promise<() => void> {
         api.on('recovery-available', (p) => offerRecovery(p)),
       ])),
     );
-    const [show, live, info, stopped] = await Promise.all([api.getShow(), api.getLive(), api.engineInfo(), api.engineStopped()]);
+    const [show, live, info, stopped, remote] = await Promise.all([api.getShow(), api.getLive(), api.engineInfo(), api.engineStopped(), api.remoteStatus()]);
     ui.engineStopped = stopped;
+    ui.remote = remote;
     ui.show = show;
     ui.live = live;
     setEngine(info);
@@ -266,6 +270,16 @@ export const take = action(api.take);
 export const loadNext = action(api.loadNext);
 export const op = action((o: ShowOp) => api.applyOp(o));
 export const listInputs = action(api.listInputs);
+
+/** Turns remote control on or off (and sets its port). */
+export const setRemote = action(async (enabled: boolean, port: number) => {
+  ui.remote = await api.remoteSet(enabled, port);
+});
+/** A new access key; asks first while remote control is on (connected systems need the new one). */
+export const newRemoteKey = action(async () => {
+  if (ui.remote?.running && !(await confirmAsk('Make a new access key? Companion and anything else connected stop working until you give them the new key.', 'New key'))) return;
+  ui.remote = await api.remoteNewKey();
+});
 
 /** Stops the engine after asking: every output goes black until Start. */
 export const stopEngine = action(async () => {

@@ -345,6 +345,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "serde_core",
+ "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
  "sha1",
@@ -5359,8 +5360,10 @@ dependencies = [
 name = "tessera-app"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "futures-util",
  "getrandom 0.4.3",
+ "http-body-util",
  "libc",
  "serde",
  "serde_json",
@@ -5372,6 +5375,7 @@ dependencies = [
  "tessera-show",
  "tokio",
  "tokio-tungstenite",
+ "tower",
  "uuid",
 ]
 

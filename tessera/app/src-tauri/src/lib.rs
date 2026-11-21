@@ -24,10 +24,12 @@ macro_rules! log {
 pub mod controller;
 pub mod engine_client;
 pub mod files;
+pub mod remote;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use controller::{Controller, CueRef, Live};
@@ -36,7 +38,7 @@ use tauri::menu::{Menu, MenuItem, MenuItemKind};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult};
 use tessera_show::{Bus, FromEngine, Scene, Show, ShowOp, ToEngine, Transition, TransportAction};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use uuid::Uuid;
 
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -53,6 +55,19 @@ pub struct AppState {
     quit: Mutex<Option<QuitChoice>>,
     /// The quit question is up.
     asking: AtomicBool,
+    /// Bumped whenever the state external systems see may have changed (remote control).
+    changes: watch::Sender<u64>,
+    remote: Mutex<RemoteRuntime>,
+}
+
+/// Remote control: the operator's settings and, while on, the server.
+struct RemoteRuntime {
+    settings: remote::Settings,
+    server: Option<remote::Server>,
+    error: Option<String>,
+    /// Shared with the running server, so "New key" applies at once.
+    key: Arc<RwLock<String>>,
+    clients: Arc<AtomicUsize>,
 }
 
 /// What a command may have changed.
@@ -90,7 +105,179 @@ fn dispatch(app: &AppHandle, change: Change, f: impl FnOnce(&mut Controller) -> 
         state.autosave.notify_one();
     }
     let _ = app.emit("live-changed", live);
+    changed(app);
     Ok(())
+}
+
+/// The state external systems see may have changed: remote clients get a fresh snapshot.
+pub(crate) fn changed(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.changes.send_modify(|n| *n = n.wrapping_add(1));
+    }
+}
+
+/// The engine's state in one word, as remote clients see it.
+fn engine_word(app: &AppHandle) -> &'static str {
+    let engine = app.state::<Engine>();
+    match engine.info() {
+        _ if engine.stopped() => "stopped",
+        Some(info) if info.held => "held",
+        Some(_) => "connected",
+        None => "connecting",
+    }
+}
+
+/// Remote commands run through `dispatch`, exactly as the UI's do, so the UI follows.
+struct AppControl(AppHandle);
+
+impl AppControl {
+    /// The cue at 1-based (group, cue), if the show has it.
+    fn cue(&self, group: usize, cue: u32) -> Result<CueRef, remote::Refused> {
+        let state = self.0.state::<AppState>();
+        let ctl = state.ctl();
+        let g = ctl.show.groups.get(group - 1).ok_or_else(|| remote::Refused::BadRequest(format!("there is no group {group}")))?;
+        let slot = cue - 1;
+        if !g.cues.iter().any(|c| c.slot == slot) {
+            return Err(remote::Refused::BadRequest(format!("group {group} ({}) has no cue {cue}", g.name)));
+        }
+        Ok(CueRef { group_id: g.id, slot })
+    }
+}
+
+impl remote::Control for AppControl {
+    fn run(&self, command: remote::Command) -> Result<(), remote::Refused> {
+        use remote::{Command as C, Refused};
+        let app = &self.0;
+        let preview_empty = || app.state::<AppState>().ctl().pvw.scene.is_empty();
+        let done = match command {
+            C::Go if preview_empty() => return Err(Refused::Conflict("Preview is empty: load a cue first".into())),
+            C::Go => dispatch(app, Change::Live, |c| Ok(c.take())),
+            C::Load { group, cue } => {
+                let r = self.cue(group, cue)?;
+                dispatch(app, Change::Live, |c| c.load_cue(r))
+            }
+            C::Fire { group, cue } => {
+                let r = self.cue(group, cue)?;
+                dispatch(app, Change::Live, |c| {
+                    let mut out = c.load_cue(r)?;
+                    out.extend(c.take());
+                    Ok(out)
+                })
+            }
+            C::Next => dispatch(app, Change::Live, |c| Ok(c.load_next())),
+            C::Previous => dispatch(app, Change::Live, |c| Ok(c.load_prev())),
+            C::Transport { .. } if app.state::<Engine>().info().is_none() => {
+                return Err(Refused::Unavailable("the engine is not connected".into()));
+            }
+            C::Transport { bus, action } => dispatch(app, Change::Live, |c| Ok(c.transport(bus, None, action))),
+            C::Volume(v) => dispatch(app, Change::Edit, |c| c.apply(ShowOp::SetMasterVolume { volume: v.clamp(0., 1.) })),
+            C::VolumeBy(d) => dispatch(app, Change::Edit, |c| {
+                let volume = (c.show.master_volume + d).clamp(0., 1.);
+                c.apply(ShowOp::SetMasterVolume { volume })
+            }),
+        };
+        done.map_err(Refused::BadRequest)
+    }
+
+    fn state(&self) -> remote::Snapshot {
+        let word = engine_word(&self.0);
+        remote::snapshot(&self.0.state::<AppState>().ctl(), word)
+    }
+
+    fn changes(&self) -> watch::Receiver<u64> {
+        self.0.state::<AppState>().changes.subscribe()
+    }
+}
+
+/// What the UI shows about remote control.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteStatus {
+    enabled: bool,
+    running: bool,
+    port: u16,
+    key: String,
+    /// This machine's LAN address, to type into Companion.
+    address: Option<String>,
+    clients: usize,
+    error: Option<String>,
+}
+
+fn remote_status_of(r: &RemoteRuntime) -> RemoteStatus {
+    RemoteStatus {
+        enabled: r.settings.enabled,
+        running: r.server.is_some(),
+        port: r.server.as_ref().map_or(r.settings.port, |s| s.addr.port()),
+        key: r.settings.key.clone(),
+        address: remote::lan_address(),
+        clients: r.clients.load(Ordering::SeqCst),
+        error: r.error.clone(),
+    }
+}
+
+fn emit_remote(app: &AppHandle) {
+    let status = remote_status_of(&app.state::<AppState>().remote.lock().unwrap_or_else(|e| e.into_inner()));
+    let _ = app.emit("remote-changed", status);
+}
+
+/// Starts or stops the server to match the settings (a key is made on first use), saves them.
+fn apply_remote(app: &AppHandle) -> RemoteStatus {
+    let state = app.state::<AppState>();
+    let mut r = state.remote.lock().unwrap_or_else(|e| e.into_inner());
+    r.server = None; // stops a running one
+    r.error = None;
+    if r.settings.enabled {
+        if r.settings.key.is_empty() {
+            r.settings.key = engine_client::new_token();
+        }
+        *r.key.write().unwrap_or_else(|e| e.into_inner()) = r.settings.key.clone();
+        let notify = app.clone();
+        let router = remote::router(Arc::new(AppControl(app.clone())), r.key.clone(), r.clients.clone(), Arc::new(move || emit_remote(&notify)));
+        match remote::start(router, "0.0.0.0", r.settings.port) {
+            Ok(server) => r.server = Some(server),
+            Err(e) => r.error = Some(e),
+        }
+    }
+    if let Err(e) = r.settings.save(&state.data_dir.join("remote.json")) {
+        log!("remote: settings: {e}");
+    }
+    let status = remote_status_of(&r);
+    drop(r);
+    let _ = app.emit("remote-changed", status.clone());
+    status
+}
+
+#[tauri::command]
+fn remote_status(state: State<AppState>) -> Res<RemoteStatus> {
+    Ok(remote_status_of(&state.remote.lock().unwrap_or_else(|e| e.into_inner())))
+}
+
+/// Turn remote control on or off, on `port`.
+#[tauri::command]
+fn remote_set(app: AppHandle, enabled: bool, port: u16) -> Res<RemoteStatus> {
+    {
+        let state = app.state::<AppState>();
+        let mut r = state.remote.lock().unwrap_or_else(|e| e.into_inner());
+        r.settings.enabled = enabled;
+        r.settings.port = if port == 0 { remote::DEFAULT_PORT } else { port };
+    }
+    Ok(apply_remote(&app))
+}
+
+/// A new access key: the old one stops working at once.
+#[tauri::command]
+fn remote_new_key(app: AppHandle) -> Res<RemoteStatus> {
+    {
+        let state = app.state::<AppState>();
+        let mut r = state.remote.lock().unwrap_or_else(|e| e.into_inner());
+        r.settings.key = engine_client::new_token();
+        *r.key.write().unwrap_or_else(|e| e.into_inner()) = r.settings.key.clone();
+        if let Err(e) = r.settings.save(&state.data_dir.join("remote.json")) {
+            log!("remote: settings: {e}");
+        }
+    }
+    emit_remote(&app);
+    Ok(remote_status_of(&app.state::<AppState>().remote.lock().unwrap_or_else(|e| e.into_inner())))
 }
 
 /// Called by the engine client on (re)connect: the full state, plus queued requests the
@@ -477,15 +664,28 @@ pub fn run() {
             }
             let ctl = Mutex::new(Controller::new());
             let recovery = Mutex::new(recovery);
-            app.manage(AppState { ctl, autosave: Notify::new(), data_dir, recovery, quit: Mutex::new(None), asking: AtomicBool::new(false) });
+            let settings = remote::Settings::load(&data_dir.join("remote.json"));
+            let remote = Mutex::new(RemoteRuntime {
+                key: Arc::new(RwLock::new(settings.key.clone())),
+                settings,
+                server: None,
+                error: None,
+                clients: Arc::new(AtomicUsize::new(0)),
+            });
+            let changes = watch::Sender::new(0);
+            app.manage(AppState { ctl, autosave: Notify::new(), data_dir, recovery, quit: Mutex::new(None), asking: AtomicBool::new(false), changes, remote });
             app.manage(engine);
+            let enabled = app.state::<AppState>().remote.lock().unwrap_or_else(|e| e.into_inner()).settings.enabled;
+            if enabled {
+                apply_remote(app.handle());
+            }
             tauri::async_runtime::spawn(engine_client::supervise(app.handle().clone(), rx));
             tauri::async_runtime::spawn(autosave(app.handle().clone()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_show, get_live, apply_op, undo, redo, load_cue, set_preview, store_preview, set_program, take, load_next, transport, list_monitors, list_inputs,
-            identify, import_media, new_show, open_show, get_recovery, save_show, engine_info, engine_stop, engine_start, engine_restart, engine_stopped
+            identify, import_media, new_show, open_show, get_recovery, save_show, engine_info, engine_stop, engine_start, engine_restart, engine_stopped, remote_status, remote_set, remote_new_key
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

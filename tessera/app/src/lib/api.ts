@@ -55,6 +55,12 @@ export const engineStart = () => invoke<null>('engine_start');
 /** Replace the engine; the new one gets the show, Preview and Program back on connect. */
 export const engineRestart = () => invoke<null>('engine_restart');
 export const engineStopped = () => invoke<boolean>('engine_stopped');
+
+/** Remote control (Companion, scripts): see docs/external-control.md. */
+export type RemoteStatus = { enabled: boolean; running: boolean; port: number; key: string; address: string | null; clients: number; error: string | null };
+export const remoteStatus = () => invoke<RemoteStatus>('remote_status');
+export const remoteSet = (enabled: boolean, port: number) => invoke<RemoteStatus>('remote_set', { enabled, port });
+export const remoteNewKey = () => invoke<RemoteStatus>('remote_new_key');
 /** Unsaved work from an earlier session. Read it before any `openShow`, which resets it. */
 export const getRecovery = () => invoke<string | null>('get_recovery');
 
@@ -67,6 +73,7 @@ type Events = {
   'recovery-available': string;
   /** The operator stopped (true) or started (false) the engine. */
   'engine-stopped': boolean;
+  'remote-changed': RemoteStatus;
 };
 
 export const on = <K extends keyof Events>(event: K, f: (payload: Events[K]) => void): Promise<UnlistenFn> =>

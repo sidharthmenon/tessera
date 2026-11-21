@@ -254,6 +254,7 @@ impl Engine {
         self.kill(true); // as `shutdown`: the supervisor takes the record as soon as it's reaped
         let _ = std::fs::remove_file(&self.file); // nothing for a next controller to adopt
         let _ = app.emit("engine-stopped", true);
+        crate::changed(app);
     }
 
     /// Operator: start an engine again after `stop` (it gets the full state on connect).
@@ -261,6 +262,7 @@ impl Engine {
         self.paused.store(false, Ordering::SeqCst);
         self.wake.notify_one();
         let _ = app.emit("engine-stopped", false);
+        crate::changed(app);
     }
 
     /// Operator: replace the engine now; the new one gets the full state on connect. (Between
@@ -316,6 +318,7 @@ impl Engine {
     fn set_info(&self, app: &AppHandle, info: Option<EngineInfo>) {
         *self.info.lock().unwrap_or_else(|e| e.into_inner()) = info;
         let _ = app.emit("engine-info", self.info());
+        crate::changed(app);
     }
 }
 

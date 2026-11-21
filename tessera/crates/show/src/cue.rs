@@ -68,6 +68,11 @@ pub fn next_cue_slot(group: &Group, after: Option<u32>) -> Option<u32> {
     group.cues.iter().map(|c| c.slot).filter(|s| after.is_none_or(|a| *s > a)).min()
 }
 
+/// The previous occupied slot before `before` (with none: the last cue).
+pub fn prev_cue_slot(group: &Group, before: Option<u32>) -> Option<u32> {
+    group.cues.iter().map(|c| c.slot).filter(|s| before.is_none_or(|b| *s < b)).max()
+}
+
 /// Screens defined in `incoming` replace those in `pgm`; others are kept.
 pub fn take_merge(pgm: &Scene, incoming: &Scene) -> Scene {
     let mut out = pgm.clone();
@@ -183,6 +188,9 @@ mod tests {
         assert_eq!(next_cue_slot(&g, None), Some(1));
         assert_eq!(next_cue_slot(&g, Some(1)), Some(3));
         assert_eq!(next_cue_slot(&g, Some(7)), None);
+        assert_eq!(prev_cue_slot(&g, None), Some(7));
+        assert_eq!(prev_cue_slot(&g, Some(7)), Some(3));
+        assert_eq!(prev_cue_slot(&g, Some(1)), None);
     }
 
     #[test]
