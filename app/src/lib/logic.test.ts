@@ -226,6 +226,19 @@ eq([' ', 'ArrowRight', 'Enter', 'Escape', 'F13', 'é', '/'].map((key) => L.cueKe
 }
 eq(L.cropBox({ left: 0.25, top: 0.1, right: 0.25, bottom: 0.2 }).map((v) => +v.toFixed(3)), [0.25, 0.1, 0.5, 0.7], 'crop box');
 eq([L.cropBox({ left: 0.6, top: 0, right: 0.6, bottom: 0 }), L.cropBox({ left: NaN, top: -1, right: 0, bottom: 2 })], [[0, 0, 1, 1], [0, 0, 1, 1]], 'a crop that leaves nothing is ignored');
+{
+  const none = { left: 0, top: 0, right: 0, bottom: 0 };
+  const rect = { x: 0, y: 0, w: 1000, h: 500 };
+  const round = (o: { rect: object; crop: Record<string, number> }) => ({ rect: o.rect, crop: Object.fromEntries(Object.entries(o.crop).map(([k, v]) => [k, +v.toFixed(4)])) });
+  const left = L.cropDrag(rect, none, 'left', 100);
+  eq(round(left), { rect: { x: 100, y: 0, w: 900, h: 500 }, crop: { left: 0.1, top: 0, right: 0, bottom: 0 } }, 'crop left: edge and crop move together');
+  eq(round(L.cropDrag(left.rect, left.crop, 'left', -300)), { rect: rect, crop: none }, 'back out only to no crop');
+  eq(round(L.cropDrag(rect, none, 'right', -250)), { rect: { x: 0, y: 0, w: 750, h: 500 }, crop: { left: 0, top: 0, right: 0.25, bottom: 0 } }, 'crop right');
+  eq(round(L.cropDrag(rect, none, 'top', 50)), { rect: { x: 0, y: 50, w: 1000, h: 450 }, crop: { left: 0, top: 0.1, right: 0, bottom: 0 } }, 'crop top');
+  eq(round(L.cropDrag(rect, none, 'left', 5000)), { rect: { x: 990, y: 0, w: 10, h: 500 }, crop: { left: 0.99, top: 0, right: 0, bottom: 0 } }, 'at most 99 % cut');
+  // Already cropped (the rect shows half the source): a unit is worth twice as much source.
+  eq(round(L.cropDrag({ x: 0, y: 0, w: 500, h: 500 }, { ...none, right: 0.5 }, 'left', 100)).crop.left, 0.1, 'scale follows the kept part');
+}
 eq(L.patternFill({ type: 'Bars' }), 'url(#cue-bars)', 'bars fill');
 
 console.log('logic: all checks passed');

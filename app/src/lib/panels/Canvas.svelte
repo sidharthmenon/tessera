@@ -2,7 +2,7 @@
   import type { Layer } from '$lib/bindings/Layer';
   import type { Rect } from '$lib/bindings/Rect';
   import type { Screen } from '$lib/bindings/Screen';
-  import { boxOf, clipTime, cueAt, dragRect, fmtTime, engineUrl, fitScale, layoutBounds, mediaOf, screenAt, snapDrag, type DragMode } from '$lib/logic';
+  import { boxOf, clipTime, cropDrag, cueAt, dragRect, fmtTime, engineUrl, fitScale, layoutBounds, mediaOf, screenAt, snapDrag, type CropSide, type DragMode } from '$lib/logic';
   import { addToPvw, editLayer, fail, ui } from '$lib/store.svelte';
 
   let cw = $state(0);
@@ -15,8 +15,12 @@
   const url = $derived(engineUrl(ui.engine, `/preview/${ui.canvasTab}.mjpg`));
   const pgmCue = $derived(cueAt(ui.show, ui.live.lastTaken));
 
-  type Drag = { screenId: string; layerId: string; mode: DragMode; x0: number; y0: number; start: Rect; rect: Rect };
+  type Crop = Layer['crop'];
+  type Drag = { screenId: string; layerId: string; mode: DragMode | CropSide; x0: number; y0: number; start: Rect; rect: Rect; startCrop: Crop; crop: Crop };
   let drag = $state.raw<Drag | null>(null);
+  /** Crop mode: the selected layer shows edge handles that crop it (box and picture edge together). */
+  let cropMode = $state(false);
+  const cropSides: CropSide[] = ['left', 'top', 'right', 'bottom'];
 
   // Everything the bus shows, all of it editable.
   const boxes = $derived(
@@ -30,12 +34,12 @@
 
   const label = (l: Layer) => l.name || (l.source.type === 'Media' ? (mediaOf(ui.show, l)?.name ?? 'media') : l.source.pattern.type);
 
-  function down(e: PointerEvent, s: Screen, l: Layer, mode: DragMode) {
+  function down(e: PointerEvent, s: Screen, l: Layer, mode: DragMode | CropSide) {
     if (e.button !== 0) return;
     e.stopPropagation();
     ui.selected = { screenId: s.id, layerId: l.id };
     (e.currentTarget as Element).setPointerCapture(e.pointerId);
-    drag = { screenId: s.id, layerId: l.id, mode, x0: e.clientX, y0: e.clientY, start: l.rect, rect: l.rect };
+    drag = { screenId: s.id, layerId: l.id, mode, x0: e.clientX, y0: e.clientY, start: l.rect, rect: l.rect, startCrop: l.crop, crop: l.crop };
   }
 
   /** Edges snap to the layer's screen and to the other layers on it. A resize keeps the layer's
@@ -43,7 +47,15 @@
   function move(e: PointerEvent) {
     const s = drag && screens.find((x) => x.id === drag!.screenId);
     if (!drag || !s || scale <= 0) return;
-    const r = dragRect(drag.start, (e.clientX - drag.x0) / scale, (e.clientY - drag.y0) / scale, drag.mode);
+    const [dx, dy] = [(e.clientX - drag.x0) / scale, (e.clientY - drag.y0) / scale];
+    if (drag.mode !== 'move' && drag.mode !== 'resize') {
+      // ponytail: ignores rotation (the drag runs along the screen's axes, not the turned box's).
+      const side = drag.mode;
+      const { rect, crop } = cropDrag(drag.start, drag.startCrop, side, side === 'left' || side === 'right' ? dx : dy);
+      drag = { ...drag, rect, crop };
+      return;
+    }
+    const r = dragRect(drag.start, dx, dy, drag.mode);
     const others = (ui.busScene[s.id] ?? []).filter((l) => l.id !== drag!.layerId).map((l) => l.rect);
     const aspect = ui.keepAspect !== e.shiftKey ? drag.start.w / drag.start.h : undefined;
     drag = { ...drag, rect: snapDrag(r, drag.mode, others, s.width, s.height, scale, aspect) };
@@ -54,8 +66,8 @@
     const d = drag;
     if (!d) return;
     const r = d.rect;
-    if (r.x !== d.start.x || r.y !== d.start.y || r.w !== d.start.w || r.h !== d.start.h) {
-      await editLayer({ screenId: d.screenId, layerId: d.layerId }, (l) => ({ ...l, rect: r }));
+    if (r.x !== d.start.x || r.y !== d.start.y || r.w !== d.start.w || r.h !== d.start.h || d.crop !== d.startCrop) {
+      await editLayer({ screenId: d.screenId, layerId: d.layerId }, (l) => ({ ...l, rect: r, crop: d.crop }));
     }
     if (drag === d) drag = null; // after the edit lands, so the box doesn't jump back meanwhile
   }
@@ -105,6 +117,13 @@
       <!-- M2: an adopted engine never gets SetProgram, so its live edits wait for the next GO. -->
       <span class="badge live">ON AIR</span><span class="note warn">{ui.engine?.adopted ? 'edits reach air on the next GO' : 'edits go to air now'}</span>
     {/if}
+    <button
+      class="crop-toggle"
+      class:on={cropMode}
+      disabled={!ui.layer}
+      title="Crop the selected layer by dragging its edges (the picture stays in place)"
+      onclick={() => (cropMode = !cropMode)}>Crop</button
+    >
     <label class="aspect" title="Resizing keeps a layer's shape. Hold Shift while dragging for the other."><input type="checkbox" bind:checked={ui.keepAspect} /> Keep aspect</label>
     {#if ui.canvasTab === 'pgm'}
       <span class="cue">{pgmCue ? `${pgmCue.slot + 1} · ${pgmCue.name}` : Object.keys(ui.live.program).length ? 'live' : 'nothing taken yet'}</span>
@@ -183,7 +202,13 @@
                 <span class="bar"><span style:width="{t.fraction * 100}%"></span></span>
               {/if}
             {/if}
-            <div class="handle" onpointerdown={(e) => down(e, s, l, 'resize')}></div>
+            {#if cropMode && ui.selected?.layerId === l.id}
+              {#each cropSides as side (side)}
+                <div class="crop {side}" title="Crop {side}" onpointerdown={(e) => down(e, s, l, side)}></div>
+              {/each}
+            {:else}
+              <div class="handle" onpointerdown={(e) => down(e, s, l, 'resize')}></div>
+            {/if}
           </div>
         {/each}
       </div>
@@ -206,8 +231,52 @@
     color: var(--live);
     font-weight: 600;
   }
-  .aspect {
+  .crop-toggle {
     margin-left: auto;
+    padding: 0 8px;
+    font-size: 11px;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .crop-toggle.on {
+    background: var(--accent);
+    color: #000;
+    border-color: var(--accent);
+  }
+  .crop {
+    position: absolute;
+    background: var(--accent);
+    border: 1px solid #000;
+  }
+  .crop.left,
+  .crop.right {
+    top: 50%;
+    width: 6px;
+    height: 22px;
+    margin-top: -11px;
+    cursor: ew-resize;
+  }
+  .crop.top,
+  .crop.bottom {
+    left: 50%;
+    width: 22px;
+    height: 6px;
+    margin-left: -11px;
+    cursor: ns-resize;
+  }
+  .crop.left {
+    left: -4px;
+  }
+  .crop.right {
+    right: -4px;
+  }
+  .crop.top {
+    top: -4px;
+  }
+  .crop.bottom {
+    bottom: -4px;
+  }
+  .aspect {
     display: flex;
     align-items: center;
     gap: 4px;

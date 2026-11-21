@@ -199,6 +199,34 @@ export function cropBox(c: Layer['crop']): [number, number, number, number] {
   return x1 - x0 < 0.001 || y1 - y0 < 0.001 ? [0, 0, 1, 1] : [x0, y0, x1 - x0, y1 - y0];
 }
 
+export type CropSide = 'left' | 'top' | 'right' | 'bottom';
+
+/** A crop handle dragged by `d` rect units (positive: right/down): that side's crop and the
+ *  matching edge of `rect` move together, so the picture keeps its place and scale and only what
+ *  is cut changes. Stops at no crop on that side, and at 1 unit / 1 % of the source left. */
+export function cropDrag(rect: Rect, crop: Layer['crop'], side: CropSide, d: number): { rect: Rect; crop: Layer['crop'] } {
+  const across = side === 'left' || side === 'right';
+  const size = across ? rect.w : rect.h;
+  const kept = across ? 1 - crop.left - crop.right : 1 - crop.top - crop.bottom;
+  if (!(size > 0) || !(kept > 0)) return { rect, crop };
+  const perUnit = kept / size; // source fraction per rect unit
+  const min = -crop[side] / perUnit; // back out to no crop on this side
+  const max = size - Math.max(1, 0.01 / perUnit);
+  const inward = side === 'left' || side === 'top' ? d : -d;
+  const r = Math.round(Math.min(max, Math.max(min, inward)));
+  const step = r < min ? min : r > max ? max : r;
+  const next = { ...crop, [side]: Math.max(0, crop[side] + step * perUnit) };
+  const moved = { ...rect };
+  if (across) {
+    moved.w = size - step;
+    if (side === 'left') moved.x = rect.x + step;
+  } else {
+    moved.h = size - step;
+    if (side === 'top') moved.y = rect.y + step;
+  }
+  return { rect: moved, crop: next };
+}
+
 export type MediaUse = { cues: number; pvw: boolean; pgm: boolean };
 
 /** Where each media item is used: in how many cues, and whether Preview or Program shows it. An
