@@ -1,0 +1,144 @@
+# Builds the installers. A pushed tag vX.Y.Z also drafts a GitHub release with them (review it,
+# then Publish). Run it by hand (Actions → Release → Run workflow) to build without releasing.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tessera/app/package-lock.json
+      - run: rustup update stable --no-self-update && rustup default stable && brew install pkgconf
+      - id: ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ~/ffmpeg-lgpl
+          key: ffmpeg-lgpl-macos-arm64-${{ hashFiles('tessera/scripts/build-ffmpeg-macos.sh') }}
+      - name: Build FFmpeg (LGPL)
+        if: steps.ffmpeg.outputs.cache-hit != 'true'
+        run: sh tessera/scripts/build-ffmpeg-macos.sh "$HOME/ffmpeg-lgpl"
+      - name: Build Tessera.app
+        working-directory: tessera/app
+        run: |
+          export PKG_CONFIG_PATH="$HOME/ffmpeg-lgpl/lib/pkgconfig"
+          npm ci
+          npm run release
+      - name: Make the DMG
+        run: |
+          version="$(jq -r .version tessera/app/src-tauri/tauri.conf.json)"
+          stage="$(mktemp -d)"
+          ditto tessera/target/release/bundle/macos/Tessera.app "$stage/Tessera.app"
+          ln -s /Applications "$stage/Applications"
+          mkdir dist
+          hdiutil create -volname Tessera -srcfolder "$stage" -ov -format UDZO "dist/Tessera_${version}_macos_arm64.dmg"
+          cp "$HOME"/ffmpeg-lgpl/ffmpeg-*.tar.xz dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The engine then needs no VC++ redistributable (tauri-build already does this for the app).
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tessera/app/package-lock.json
+      - run: rustup update stable --no-self-update && rustup default stable
+      - name: FFmpeg (LGPL shared build from BtbN)
+        run: |
+          name=ffmpeg-n9.0-latest-win64-lgpl-shared-9.0
+          curl -fsSL -o "$RUNNER_TEMP/ffmpeg.zip" "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$name.zip"
+          7z x -y "$RUNNER_TEMP/ffmpeg.zip" -o"$RUNNER_TEMP" > /dev/null
+          dir="$RUNNER_TEMP/$name"
+          echo "FFMPEG_DIR=$(cygpath -w "$dir")" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
+          mkdir -p tessera/app/src-tauri/ffmpeg-dlls dist
+          cp "$dir"/bin/*.dll tessera/app/src-tauri/ffmpeg-dlls/
+          "$dir/bin/ffmpeg.exe" -version | head -1 | sed 's/ Copyright.*//' > dist/ffmpeg-windows.txt
+          cat dist/ffmpeg-windows.txt
+      - name: Build the installer
+        working-directory: tessera/app
+        run: |
+          npm ci
+          npx tauri build --bundles nsis --config src-tauri/tauri.release-windows.conf.json
+          cp ../target/release/bundle/nsis/*-setup.exe ../../dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  companion:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: companion-module-tessera/package-lock.json
+      - name: Package the Companion module
+        working-directory: companion-module-tessera
+        run: |
+          npm ci
+          npm test
+          npm run package
+          version="$(jq -r .version package.json)"
+          mkdir ../dist
+          mv "tessera-$version.tgz" "../dist/tessera-companion-$version.tgz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: companion
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows, companion]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check the versions match the tag
+        run: |
+          app="$(jq -r .version tessera/app/src-tauri/tauri.conf.json)"
+          module="$(jq -r .version companion-module-tessera/package.json)"
+          if [ "v$app" != "$GITHUB_REF_NAME" ] || [ "v$module" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but tauri.conf.json says $app and companion-module-tessera/package.json says $module"
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          notes="$(mktemp)"
+          sed -e "s|{{VERSION}}|$version|g" -e "s|{{FFMPEG_WINDOWS}}|$(cat dist/ffmpeg-windows.txt)|g" .github/release-notes.md > "$notes"
+          rm dist/ffmpeg-windows.txt
+          gh release create "$GITHUB_REF_NAME" --draft --title "Tessera $version" --notes-file "$notes" dist/*

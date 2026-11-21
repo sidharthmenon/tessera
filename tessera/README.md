@@ -12,7 +12,7 @@ Windows is untested.
 
 - Rust stable, Node 20+
 - macOS: `brew install ffmpeg pkgconf` (built against Homebrew FFmpeg 9)
-- Windows (untested): the BtbN FFmpeg *shared* build, with `FFMPEG_DIR` pointing at it
+- Windows (untested): the BtbN FFmpeg `lgpl-shared` build, with `FFMPEG_DIR` pointing at it
 
 ## Build, run, test
 
@@ -31,32 +31,46 @@ cargo test --workspace
 cd app && npm run check && npm test
 ```
 
-## Release build (macOS)
+## Releasing
+
+GitHub Actions builds the installers (`.github/workflows/release.yml` at the repo root):
+
+1. Bump the version in `app/src-tauri/tauri.conf.json`, `app/package.json` and
+   `../companion-module-tessera/package.json` (the workflow refuses a tag that doesn't match).
+2. Commit, then `git tag vX.Y.Z && git push origin main vX.Y.Z`.
+3. The workflow drafts a release with the macOS `.dmg`, the Windows `setup.exe`, the Companion
+   module `.tgz` and the FFmpeg source. Check it on GitHub, then click **Publish**.
+
+Actions → Release → **Run workflow** builds the same files (as run artifacts) without a release.
+
+The installers bundle an **LGPL** FFmpeg, so they can be shipped with Tessera's GPL-3.0 code and
+without Homebrew's GPL build:
+
+- macOS: `scripts/build-ffmpeg-macos.sh <prefix>` builds FFmpeg 9.0.2 from source for macOS 12+
+  (cached in CI). The app then needs macOS 12, Apple Silicon. Not notarized: see the release notes.
+- Windows: BtbN's `lgpl-shared` build. `app/src-tauri/tauri.release-windows.conf.json` puts its
+  DLLs next to `tessera-render.exe`. Not signed.
+
+### Release build on this Mac
 
 ```sh
 cd app && npm run release
 ```
 
-This produces `target/release/bundle/macos/Tessera.app` (under `$CARGO_TARGET_DIR` if that is
-set). The app runs without Homebrew or a dev setup. The command does two things:
+This makes `target/release/bundle/macos/Tessera.app` (under `$CARGO_TARGET_DIR` if set):
+`tauri build --bundles app`, then `scripts/bundle-ffmpeg-macos.sh` copies every non-system dylib
+the sidecar loads into `Contents/Frameworks`, points the load paths there and ad-hoc signs the app.
+With Homebrew's FFmpeg that app needs this Mac's macOS and is GPL. For what CI ships, build the LGPL
+FFmpeg first:
 
-1. `tauri build --bundles app` builds the release engine and the app.
-2. `scripts/bundle-ffmpeg-macos.sh` copies every non-system dylib the sidecar needs into
-   `Contents/Frameworks`: FFmpeg and its codec libraries, found with `otool -L`. It rewrites
-   their load paths to `@executable_path/../Frameworks` and ad-hoc signs the app.
+```sh
+sh scripts/build-ffmpeg-macos.sh ~/ffmpeg-lgpl
+cd app && MACOSX_DEPLOYMENT_TARGET=12.0 PKG_CONFIG_PATH=~/ffmpeg-lgpl/lib/pkgconfig npm run release
+```
 
-Limits of the release build:
-
-- **macOS version and CPU.** The app runs only on the build Mac's architecture. It also needs at
-  least the macOS version that the build Mac's Homebrew bottles target. The script writes that
-  version into `LSMinimumSystemVersion`, so build on a Mac running the same macOS as the show Mac,
-  or an older one.
-- **Not notarized.** If macOS blocks the app after a download or AirDrop, run
-  `xattr -dr com.apple.quarantine Tessera.app`.
-- **Logs.** To see the controller and `[engine]` logs, start the app from a terminal:
-  `Tessera.app/Contents/MacOS/tessera-app`.
-
-Plain `npm run tauri build` still works, but its `.app` and `.dmg` load FFmpeg from Homebrew.
+To see the controller and `[engine]` logs, start the app from a terminal:
+`Tessera.app/Contents/MacOS/tessera-app`. If macOS blocks a copied app, run
+`xattr -dr com.apple.quarantine Tessera.app`.
 
 ## Shows, autosave, crash recovery
 
@@ -219,5 +233,5 @@ Keys work when no field or button has focus (Esc leaves a field).
 - **Frame pacing.** A single render loop drives all outputs, so they are all paced at the rate
   of the slowest display.
 - **Audio drift.** Audio isn't slaved to the video clock, so long clips can drift.
-- **Windows.** Untested, and the release build doesn't bundle FFmpeg DLLs there.
+- **Windows.** CI builds the installer, FFmpeg DLLs included, but it hasn't run on a PC yet.
 - **Engine adoption** after a UI crash works only on macOS and other unix systems.

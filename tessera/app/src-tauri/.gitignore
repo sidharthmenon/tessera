@@ -8,3 +8,6 @@
 
 # Tauri sidecar tessera-render-<triple>: scripts/build-engine.sh (build.rs writes a placeholder)
 /binaries/
+
+# Release builds on Windows: FFmpeg DLLs copied in by CI (tauri.release-windows.conf.json)
+/ffmpeg-dlls/
