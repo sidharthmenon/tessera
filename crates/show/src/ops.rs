@@ -57,7 +57,8 @@ fn floats(op: &ShowOp) -> Vec<f32> {
                     Source::Pattern { pattern: Pattern::Solid { rgba } } => &rgba[..],
                     _ => &[],
                 };
-                [&rect(&l.rect)[..], &[l.opacity, l.brightness, l.contrast, l.saturation, l.volume, l.rotation, l.speed], solid].concat()
+                let c = &l.crop;
+                [&rect(&l.rect)[..], &[l.opacity, l.brightness, l.contrast, l.saturation, l.volume, l.rotation, l.speed], &[c.left, c.top, c.right, c.bottom], solid].concat()
             })
             .collect(),
         ShowOp::SetMasterVolume { volume } => vec![*volume],
@@ -332,9 +333,10 @@ mod tests {
             let mut l = layer();
             l.rect.x = bad;
             ops.push(with_layer(l));
-            for f in 0..7 {
+            for f in 0..11 {
                 let mut l = layer();
-                *[&mut l.opacity, &mut l.brightness, &mut l.contrast, &mut l.saturation, &mut l.volume, &mut l.rotation, &mut l.speed][f] = bad;
+                let c = &mut l.crop;
+                *[&mut l.opacity, &mut l.brightness, &mut l.contrast, &mut l.saturation, &mut l.volume, &mut l.rotation, &mut l.speed, &mut c.left, &mut c.top, &mut c.right, &mut c.bottom][f] = bad;
                 ops.push(with_layer(l));
             }
             let solid = Layer::new(Source::Pattern { pattern: Pattern::Solid { rgba: [0., bad, 0., 1.] } }, rect());

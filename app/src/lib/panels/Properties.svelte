@@ -6,6 +6,13 @@
   import { editLayer, moveLayer, setTransition, ui } from '$lib/store.svelte';
 
   const kinds: TransitionKind[] = ['Cut', 'Fade', 'WipeLeft', 'WipeRight'];
+  /** Crop fields: side, label, and the source axis it is measured along. */
+  const cropSides = [
+    ['left', 'Left', 'w'],
+    ['top', 'Top', 'h'],
+    ['right', 'Right', 'w'],
+    ['bottom', 'Bottom', 'h'],
+  ] as const;
   const endModes: [Playback, string][] = [
     ['Loop', 'Loop'],
     ['Once', 'Play once, then clear'],
@@ -198,6 +205,31 @@
           <span>Rotation °</span>
           <input type="number" step="1" value={layer.rotation} onchange={(e) => setNum(e, (rotation) => ({ rotation }), () => layer.rotation)} />
         </label>
+        {@const size = media?.width && media?.height ? { w: media.width, h: media.height } : null}
+        {@const crop = layer.crop}
+        <div class="row">
+          <span title={size ? 'Pixels of the source cut from each edge' : 'Percent of the source cut from each edge'}>Crop {size ? 'px' : '%'}</span>
+          <span class="trim">
+            {#each cropSides as [side, label, axis] (side)}
+              {@const scale = size ? size[axis] : 100}
+              <input
+                type="number"
+                min="0"
+                step={size ? 1 : 0.5}
+                title="{label} ({size ? 'source pixels' : '% of the source'})"
+                placeholder={label[0]}
+                value={+(crop[side] * scale).toFixed(size ? 0 : 1)}
+                onchange={(e) => setNum(e, (v) => ({ crop: { ...crop, [side]: Math.min(0.99, Math.max(0, v / scale)) } }), () => +(crop[side] * scale).toFixed(size ? 0 : 1))}
+              />
+            {/each}
+          </span>
+        </div>
+        {#if crop.left || crop.top || crop.right || crop.bottom}
+          <div class="row">
+            <span></span>
+            <span class="trim"><button onclick={() => set({ crop: { left: 0, top: 0, right: 0, bottom: 0 } })}>No crop</button></span>
+          </div>
+        {/if}
         <div class="grid">
           {@render field('X', layer.rect.x, (x) => ({ rect: { ...layer.rect, x } }))}
           {@render field('Y', layer.rect.y, (y) => ({ rect: { ...layer.rect, y } }))}

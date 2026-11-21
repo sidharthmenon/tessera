@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Cue } from '$lib/bindings/Cue';
   import type { Layer } from '$lib/bindings/Layer';
-  import { cueKey, engineUrl, firstEmptySlot, layoutBounds, mediaOf, patternFill, sameRef, slotCount, withScreen } from '$lib/logic';
+  import { cropBox, cueKey, engineUrl, firstEmptySlot, layoutBounds, mediaOf, patternFill, sameRef, slotCount, withScreen } from '$lib/logic';
   import { addGroup, clickSlot, confirmAsk, editCue, fire, op, promptText, ui, updateCue } from '$lib/store.svelte';
   import type { CueRef } from '$lib/api';
 
@@ -128,7 +128,12 @@
           {@const m = mediaOf(ui.show, l)}
           {@const href = m?.thumb ? engineUrl(ui.engine, `/thumb/${encodeURIComponent(m.thumb)}`) : null}
           {#if href}
-            <image {href} x={l.rect.x} y={l.rect.y} width={l.rect.w} height={l.rect.h} preserveAspectRatio="none" opacity={l.opacity} transform={turn(l)} />
+            {@const [cx, cy, cw, ch] = cropBox(l.crop)}
+            <g transform={turn(l)} opacity={l.opacity}>
+              <svg x={l.rect.x} y={l.rect.y} width={l.rect.w} height={l.rect.h} viewBox="{cx} {cy} {cw} {ch}" preserveAspectRatio="none">
+                <image {href} width="1" height="1" preserveAspectRatio="none" />
+              </svg>
+            </g>
           {:else}
             <rect x={l.rect.x} y={l.rect.y} width={l.rect.w} height={l.rect.h} fill={l.source.type === 'Pattern' ? patternFill(l.source.pattern) : '#333'} opacity={l.opacity} transform={turn(l)} />
           {/if}

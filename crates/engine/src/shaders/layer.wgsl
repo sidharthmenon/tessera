@@ -12,6 +12,7 @@ struct U {
     saturation: f32,
     yuv_scale: f32,     // normalized → 8-bit code values: 255 (8-bit), 256 (MSB-aligned 16-bit)
     rotation: f32,      // radians clockwise about the rect's centre
+    crop: vec4<f32>,    // the source part drawn, in uv: (x0, y0, x1, y1)
 };
 
 @group(0) @binding(0) var t0: texture_2d<f32>;
@@ -63,17 +64,18 @@ fn grid(pos: vec2<f32>) -> vec4<f32> {
 }
 
 @fragment fn fs(v: VO) -> @location(0) vec4<f32> {
-    let a = textureSample(t0, s, v.uv);
-    let b = textureSample(t1, s, v.uv);
+    let uv = mix(u.crop.xy, u.crop.zw, v.uv);
+    let a = textureSample(t0, s, uv);
+    let b = textureSample(t1, s, uv);
     var c: vec4<f32>;
     switch u.kind {
         case 0u: { c = a; }
         case 1u: { c = vec4(yuv(a.r, b.r, b.g), 1.0); }
         case 6u: { c = vec4(yuv(a.g, a.b, a.a), a.r); } // packed A Y Cb Cr, straight alpha
         case 7u: { c = vec4(a.rgb, 1.0); }               // fourth byte undefined: opaque
-        case 2u: { c = bars(v.uv.x); }
+        case 2u: { c = bars(uv.x); }
         case 3u: { c = grid(v.pos.xy); }
-        case 4u: { c = vec4(vec3(v.uv.x), 1.0); }
+        case 4u: { c = vec4(vec3(uv.x), 1.0); }
         default: { c = u.color; }
     }
     if (u.flags & 1u) != 0u && c.a > 0.0 {

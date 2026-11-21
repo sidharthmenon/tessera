@@ -224,6 +224,8 @@ eq([' ', 'ArrowRight', 'Enter', 'Escape', 'F13', 'é', '/'].map((key) => L.cueKe
   eq(L.clipTime(clip, { trimInMs: 2000, trimOutMs: 6000, speed: 2 }, 3000), { elapsed: 500, remaining: 1500, fraction: 0.25 }, 'trimmed to 2–6 s at 2×: 1 s in → 0.5 s played, 1.5 s left');
   eq(L.losesPicture({ b: [layer] }, { b: [{ ...layer, trimInMs: 100 }] }), false, 'a pattern has no trim to lose');
 }
+eq(L.cropBox({ left: 0.25, top: 0.1, right: 0.25, bottom: 0.2 }).map((v) => +v.toFixed(3)), [0.25, 0.1, 0.5, 0.7], 'crop box');
+eq([L.cropBox({ left: 0.6, top: 0, right: 0.6, bottom: 0 }), L.cropBox({ left: NaN, top: -1, right: 0, bottom: 2 })], [[0, 0, 1, 1], [0, 0, 1, 1]], 'a crop that leaves nothing is ignored');
 eq(L.patternFill({ type: 'Bars' }), 'url(#cue-bars)', 'bars fill');
 
 console.log('logic: all checks passed');

@@ -86,6 +86,23 @@ fn opacity_half() {
     assert_near(px(&data, 100, 50, 50), [128, 128, 128, 128], 2);
 }
 
+/// Cropping the left half off colour bars draws bars 5–8 across the whole rect; a crop that would
+/// leave nothing is ignored.
+#[test]
+fn crop_draws_only_the_kept_part() {
+    let gpu = gpu();
+    let mut c = Compositor::new(&gpu);
+    let s = screen(80, 4);
+    let mut bars = pattern(Pattern::Bars, r(0., 0., 80., 4.));
+    bars.0.crop.left = 0.5;
+    let data = render(&gpu, &mut c, &s, &[bars.clone()]);
+    assert_eq!(px(&data, 80, 2, 2), [255, 0, 255, 255], "left edge: the 5th bar (magenta)");
+    assert_eq!(px(&data, 80, 78, 2), [0, 0, 0, 255], "right edge: the 8th bar (black)");
+    bars.0.crop = tessera_show::Crop { left: 0.6, right: 0.6, ..Default::default() };
+    let data = render(&gpu, &mut c, &s, &[bars]);
+    assert_eq!(px(&data, 80, 2, 2), [255, 255, 255, 255], "nothing left: uncropped (white first bar)");
+}
+
 /// A 60×20 bar rotated 90° about its centre (50, 50) stands upright: 20 wide, 60 tall.
 #[test]
 fn rotation_turns_about_centre() {

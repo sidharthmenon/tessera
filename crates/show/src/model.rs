@@ -179,6 +179,19 @@ pub struct Layer {
     #[serde(default)]
     #[ts(type = "number | null")]
     pub trim_out_ms: Option<u64>,
+    /// Cut from the source's edges before it is drawn into `rect`.
+    #[serde(default)]
+    pub crop: Crop,
+}
+
+/// Parts of a layer's source cut away, as fractions of its width (left, right) and height (top,
+/// bottom) from each edge: resolution-independent, so a live input keeps its crop at any format.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, TS)]
+pub struct Crop {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
 }
 
 fn one() -> f32 {
@@ -204,6 +217,7 @@ impl Layer {
             speed: 1.0,
             trim_in_ms: 0,
             trim_out_ms: None,
+            crop: Crop::default(),
         }
     }
 }

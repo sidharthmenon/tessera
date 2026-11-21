@@ -135,7 +135,7 @@ export function newLayer(source: Source, screen: Screen, name: string): Layer {
   return {
     id: uuid(), name, source, rect: { x: 0, y: 0, w: screen.width, h: screen.height },
     opacity: 1, brightness: 0, contrast: 1, saturation: 1, volume: 1, playback: 'Loop', visible: true, muted: false,
-    rotation: 0, speed: 1, trimInMs: 0, trimOutMs: null,
+    rotation: 0, speed: 1, trimInMs: 0, trimOutMs: null, crop: { left: 0, top: 0, right: 0, bottom: 0 },
   };
 }
 
@@ -189,6 +189,14 @@ export function clipTime(
   const played = Math.min(Math.max(0, (pos ?? start) - start), length);
   const speed = layer.speed > 0 ? layer.speed : 1;
   return { elapsed: played / speed, remaining: (length - played) / speed, fraction: played / length };
+}
+
+/** The part of a layer's source drawn, as a unit-square box (x, y, w, h), as the engine reads the
+ *  crop: one that leaves (almost) nothing is ignored. */
+export function cropBox(c: Layer['crop']): [number, number, number, number] {
+  const edge = (v: number) => (Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0);
+  const [x0, y0, x1, y1] = [edge(c.left), edge(c.top), 1 - edge(c.right), 1 - edge(c.bottom)];
+  return x1 - x0 < 0.001 || y1 - y0 < 0.001 ? [0, 0, 1, 1] : [x0, y0, x1 - x0, y1 - y0];
 }
 
 export type MediaUse = { cues: number; pvw: boolean; pgm: boolean };

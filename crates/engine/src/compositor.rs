@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
-use tessera_show::{Layer, Mapping, Output, Pattern, Rect, Screen, Source, TransitionKind};
+use tessera_show::{Crop, Layer, Mapping, Output, Pattern, Rect, Screen, Source, TransitionKind};
 use uuid::Uuid;
 use wgpu::util::DeviceExt;
 
@@ -59,6 +59,15 @@ struct LayerUniform {
     yuv_scale: f32,
     rotation: f32,
     _pad: [f32; 2],
+    crop: [f32; 4],
+}
+
+/// The part of the source a layer draws, in uv (x0, y0, x1, y1). A crop that leaves (almost)
+/// nothing, or isn't finite, is ignored rather than drawing a smear of one texel.
+fn crop_uv(c: &Crop) -> [f32; 4] {
+    let edge = |v: f32| if v.is_finite() { v.clamp(0., 1.) } else { 0. };
+    let (x0, y0, x1, y1) = (edge(c.left), edge(c.top), 1. - edge(c.right), 1. - edge(c.bottom));
+    if x1 - x0 < 0.001 || y1 - y0 < 0.001 { [0., 0., 1., 1.] } else { [x0, y0, x1, y1] }
 }
 
 /// Mirrors `U` in shaders/transition.wgsl.
@@ -274,6 +283,7 @@ impl Compositor {
             yuv_scale: 255.,
             rotation: if l.rotation.is_finite() { l.rotation.to_radians() } else { 0. },
             _pad: [0.; 2],
+            crop: crop_uv(&l.crop),
         };
         let (a, b) = match (&l.source, tex) {
             (Source::Pattern { pattern }, _) => {
