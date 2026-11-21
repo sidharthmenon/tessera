@@ -4,7 +4,7 @@ struct U {
     rect: vec4<f32>,    // layer rect in screen px (x, y, w, h)
     color: vec4<f32>,   // Solid pattern, straight alpha
     screen: vec2<f32>,  // screen size in px
-    kind: u32,          // 0 rgba, 1 yuv (nv12/p010), 2 bars, 3 grid, 4 gradient, 5 solid, 6 ayuv64
+    kind: u32,          // 0 rgba, 1 yuv (nv12/p010), 2 bars, 3 grid, 4 gradient, 5 solid, 6 ayuv64, 7 rgbx
     flags: u32,         // bit 0 premultiplied, bit 1 full range
     opacity: f32,
     brightness: f32,
@@ -70,6 +70,7 @@ fn grid(pos: vec2<f32>) -> vec4<f32> {
         case 0u: { c = a; }
         case 1u: { c = vec4(yuv(a.r, b.r, b.g), 1.0); }
         case 6u: { c = vec4(yuv(a.g, a.b, a.a), a.r); } // packed A Y Cb Cr, straight alpha
+        case 7u: { c = vec4(a.rgb, 1.0); }               // fourth byte undefined: opaque
         case 2u: { c = bars(v.uv.x); }
         case 3u: { c = grid(v.pos.xy); }
         case 4u: { c = vec4(vec3(v.uv.x), 1.0); }

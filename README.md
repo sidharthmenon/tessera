@@ -145,6 +145,7 @@ On Windows, run the same checklist before the first show there.
 - [ ] Windows: D3D11VA decode and surface sizing
 - [ ] A USB capture device (Magewell/Elgato) as a live input: add, show, unplug and replug
 - [ ] Windows: DirectShow capture listing and opening
+- [ ] An NDI source (NDI Tools' Test Patterns) as a live input, with and without alpha
 - [ ] Menu bar and Dock behaviour while an output is in simple fullscreen
 
 ## Displays and audio
@@ -174,6 +175,12 @@ by itself. Video only for now.
 - **Windows** uses FFmpeg's DirectShow input: devices are listed by their stable device path.
   Allow desktop apps to use the camera (Settings → Privacy → Camera), and close any other app
   using the device: DirectShow devices are exclusive. Not yet tried on a Windows PC.
+- **NDI® sources** show in the same list once the free NDI Tools (or NDI Runtime) is installed:
+  Tessera loads the runtime when it starts looking (`$NDI_RUNTIME_DIR_V6`/`_V5`,
+  `/usr/local/lib/libndi.dylib`, `/Library/NDI SDK for Apple/lib/macOS/libndi.dylib`; on Windows
+  `Processing.NDI.Lib.x64.dll` from `%NDI_RUNTIME_DIR_V6%`). Without it, the Inputs tab says so
+  and everything else works. Video only (BGRA with alpha, or opaque BGRX). NDI® is a registered
+  trademark of Vizrt NDI AB.
 
 ## Known limits
 

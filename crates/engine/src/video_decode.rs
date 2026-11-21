@@ -24,6 +24,10 @@ pub enum PixelFormatKind {
     Ayuv64,
     /// Straight-alpha RGBA8, converted by `sws_scale` (software fallback for everything else).
     Rgba,
+    /// Straight-alpha BGRA8 (NDI).
+    Bgra,
+    /// BGR8 plus an undefined fourth byte (NDI without alpha): drawn opaque.
+    Bgrx,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +60,20 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
+    /// A copy of packed 4-byte pixels (`Bgra`/`Bgrx`/`Rgba`), `stride` bytes per row, so the source
+    /// buffer can be released at once.
+    pub(crate) fn packed(w: u32, h: u32, data: &[u8], stride: usize, kind: PixelFormatKind) -> anyhow::Result<Frame> {
+        let row = w as usize * 4;
+        ensure!(w > 0 && h > 0 && stride >= row && data.len() >= stride * (h as usize - 1) + row, "frame {w}×{h}: buffer too small");
+        let pixel = if kind == PixelFormatKind::Rgba { ff::format::Pixel::RGBA } else { ff::format::Pixel::BGRA };
+        let mut frame = ff::frame::Video::new(pixel, w, h);
+        let out_stride = frame.stride(0);
+        for (dst, src) in frame.data_mut(0).chunks_mut(out_stride).zip(data.chunks(stride)).take(h as usize) {
+            dst[..row].copy_from_slice(&src[..row]);
+        }
+        Ok(Frame { pts: Duration::ZERO, kind, hardware: false, full_range: false, frame })
+    }
+
     /// A solid `w`×`h` RGBA frame, for tests.
     #[cfg(test)]
     pub(crate) fn test_rgba(w: u32, h: u32, rgba: [u8; 4]) -> Frame {

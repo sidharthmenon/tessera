@@ -21,6 +21,7 @@
 
   function meta(m: MediaItem) {
     if (m.kind === 'Capture') return `live input${m.width ? ` · ${m.width}×${m.height}` : ''}`;
+    if (m.kind === 'Ndi') return 'NDI® source';
     if (!m.width) return 'probing…';
     const parts = [`${m.width}×${m.height}`];
     if (m.durationMs != null) parts.push(fmtTime(m.durationMs));
@@ -120,7 +121,7 @@
       {#if tab === 'media'}
         <button onclick={() => importMedia()}>Import…</button>
       {:else}
-        <span class="muted">Capture devices</span>
+        <span class="muted">Capture devices and NDI®</span>
         <button onclick={() => listInputs()} title="Look for capture devices again">Refresh</button>
       {/if}
     </div>
@@ -128,7 +129,7 @@
   <ul>
     {#if tab === 'media'}
       {#each ui.show?.media ?? [] as m (m.id)}
-        {@render row(media(m), m.name, meta(m), m.thumb ? engineUrl(ui.engine, `/thumb/${encodeURIComponent(m.thumb)}`) : null, { Video: '▶', Image: '▣', Capture: '◉' }[m.kind], m)}
+        {@render row(media(m), m.name, meta(m), m.thumb ? engineUrl(ui.engine, `/thumb/${encodeURIComponent(m.thumb)}`) : null, { Video: '▶', Image: '▣', Capture: '◉', Ndi: '⦿' }[m.kind], m)}
       {:else}
         <p class="muted empty">No media yet. Import images or videos.</p>
       {/each}
@@ -139,10 +140,10 @@
         {#each ui.inputs.list as i (i.id)}
           {@const item = added(i)}
           <li class="input">
-            <span class="thumb">◉</span>
+            <span class="thumb">{i.kind === 'Ndi' ? '⦿' : '◉'}</span>
             <span class="text">
               <span class="name">{i.name}</span>
-              <span class="sub">{i.width ? `${i.width}×${i.height}` : 'capture device'}</span>
+              <span class="sub">{i.kind === 'Ndi' ? 'NDI® source' : i.width ? `${i.width}×${i.height}` : 'capture device'}</span>
             </span>
             {#if item}
               <span class="tag" title="In Media: drag it onto a screen from there">added</span>
@@ -151,9 +152,9 @@
             {/if}
           </li>
         {:else}
-          <p class="muted empty">No capture devices found. Connect one and press Refresh.</p>
+          <p class="muted empty">No capture devices or NDI sources found. Connect one and press Refresh.</p>
         {/each}
-        {#if ui.inputs.error}<p class="warn empty">{ui.inputs.error}</p>{/if}
+        {#if ui.inputs.error}<p class="note empty">{ui.inputs.error}</p>{/if}
       {/if}
     {:else}
       {#each patterns as p (p.name)}
@@ -207,8 +208,9 @@
     padding: 1px 8px;
     font-size: 11px;
   }
-  .warn {
-    color: var(--warn);
+  .note {
+    color: var(--muted);
+    font-size: 11px;
   }
   .foot {
     display: flex;

@@ -22,6 +22,7 @@ pub mod compositor;
 pub mod frame_clock;
 pub mod gpu;
 pub mod live;
+pub mod ndi;
 pub mod net;
 pub mod outputs;
 pub mod player;

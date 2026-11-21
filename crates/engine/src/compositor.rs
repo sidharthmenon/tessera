@@ -28,6 +28,8 @@ pub enum Planes {
     /// One `Rgba16Unorm` of packed A, Y, Cb, Cr (VideoToolbox ProRes 4444 + alpha, `y416`);
     /// alpha is straight, so `premultiplied` stays false.
     Ayuv64(wgpu::TextureView),
+    /// Like `Rgba`, but the fourth channel is undefined: drawn opaque (NDI's BGRX).
+    Rgbx(wgpu::TextureView),
 }
 
 /// Which copy of a screen to render: PGM, PVW and a transition's outgoing PGM can all show the
@@ -298,6 +300,10 @@ impl Compositor {
                     }
                     Planes::Ayuv64(v) => {
                         (u.kind, u.yuv_scale) = (6, 256.);
+                        (v, &self.blank)
+                    }
+                    Planes::Rgbx(v) => {
+                        u.kind = 7;
                         (v, &self.blank)
                     }
                 }

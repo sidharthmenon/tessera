@@ -397,6 +397,7 @@ fn layout(kind: PixelFormatKind) -> &'static [(F, (u32, u32), u32)] {
         PixelFormatKind::P210 => &[(F::R16Unorm, (1, 1), 2), (F::Rg16Unorm, (2, 1), 4)],
         PixelFormatKind::Ayuv64 => &[(F::Rgba16Unorm, (1, 1), 8)],
         PixelFormatKind::Rgba => &[(F::Rgba8Unorm, (1, 1), 4)],
+        PixelFormatKind::Bgra | PixelFormatKind::Bgrx => &[(F::Bgra8Unorm, (1, 1), 4)],
     }
 }
 
@@ -433,7 +434,8 @@ impl GpuFrame {
             // normalized coordinates.
             PixelFormatKind::P010 | PixelFormatKind::P210 => Planes::P010 { y: view(0), uv: view(1) },
             PixelFormatKind::Ayuv64 => Planes::Ayuv64(view(0)),
-            PixelFormatKind::Rgba => Planes::Rgba(view(0)),
+            PixelFormatKind::Rgba | PixelFormatKind::Bgra => Planes::Rgba(view(0)),
+            PixelFormatKind::Bgrx => Planes::Rgbx(view(0)),
         };
         // One frame per chunk: each frame's planes go up in one belt chunk.
         let bytes = textures.iter().zip(layout(kind)).map(|(t, &(_, _, bpp))| pitch(t.width(), bpp) * t.height() as u64).sum();
@@ -583,5 +585,34 @@ mod tests {
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("h264_trunc_64.mp4"), "{errors:?}");
         assert!(frames >= steps - 3, "{frames} of {steps} steps showed a new frame");
+    }
+}
+
+#[cfg(test)]
+mod packed_tests {
+    use super::*;
+    use crate::compositor::{Compositor, ScreenSlot};
+    use crate::gpu::read_rgba;
+    use tessera_show::{Layer, Rect, Screen, Source};
+
+    /// A 2×2 frame of one packed pixel, uploaded and drawn full-screen; the drawn pixel.
+    fn drawn(kind: PixelFormatKind, pixel: [u8; 4]) -> [u8; 4] {
+        let gpu = Gpu::new_headless().expect("these tests need a GPU");
+        let frame = Frame::packed(2, 2, &pixel.repeat(4), 8, kind).unwrap();
+        let mut slot = None;
+        let texture = upload_into(&mut slot, &gpu, &frame).unwrap();
+        let screen = Screen { id: uuid::Uuid::new_v4(), name: "S".into(), width: 4, height: 4, layout_x: 0, layout_y: 0 };
+        let layer = Layer::new(Source::Media { media_id: uuid::Uuid::new_v4() }, Rect { x: 0., y: 0., w: 4., h: 4. });
+        let mut c = Compositor::new(&gpu);
+        let view = c.render_screen(&gpu, ScreenSlot::Pgm, &screen, &[(layer, Some(texture))]);
+        read_rgba(&gpu, view.texture()).unwrap()[..4].try_into().unwrap()
+    }
+
+    #[test]
+    fn bgra_and_bgrx_draw_their_colours() {
+        assert_eq!(drawn(PixelFormatKind::Bgra, [0, 0, 255, 255]), [255, 0, 0, 255], "BGRA red stays red");
+        assert_eq!(drawn(PixelFormatKind::Bgrx, [255, 0, 0, 7]), [0, 0, 255, 255], "BGRX blue, fourth byte ignored: opaque");
+        let half = drawn(PixelFormatKind::Bgra, [0, 255, 0, 128]);
+        assert!(half[1].abs_diff(128) <= 2 && half[3].abs_diff(128) <= 2, "straight alpha, premultiplied on output: {half:?}");
     }
 }

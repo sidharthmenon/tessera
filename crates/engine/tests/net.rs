@@ -172,6 +172,24 @@ async fn ws_probe_replies_and_serves_thumb() {
     assert!(find(&thumb, b"\r\n\r\n\xFF\xD8").is_some(), "a JPEG body");
 }
 
+/// `ListInputs` is answered with `Inputs` (capture devices and NDI sources; on a machine without
+/// the NDI runtime, `error` says so and the capture devices still come back).
+#[tokio::test]
+async fn ws_list_inputs_replies() {
+    let s = server();
+    let mut ws = connect(&s, &format!("?token={TOKEN}")).await.unwrap();
+    send(&mut ws, &serde_json::to_string(&ToEngine::ListInputs).unwrap()).await;
+    loop {
+        if let FromEngine::Inputs { inputs, error } = next_event(&mut ws).await {
+            assert!(inputs.iter().all(|i| !i.id.is_empty()), "{inputs:?}");
+            if let Some(e) = error {
+                assert!(e.contains("NDI") || e.contains("capture"), "{e}");
+            }
+            break;
+        }
+    }
+}
+
 #[tokio::test]
 async fn preview_requires_token() {
     let s = server();

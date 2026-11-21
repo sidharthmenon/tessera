@@ -594,7 +594,7 @@ impl FileOpener {
         FileOpener { gpu, audio, media: vec![], feeds: HashMap::new() }
     }
 
-    /// The input's running feed, or a new one.
+    /// The input's running feed, or a new one (`item` is a live kind).
     fn feed(&mut self, item: &MediaItem) -> anyhow::Result<Arc<Feed>> {
         let key = (item.id, item.path.clone());
         if let Some(feed) = self.feeds.get(&key).and_then(Weak::upgrade).filter(|f| f.running()) {
@@ -602,7 +602,11 @@ impl FileOpener {
         }
         self.feeds.retain(|_, f| f.strong_count() > 0);
         let id = item.path.clone();
-        let feed = Feed::spawn(&item.name, Box::new(move || crate::capture::open(&id)))?;
+        let feed = if item.kind == MediaKind::Ndi {
+            Feed::spawn(&item.name, Box::new(move || crate::ndi::open(&id)))?
+        } else {
+            Feed::spawn(&item.name, Box::new(move || crate::capture::open(&id)))?
+        };
         self.feeds.insert(key, Arc::downgrade(&feed));
         Ok(feed)
     }
@@ -619,7 +623,7 @@ impl Opener for FileOpener {
             MediaKind::Video => Player::open_trimmed(path, layer.playback.clone(), self.audio, layer.trim_in_ms, layer.trim_out_ms)
                 .map(|player| FileMedia::Video { player: Box::new(player), gpu: self.gpu.clone() }),
             MediaKind::Image => ImageSource::open(&self.gpu, path).map(|image| FileMedia::Image(Box::new(image))),
-            MediaKind::Capture => self.feed(&item).map(|feed| FileMedia::Live { live: Box::new(LiveMedia::new(feed)), gpu: self.gpu.clone() }),
+            MediaKind::Capture | MediaKind::Ndi => self.feed(&item).map(|feed| FileMedia::Live { live: Box::new(LiveMedia::new(feed)), gpu: self.gpu.clone() }),
         };
         media.map_err(|e| format!("{}: {e:#}", item.path))
     }

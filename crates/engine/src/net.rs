@@ -203,12 +203,21 @@ impl Shared {
     fn list_inputs(&self) {
         let events = self.events.clone();
         tokio::spawn(async move {
-            let listed = tokio::task::spawn_blocking(crate::capture::list).await;
-            let (inputs, error) = match listed {
-                Ok(Ok(inputs)) => (inputs, None),
-                Ok(Err(e)) => (vec![], Some(format!("capture devices: {e:#}"))),
-                Err(e) => (vec![], Some(format!("capture devices: {e}"))),
-            };
+            // Capture devices and NDI sources side by side (NDI waits about a second).
+            let lists = tokio::task::spawn_blocking(|| [("capture devices", crate::capture::list()), ("NDI sources", crate::ndi::list())]).await;
+            let (mut inputs, mut errors) = (vec![], vec![]);
+            match lists {
+                Ok(lists) => {
+                    for (what, list) in lists {
+                        match list {
+                            Ok(found) => inputs.extend(found),
+                            Err(e) => errors.push(format!("{what}: {e:#}")),
+                        }
+                    }
+                }
+                Err(e) => errors.push(format!("inputs: {e}")),
+            }
+            let error = (!errors.is_empty()).then(|| errors.join("; "));
             let _ = events.send(FromEngine::Inputs { inputs, error });
         });
     }
