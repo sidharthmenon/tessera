@@ -196,6 +196,7 @@ eq(L.patternFill({ type: 'Solid', rgba: [1, 0.5, 0, 0.25] }), 'rgba(255,128,0,0.
   eq(order(L.shiftLayer(c, 's', 'c', -1)), 'acb', 'layer down');
   eq(L.shiftLayer(c, 's', 'c', 1), c, 'top layer stays');
   eq(L.shiftLayer(c, 's', 'a', -1), c, 'bottom layer stays');
+  eq([order(L.shiftLayer(c, 's', 'a', Infinity)), order(L.shiftLayer(c, 's', 'c', -Infinity)), order(L.shiftLayer(c, 's', 'b', Infinity))], ['bca', 'cab', 'acb'], 'to top, to bottom');
 }
 eq(L.lockAspect({ x: 5, y: 5, w: 400, h: 100 }, 16 / 9), { x: 5, y: 5, w: 400, h: 225 }, 'aspect: too wide grows height');
 eq(L.lockAspect({ x: 5, y: 5, w: 100, h: 900 }, 16 / 9), { x: 5, y: 5, w: 1600, h: 900 }, 'aspect: too tall grows width');
@@ -215,6 +216,11 @@ eq(L.fitInto(16 / 9, 3840, 1080), { x: 960, y: 0, w: 1920, h: 1080 }, 'fit 16:9 
 }
 eq(['h', 'H', '7', 'F1', 'F12'].map((key) => L.cueKey({ key })), ['H', 'H', '7', 'F1', 'F12'], 'cue keys, letters upper-cased');
 eq([' ', 'ArrowRight', 'Enter', 'Escape', 'F13', 'é', '/'].map((key) => L.cueKey({ key })), [null, null, null, null, null, null, null], 'keys a cue cannot take');
+{
+  const clip = { durationMs: 10_000 } as Parameters<typeof L.clipTime>[0];
+  eq(L.clipTime(clip, 2500), { elapsed: 2500, remaining: 7500, fraction: 0.25 }, 'clip time');
+  eq([L.clipTime(clip, undefined)?.elapsed, L.clipTime(clip, 12_000)?.remaining, L.clipTime({ durationMs: null } as typeof clip, 5)], [0, 0, null], 'clip time: no report yet, past the end, still');
+}
 eq(L.patternFill({ type: 'Bars' }), 'url(#cue-bars)', 'bars fill');
 
 console.log('logic: all checks passed');

@@ -3,4 +3,8 @@ import type { Playback } from "./Playback";
 import type { Rect } from "./Rect";
 import type { Source } from "./Source";
 
-export type Layer = { id: string, name: string, source: Source, rect: Rect, opacity: number, brightness: number, contrast: number, saturation: number, volume: number, playback: Playback, visible: boolean, };
+export type Layer = { id: string, name: string, source: Source, rect: Rect, opacity: number, brightness: number, contrast: number, saturation: number, volume: number, playback: Playback, visible: boolean, 
+/**
+ * Silent, whatever its volume (kept for unmuting).
+ */
+muted: boolean, };

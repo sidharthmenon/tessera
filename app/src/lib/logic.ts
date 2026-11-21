@@ -134,7 +134,7 @@ export function uuid(): string {
 export function newLayer(source: Source, screen: Screen, name: string): Layer {
   return {
     id: uuid(), name, source, rect: { x: 0, y: 0, w: screen.width, h: screen.height },
-    opacity: 1, brightness: 0, contrast: 1, saturation: 1, volume: 1, playback: 'Loop', visible: true,
+    opacity: 1, brightness: 0, contrast: 1, saturation: 1, volume: 1, playback: 'Loop', visible: true, muted: false,
   };
 }
 
@@ -154,15 +154,15 @@ export function withLayer(scene: Scene, screenId: string, layerId: string, f: (l
   return withScreen(scene, screenId, layers.flatMap((l) => (l.id === layerId ? (f(l) ?? []) : [l])));
 }
 
-/** `scene` with a layer moved one place in its screen's stack (`by` 1: up, towards the top);
- *  unchanged at either end. */
-export function shiftLayer(scene: Scene, screenId: string, layerId: string, by: 1 | -1): Scene {
+/** `scene` with a layer moved `by` places in its screen's stack (positive: up, towards the top;
+ *  ±Infinity: to the top or bottom); unchanged when it can't move. */
+export function shiftLayer(scene: Scene, screenId: string, layerId: string, by: number): Scene {
   const layers = scene[screenId] ?? [];
   const i = layers.findIndex((l) => l.id === layerId);
-  const j = i + by;
-  if (i < 0 || j < 0 || j >= layers.length) return scene;
-  const next = [...layers];
-  [next[i], next[j]] = [next[j], next[i]];
+  const j = Math.max(0, Math.min(layers.length - 1, i + by));
+  if (i < 0 || j === i) return scene;
+  const next = layers.filter((_, k) => k !== i);
+  next.splice(j, 0, layers[i]);
   return withScreen(scene, screenId, next);
 }
 
@@ -171,6 +171,15 @@ export function shiftLayer(scene: Scene, screenId: string, layerId: string, by: 
 export function cueKey(e: Pick<KeyboardEvent, 'key'>): string | null {
   const k = e.key.length === 1 ? e.key.toUpperCase() : e.key;
   return /^([A-Z0-9]|F([1-9]|1[0-2]))$/.test(k) ? k : null;
+}
+
+/** A clip's progress for its canvas box, from the engine's reported position (ms into the file):
+ *  elapsed, remaining and the fraction played. Null for stills and unprobed media. */
+export function clipTime(media: MediaItem | undefined, pos: number | undefined): { elapsed: number; remaining: number; fraction: number } | null {
+  const total = media?.durationMs;
+  if (!total) return null;
+  const elapsed = Math.min(Math.max(0, pos ?? 0), total);
+  return { elapsed, remaining: total - elapsed, fraction: elapsed / total };
 }
 
 export type MediaUse = { cues: number; pvw: boolean; pgm: boolean };

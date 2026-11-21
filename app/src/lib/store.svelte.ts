@@ -258,8 +258,9 @@ export const addToPvw = action(async (source: Source, name: string, screen?: Scr
  *  which goes to air at once, so taking picture away (or restarting a clip) asks first. */
 export const editLayer = action((sel: LayerRef, f: (l: Layer) => Layer | null) => editBus((sc) => withLayer(sc, sel.screenId, sel.layerId, f)));
 
-/** Move a layer one place up (towards the top) or down its screen's stack, as `editLayer` edits. */
-export const moveLayer = action((sel: LayerRef, by: 1 | -1) => editBus((sc) => shiftLayer(sc, sel.screenId, sel.layerId, by)));
+/** Move a layer `by` places up (towards the top) or down its screen's stack (±Infinity: to the
+ *  top or bottom), as `editLayer` edits. */
+export const moveLayer = action((sel: LayerRef, by: number) => editBus((sc) => shiftLayer(sc, sel.screenId, sel.layerId, by)));
 
 async function editBus(f: (sc: Scene) => Scene) {
   const scene = ui.busScene;

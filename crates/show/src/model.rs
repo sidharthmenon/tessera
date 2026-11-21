@@ -152,6 +152,9 @@ pub struct Layer {
     pub volume: f32,
     pub playback: Playback,
     pub visible: bool,
+    /// Silent, whatever its volume (kept for unmuting).
+    #[serde(default)]
+    pub muted: bool,
 }
 
 impl Layer {
@@ -168,6 +171,7 @@ impl Layer {
             volume: 1.0,
             playback: Playback::Loop,
             visible: true,
+            muted: false,
         }
     }
 }
@@ -206,6 +210,10 @@ mod tests {
         let json = r#"{"id":"00000000-0000-4000-8000-000000000001","name":"C","slot":0,"layersByScreen":{},"transition":{"kind":"Cut","durationMs":0}}"#;
         let cue: Cue = serde_json::from_str(json).unwrap();
         assert_eq!(cue.hotkey, None);
+        let layer = r#"{"id":"00000000-0000-4000-8000-000000000002","name":"","source":{"type":"Pattern","pattern":{"type":"Bars"}},
+            "rect":{"x":0,"y":0,"w":10,"h":10},"opacity":1,"brightness":0,"contrast":1,"saturation":1,"volume":1,"playback":"Loop","visible":true}"#;
+        let layer: Layer = serde_json::from_str(layer).unwrap();
+        assert_eq!(layer, Layer { id: layer.id, ..Layer::new(layer.source.clone(), layer.rect.clone()) });
     }
 
     #[test]

@@ -190,6 +190,7 @@
           <span class="meta">{cue.transition.kind}{cue.transition.kind !== 'Cut' ? ` ${cue.transition.durationMs}` : ''} · {Object.keys(cue.layersByScreen).length} scr</span>
         {/if}
         <span class="tags">
+          {#if cue && Object.values(cue.layersByScreen).some((ls) => ls.some((l) => l.muted))}<span class="mute" title="A clip in this cue is muted">🔇</span>{/if}
           {#if live}<span class="badge live">PGM</span>{/if}
           {#if pvw}<span class="badge pvw">PVW</span>{/if}
         </span>
@@ -305,6 +306,12 @@
   }
   .warn {
     color: var(--warn);
+  }
+  .mute {
+    font-size: 10px;
+    background: rgba(0, 0, 0, 0.6);
+    border-radius: 2px;
+    padding: 0 2px;
   }
   .key {
     position: absolute;

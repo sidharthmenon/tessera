@@ -2,7 +2,7 @@
   import type { Layer } from '$lib/bindings/Layer';
   import type { Rect } from '$lib/bindings/Rect';
   import type { Screen } from '$lib/bindings/Screen';
-  import { boxOf, cueAt, dragRect, engineUrl, fitScale, layoutBounds, mediaOf, screenAt, snapDrag, type DragMode } from '$lib/logic';
+  import { boxOf, clipTime, cueAt, dragRect, fmtTime, engineUrl, fitScale, layoutBounds, mediaOf, screenAt, snapDrag, type DragMode } from '$lib/logic';
   import { addToPvw, editLayer, fail, ui } from '$lib/store.svelte';
 
   let cw = $state(0);
@@ -173,6 +173,14 @@
             onpointerdown={(e) => down(e, s, l, 'move')}
           >
             <span class="tag">{label(l)}</span>
+            {#if l.source.type === 'Media'}
+              {@const t = clipTime(mediaOf(ui.show, l), ui.positions[l.id])}
+              <span class="flags">{l.muted ? '🔇 ' : ''}{t ? { Loop: '⟲', Once: '→', HoldLast: '⇥' }[l.playback] : ''}</span>
+              {#if t && box.h > 28}
+                <span class="time">{fmtTime(t.elapsed)}<span class="rem">−{fmtTime(t.remaining)}</span></span>
+                <span class="bar"><span style:width="{t.fraction * 100}%"></span></span>
+              {/if}
+            {/if}
             <div class="handle" onpointerdown={(e) => down(e, s, l, 'resize')}></div>
           </div>
         {/each}
@@ -296,6 +304,44 @@
     overflow: hidden;
     text-overflow: ellipsis;
     pointer-events: none;
+  }
+  .flags {
+    position: absolute;
+    right: 2px;
+    top: 0;
+    font-size: 10px;
+    color: var(--accent-2);
+    text-shadow: 0 0 2px #000;
+    pointer-events: none;
+  }
+  .time {
+    position: absolute;
+    left: 3px;
+    bottom: 5px;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.55);
+    padding: 0 3px;
+    pointer-events: none;
+  }
+  .rem {
+    margin-left: 5px;
+    color: var(--accent-2);
+  }
+  .bar {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 3px;
+    background: rgba(0, 0, 0, 0.5);
+    pointer-events: none;
+  }
+  .bar span {
+    display: block;
+    height: 100%;
+    background: var(--accent);
   }
   .handle {
     position: absolute;

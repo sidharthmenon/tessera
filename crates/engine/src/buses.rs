@@ -385,13 +385,13 @@ impl<O: Opener> Buses<O> {
                     Some((o, p)) if !o.bus.holds(h) => p,
                     _ => 1.,
                 };
-                push_once(&mut self.gains, h, layer.volume * gain);
+                push_once(&mut self.gains, h, audible(layer) * gain);
             }
         }
         if let Some((o, p)) = fade {
             for layer in o.screens.iter().filter_map(|s| o.bus.scene.get(s)).flatten().filter(|l| l.visible) {
                 if let Some(h) = o.bus.players.get(&layer.id) {
-                    push_once(&mut self.gains, h, layer.volume * (1. - p));
+                    push_once(&mut self.gains, h, audible(layer) * (1. - p));
                 }
             }
         }
@@ -436,6 +436,11 @@ impl<O: Opener> Buses<O> {
 }
 
 /// Adds `h` unless it's in already (a player shared by two layers counts once).
+/// A layer's volume, or 0 while it is muted.
+fn audible(layer: &Layer) -> f32 {
+    if layer.muted { 0. } else { layer.volume }
+}
+
 fn push_once<M>(gains: &mut Vec<(Handle<M>, f32)>, h: &Handle<M>, gain: f32) {
     if !gains.iter().any(|(g, _)| Arc::ptr_eq(g, h)) {
         gains.push((h.clone(), gain));
@@ -1075,8 +1080,8 @@ mod tests {
         let [a, s, m1, m2, m3, m4, m5] = ids();
         let t0 = Instant::now();
         let mut b = buses();
-        let (shared, mut out, kept) = (clip(m1), clip(m2), clip(m4));
-        out.volume = 0.8;
+        let (shared, mut out, mut kept) = (clip(m1), clip(m2), clip(m4));
+        (out.volume, kept.muted) = (0.8, true);
         b.set_program(Scene::from([(a, vec![shared.clone(), out.clone()]), (s, vec![kept.clone()])]), t0);
         let (mut shared2, mut inc, mut hidden) = (clip(m1), clip(m3), clip(m5));
         (shared2.volume, inc.volume, hidden.visible) = (0.9, 0.5, false);
@@ -1090,7 +1095,7 @@ mod tests {
         assert_eq!(gain(&b, &pgm(&b, &shared2)), [0.9], "shared: once, at full (incoming) volume");
         assert_eq!(gain(&b, &pgm(&b, &inc)), [0.5 * 0.25], "incoming only: × p");
         assert_eq!(gain(&b, &out_player), [0.8 * 0.75], "outgoing only: × (1 − p)");
-        assert_eq!(gain(&b, &pgm(&b, &kept)), [1.], "unchanged screen");
+        assert_eq!(gain(&b, &pgm(&b, &kept)), [0.], "unchanged screen, muted layer: silent but listed (drains)");
         assert_eq!(gain(&b, &pgm(&b, &hidden)), [0.], "invisible: muted");
         assert_eq!(b.gains.len(), 5);
         // The test's clones would keep it in the pool (`audio_taps` drains `gains` at once).

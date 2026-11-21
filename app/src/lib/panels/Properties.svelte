@@ -6,7 +6,11 @@
   import { editLayer, moveLayer, setTransition, ui } from '$lib/store.svelte';
 
   const kinds: TransitionKind[] = ['Cut', 'Fade', 'WipeLeft', 'WipeRight'];
-  const playbacks: Playback[] = ['Loop', 'Once', 'HoldLast'];
+  const endModes: [Playback, string][] = [
+    ['Loop', 'Loop'],
+    ['Once', 'Play once, then clear'],
+    ['HoldLast', 'Stop on last frame'],
+  ];
 
   const scene = $derived(ui.busScene);
   const t = $derived(ui.live.transition);
@@ -93,6 +97,9 @@
               <!-- Listed top first: the first row is the top layer. -->
               <button class="icon" title="Move up (in front)" disabled={i === 0} onclick={() => moveLayer({ screenId: s.id, layerId: l.id }, 1)}>▲</button>
               <button class="icon" title="Move down (behind)" disabled={i === scene[s.id].length - 1} onclick={() => moveLayer({ screenId: s.id, layerId: l.id }, -1)}>▼</button>
+              {#if l.source.type === 'Media'}
+                <button class="icon" title={l.muted ? 'Unmute' : 'Mute'} onclick={() => editLayer({ screenId: s.id, layerId: l.id }, (x) => ({ ...x, muted: !x.muted }))}>{l.muted ? '🔇' : '🔈'}</button>
+              {/if}
               <button
                 class="icon"
                 title={l.visible ? 'Hide' : 'Show'}
@@ -119,6 +126,30 @@
             <span class="src">{layer.source.pattern.type} pattern</span>
           {/if}
         </div>
+        {#if ui.selected}
+          {@const sel = ui.selected}
+          {@const at = (scene[sel.screenId] ?? []).findIndex((l) => l.id === sel.layerId)}
+          {@const top = (scene[sel.screenId] ?? []).length - 1}
+          <div class="row">
+            <span>Order</span>
+            <span class="order">
+              <button class="icon" title="To the top" disabled={at === top} onclick={() => moveLayer(sel, Infinity)}>⤒</button>
+              <button class="icon" title="Up one" disabled={at === top} onclick={() => moveLayer(sel, 1)}>▲</button>
+              <button class="icon" title="Down one" disabled={at === 0} onclick={() => moveLayer(sel, -1)}>▼</button>
+              <button class="icon" title="To the bottom" disabled={at === 0} onclick={() => moveLayer(sel, -Infinity)}>⤓</button>
+            </span>
+          </div>
+        {/if}
+        {#if layer.source.type === 'Media'}
+          <label class="row">
+            <span>End mode</span>
+            <select value={layer.playback} onchange={(e) => set({ playback: e.currentTarget.value as Playback })}>
+              {#each endModes as [p, label] (p)}<option value={p}>{label}</option>{/each}
+            </select>
+          </label>
+          {@render slider('Volume', layer.volume, 0, 1, (volume) => ({ volume }))}
+          <label class="row"><span>Mute</span><input type="checkbox" checked={layer.muted} onchange={(e) => set({ muted: e.currentTarget.checked })} /></label>
+        {/if}
         <div class="grid">
           {@render field('X', layer.rect.x, (x) => ({ rect: { ...layer.rect, x } }))}
           {@render field('Y', layer.rect.y, (y) => ({ rect: { ...layer.rect, y } }))}
@@ -132,18 +163,6 @@
         {@render slider('Brightness', layer.brightness, -1, 1, (brightness) => ({ brightness }))}
         {@render slider('Contrast', layer.contrast, 0, 2, (contrast) => ({ contrast }))}
         {@render slider('Saturation', layer.saturation, 0, 2, (saturation) => ({ saturation }))}
-        {#if layer.source.type === 'Media'}
-          {@render slider('Volume', layer.volume, 0, 1, (volume) => ({ volume }))}
-          <label class="row">
-            <span>Playback</span>
-            <select
-              value={layer.playback}
-              onchange={(e) => set({ playback: e.currentTarget.value as Playback })}
-            >
-              {#each playbacks as p (p)}<option value={p}>{p}</option>{/each}
-            </select>
-          </label>
-        {/if}
         <label class="row"><span>Visible</span><input
             type="checkbox"
             checked={layer.visible}
@@ -240,5 +259,9 @@
   }
   .icon {
     padding: 2px 6px;
+  }
+  .order {
+    display: flex;
+    gap: 3px;
   }
 </style>
