@@ -188,6 +188,13 @@ by itself. Video only for now.
   and everything else works. Video only (BGRA with alpha, or opaque BGRX). NDI® is a registered
   trademark of Vizrt NDI AB.
 
+## External control (Companion)
+
+Status bar → **Remote** turns on an HTTP + WebSocket API on the network (port 7410, with an access
+key), for Bitfocus Companion or any script. Off by default. Reference:
+[`docs/external-control.md`](docs/external-control.md). Companion module:
+[`../companion-module-tessera`](../companion-module-tessera/README.md).
+
 ## Keyboard
 
 Keys work when no field or button has focus (Esc leaves a field).
