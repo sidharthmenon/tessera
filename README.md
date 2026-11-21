@@ -185,6 +185,21 @@ by itself. Video only for now.
   and everything else works. Video only (BGRA with alpha, or opaque BGRX). NDI® is a registered
   trademark of Vizrt NDI AB.
 
+## Keyboard
+
+Keys work when no field or button has focus (Esc leaves a field).
+
+| Key | Does |
+|---|---|
+| Space, ⌘/Ctrl+Enter | GO: Preview to Program |
+| → | Load the next cue into Preview (when no layer is selected) |
+| A–Z, 0–9, F1–F12 | A cue's shortcut: load it into Preview (right-click a cue → Shortcut…) |
+| Arrows | Nudge the selected Preview layer 1 px (Shift: 10 px) |
+| `[` / `]` | Move the selected Preview layer down / up its stack (⌘/Ctrl: to the bottom / top) |
+| Esc | Deselect the layer |
+| ⌘/Ctrl+Z, ⇧⌘/Ctrl+Z | Undo, redo |
+| ⌘/Ctrl+S, ⇧⌘/Ctrl+S | Save, Save As |
+
 ## Known limits
 
 - **Zero-copy decode.** Decoded frames are copied to the GPU. The spike

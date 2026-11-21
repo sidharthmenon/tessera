@@ -1,8 +1,8 @@
 <script lang="ts">
   import '../app.css';
   import { onMount } from 'svelte';
-  import { cueKey, hotkey, ownsKeys, type Hotkey } from '$lib/logic';
-  import { clickSlot, init, loadNext, redo, saveShow, take, ui, undo } from '$lib/store.svelte';
+  import { cueKey, hotkey, layerKey, ownsKeys, type Hotkey } from '$lib/logic';
+  import { clickSlot, editLayer, init, loadNext, moveLayer, redo, saveShow, take, ui, undo } from '$lib/store.svelte';
   import Prompt from '$lib/Prompt.svelte';
   import Canvas from '$lib/panels/Canvas.svelte';
   import CueGrid from '$lib/panels/CueGrid.svelte';
@@ -35,11 +35,29 @@
       return; // R40: never GO from a focused control
     }
     if (ui.modal) return;
+    if (layerKeys(e)) return;
+    if (e.key === 'Escape' && ui.selected) return void (ui.selected = null); // → is "next cue" again
     const key = hotkey(e);
     if (!key) return cueShortcut(e);
     e.preventDefault(); // also keeps Space from clicking a focused button
     if (e.repeat && key !== 'undo' && key !== 'redo') return; // a held Space is one GO
     actions[key]();
+  }
+
+  /** With a layer selected on the Preview tab: arrows nudge it, brackets restack it. True if the
+   *  key was one of those (it then does nothing else, so → doesn't also load the next cue). */
+  function layerKeys(e: KeyboardEvent): boolean {
+    const sel = ui.selected;
+    const k = ui.canvasTab === 'pvw' && sel && ui.layer ? layerKey(e) : null;
+    if (!k || !sel) return false;
+    e.preventDefault();
+    if ('nudge' in k) {
+      const [dx, dy] = k.nudge;
+      editLayer(sel, (l) => ({ ...l, rect: { ...l.rect, x: l.rect.x + dx, y: l.rect.y + dy } })); // held: repeats
+    } else if (!e.repeat) {
+      moveLayer(sel, k.order);
+    }
+    return true;
   }
 
   /** A cue's shortcut (active group) loads it into Preview, as a click on its tile does. */

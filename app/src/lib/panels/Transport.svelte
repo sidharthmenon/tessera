@@ -66,7 +66,7 @@
       <span><span class="badge live">PGM</span> {pgmCue ? `${pgmCue.slot + 1} · ${pgmCue.name}` : Object.keys(ui.live.program).length ? 'live' : '—'}</span>
     </div>
     <button onclick={() => loadNext()} title="Load the next cue into Preview (→)">Next ▸</button>
-    <button class="primary big" disabled={pvwEmpty} onclick={() => take()} title="Take Preview to Program (Space)">GO</button>
+    <button class="primary big" disabled={pvwEmpty} onclick={() => take()} title="Take Preview to Program (Space, or ⌘/Ctrl+Enter)">GO</button>
   </div>
 </section>
 

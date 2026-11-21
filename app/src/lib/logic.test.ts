@@ -101,6 +101,14 @@ const k = (key: string, m: Partial<{ metaKey: boolean; ctrlKey: boolean; shiftKe
 eq([k(' ', { code: 'Space' }), k('ArrowRight'), k('z', { metaKey: true }), k('Z', { metaKey: true, shiftKey: true }), k('s', { ctrlKey: true }), k('S', { metaKey: true, shiftKey: true })],
   ['take', 'next', 'undo', 'redo', 'save', 'saveAs'], 'hotkeys');
 eq([k('z'), k(' ', { shiftKey: true }), k('ArrowRight', { metaKey: true }), k('z', { metaKey: true, altKey: true })], [null, null, null, null], 'not hotkeys');
+eq([k('Enter', { metaKey: true }), k('Enter', { ctrlKey: true }), k('Enter'), k('Enter', { metaKey: true, shiftKey: true })], ['take', 'take', null, null], '⌘/Ctrl+Enter is GO, Enter alone is not');
+{
+  const lk = (key: string, m: Partial<{ metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; code: string }> = {}) =>
+    L.layerKey({ key, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, ...m });
+  eq([lk('ArrowLeft'), lk('ArrowRight'), lk('ArrowUp'), lk('ArrowDown', { shiftKey: true })], [{ nudge: [-1, 0] }, { nudge: [1, 0] }, { nudge: [0, -1] }, { nudge: [0, 10] }], 'arrows nudge, Shift by 10');
+  eq([lk('[', { code: 'BracketLeft' }), lk(']', { code: 'BracketRight' }), lk('[', { metaKey: true }), lk('ü', { code: 'BracketLeft' })], [{ order: -1 }, { order: 1 }, { order: -Infinity }, { order: -1 }], 'brackets: down/up, ⌘ to the end, any layout');
+  eq([lk('ArrowLeft', { metaKey: true }), lk('ArrowLeft', { altKey: true }), lk('a'), lk(' ')], [null, null, null, null], 'not layer keys');
+}
 // R40: any focused control keeps the keys (Space must never both work it and GO).
 const el = (tagName: string, role: string | null = null, isContentEditable = false) => ({ tagName, isContentEditable, getAttribute: (n: string) => (n === 'role' ? role : null) });
 eq(

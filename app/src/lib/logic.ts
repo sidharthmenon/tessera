@@ -295,6 +295,22 @@ export function hotkey(e: KeyLike): Hotkey | null {
   const k = e.key.toLowerCase();
   if (k === 'z') return e.shiftKey ? 'redo' : 'undo';
   if (k === 's') return e.shiftKey ? 'saveAs' : 'save';
+  if (k === 'enter' && !e.shiftKey) return 'take';
+  return null;
+}
+
+/** Keys that work on the selected Preview layer: arrows nudge it (1 px, 10 with Shift); `[` / `]`
+ *  move it down / up its screen's stack (with ⌘/Ctrl: to the bottom / top). By physical key, so
+ *  the brackets work on any keyboard layout. */
+export function layerKey(e: KeyLike): { nudge: [number, number] } | { order: number } | null {
+  if (e.altKey) return null;
+  const mod = e.metaKey || e.ctrlKey;
+  const step = e.shiftKey ? 10 : 1;
+  const nudge: Record<string, [number, number]> = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
+  if (!mod && e.key in nudge) return { nudge: nudge[e.key] };
+  if (e.shiftKey) return null;
+  if (e.code === 'BracketLeft' || e.key === '[') return { order: mod ? -Infinity : -1 };
+  if (e.code === 'BracketRight' || e.key === ']') return { order: mod ? Infinity : 1 };
   return null;
 }
 
