@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{self, Sender, SyncSender};
+use std::sync::mpsc::{Sender, SyncSender};
 use std::time::{Duration, Instant};
 
 use tessera_show::{Bus, EngineConfig, FromEngine, Layer, Mapping, Output, OutputState, Pattern, Rect, Screen, Source, ToEngine};
@@ -15,7 +15,7 @@ use crate::buses::{Buses, FileOpener};
 use crate::compositor::{Compositor, ScreenSlot};
 use crate::frame_clock::FrameClock;
 use crate::gpu::{Gpu, Readback};
-use crate::net::Previews;
+use crate::net::{Previews, RgbaFrame};
 use crate::outputs::{Outputs, monitors};
 
 const MONITOR_POLL: Duration = Duration::from_secs(2);
@@ -89,8 +89,8 @@ pub struct App {
     previews: Arc<Previews>,
     /// Indexed by `Bus as usize`.
     captures: [Capture; 2],
-    /// To the JPEG thread: (bus, width, height, RGBA).
-    encoder: SyncSender<(Bus, u32, u32, Vec<u8>)>,
+    /// To each bus's JPEG thread (indexed by `Bus as usize`): (width, height, RGBA).
+    encoders: [SyncSender<RgbaFrame>; 2],
     /// `None`: no usable output device, the engine runs silent.
     mixer: Option<Mixer>,
     // Per-frame scratch, reused so the render path doesn't allocate.
@@ -125,15 +125,7 @@ impl App {
                 None
             }
         };
-        let (encoder, frames) = mpsc::sync_channel::<(Bus, u32, u32, Vec<u8>)>(2);
-        let jpegs = previews.clone();
-        std::thread::Builder::new().name("preview jpeg".into()).spawn(move || {
-            for (bus, width, height, rgba) in frames {
-                if let Err(e) = jpegs.publish_rgba(bus, width, height, rgba) {
-                    log!("preview {bus:?}: {e:#}");
-                }
-            }
-        })?;
+        let encoders = previews.spawn_encoders()?;
         let now = Instant::now();
         Ok(App {
             compositor: Compositor::new(&gpu),
@@ -154,7 +146,7 @@ impl App {
             next_positions: now,
             previews,
             captures: [(); 2].map(|()| Capture { pending: None, next: now }),
-            encoder,
+            encoders,
             mixer,
             views: HashMap::new(),
             mappings: vec![],
@@ -274,7 +266,7 @@ impl App {
                     None => continue,
                     Some(Ok(rgba)) => {
                         let (width, height) = readback.size();
-                        let _ = self.encoder.try_send((bus, width, height, rgba)); // JPEG thread busy: skip it
+                        let _ = self.encoders[bus as usize].try_send((width, height, rgba)); // its JPEG thread busy: skip it
                     }
                     Some(Err(e)) => log!("preview {bus:?}: {e:#}"),
                 }

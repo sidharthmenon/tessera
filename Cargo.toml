@@ -1,3 +1,12 @@
 [workspace]
 resolver = "3"
 members = ["crates/show", "crates/engine", "app/src-tauri"]
+
+# Dev builds (`tauri dev` runs a debug engine) optimize the dependencies and the engine, which
+# renders in real time: unoptimized, a preview JPEG took 110 ms to encode (3.8 ms optimized).
+# The engine needs its own entry because generic code (the JPEG encoder) compiles in the caller.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.tessera-engine]
+opt-level = 2

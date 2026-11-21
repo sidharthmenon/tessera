@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use anyhow::{Context, ensure};
 use axum::Router;
@@ -28,6 +28,9 @@ use crate::probe::probe;
 /// Probes decoding at once; the rest wait their turn.
 const PROBES: usize = 2;
 const JPEG_QUALITY: u8 = 70;
+
+/// A preview frame for a JPEG thread: width, height, RGBA (rows tightly packed).
+pub type RgbaFrame = (u32, u32, Vec<u8>);
 
 /// The latest preview JPEG of each bus (indexed by `Bus as usize`). The render loop reads a bus
 /// back only while it is `watched`: the channel's receiver count is the per-bus subscriber count.
@@ -53,6 +56,35 @@ impl Previews {
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, JPEG_QUALITY).encode_image(&image)?;
         self.frames[bus as usize].send_replace(jpeg.into());
         Ok(())
+    }
+
+    /// A JPEG thread per bus (indexed by `Bus as usize`), each taking frames for `publish_rgba`,
+    /// so one bus's slow encode never starves the other. Each holds one frame waiting:
+    /// `try_send` and skip the frame when it is full.
+    pub fn spawn_encoders(self: &Arc<Self>) -> anyhow::Result<[mpsc::SyncSender<RgbaFrame>; 2]> {
+        let spawn = |bus: Bus| -> anyhow::Result<_> {
+            let (tx, frames) = mpsc::sync_channel::<RgbaFrame>(1);
+            let previews = self.clone();
+            std::thread::Builder::new().name(format!("preview jpeg {bus:?}")).spawn(move || {
+                for (width, height, rgba) in frames {
+                    if let Err(e) = previews.publish_rgba(bus, width, height, rgba) {
+                        crate::log!("preview {bus:?}: {e:#}");
+                    }
+                }
+            })?;
+            Ok(tx)
+        };
+        // Placed by `bus as usize`, so the array follows the enum's order, whatever it is.
+        let mut encoders = [None, None];
+        for bus in [Bus::Pgm, Bus::Pvw] {
+            encoders[bus as usize] = Some(spawn(bus)?);
+        }
+        Ok(encoders.map(Option::unwrap))
+    }
+
+    /// `bus`'s latest JPEG (empty before the first).
+    pub fn latest(&self, bus: Bus) -> Bytes {
+        self.frames[bus as usize].borrow().clone()
     }
 }
 
@@ -199,14 +231,19 @@ fn mjpeg(previews: &Previews, bus: Bus) -> Response {
     (headers, Body::from_stream(parts)).into_response()
 }
 
-/// `/thumb/<media id>.jpg` from the thumbnail dir. The name is rebuilt from the parsed UUID, so
-/// nothing outside that dir is reachable.
+/// `/thumb/<media id>.jpg` (or `.png`, for one with transparency) from the thumbnail dir. The name
+/// is rebuilt from the parsed UUID and one of those two extensions, so nothing outside that dir is
+/// reachable.
 async fn thumb(State(s): State<Shared>, UrlPath(file): UrlPath<String>) -> Response {
-    let Some(id) = file.strip_suffix(".jpg").and_then(|id| Uuid::parse_str(id).ok()) else {
-        return (StatusCode::BAD_REQUEST, "expected /thumb/<media id>.jpg").into_response();
+    let typed = [("jpg", "image/jpeg"), ("png", "image/png")].into_iter().find_map(|(ext, mime)| {
+        let id = file.strip_suffix(ext)?.strip_suffix('.')?;
+        Some((Uuid::parse_str(id).ok()?, ext, mime))
+    });
+    let Some((id, ext, mime)) = typed else {
+        return (StatusCode::BAD_REQUEST, "expected /thumb/<media id>.jpg or .png").into_response();
     };
-    match tokio::fs::read(s.thumbs.join(format!("{id}.jpg"))).await {
-        Ok(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
+    match tokio::fs::read(s.thumbs.join(format!("{id}.{ext}"))).await {
+        Ok(body) => ([(header::CONTENT_TYPE, mime)], body).into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }

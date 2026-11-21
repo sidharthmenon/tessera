@@ -7,12 +7,16 @@ import type { Layer } from '$lib/bindings/Layer';
 import type { FromEngine } from '$lib/bindings/FromEngine';
 import type { Show } from '$lib/bindings/Show';
 import type { ShowOp } from '$lib/bindings/ShowOp';
+import type { Transition } from '$lib/bindings/Transition';
 import type { TransportAction } from '$lib/bindings/TransportAction';
 
 // App-crate types, not in the generated bindings: controller.rs `CueRef`/`Live`, engine_client.rs `EngineInfo`.
 export type CueRef = { groupId: string; slot: number };
 /** `program`: what PGM shows, by screen id, with the engine's layer ids (transport targets these). */
-export type Live = { pvw: CueRef | null; lastTaken: CueRef | null; program: { [screenId: string]: Layer[] } };
+/** `pvw`: the cue Preview was last loaded from or stored into. `preview`/`transition`: what PVW
+ *  holds, edited freely (no cue changes); `program`: what PGM shows. Scenes by screen id. */
+export type Live = { pvw: CueRef | null; lastTaken: CueRef | null; program: Scene; preview: Scene; transition: Transition };
+type Scene = { [screenId: string]: Layer[] };
 export type EngineInfo = { port: number; token: string; adopted: boolean; held: boolean };
 
 export const getShow = () => invoke<Show>('get_show');
@@ -22,6 +26,12 @@ export const undo = () => invoke<null>('undo');
 export const redo = () => invoke<null>('redo');
 /** Rejects when the slot is empty. */
 export const loadCue = (groupId: string, slot: number) => invoke<null>('load_cue', { groupId, slot });
+/** An edit of Preview: no cue changes. */
+export const setPreview = (scene: Scene, transition: Transition) => invoke<null>('set_preview', { scene, transition });
+/** Preview into the cue at the slot (made if the slot is empty). */
+export const storePreview = (groupId: string, slot: number) => invoke<null>('store_preview', { groupId, slot });
+/** A live edit of Program. */
+export const setProgram = (scene: Scene) => invoke<null>('set_program', { scene });
 export const take = () => invoke<null>('take');
 export const loadNext = () => invoke<null>('load_next');
 /** `layer: null` = every player on the bus. */

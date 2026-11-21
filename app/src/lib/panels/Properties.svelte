@@ -2,16 +2,16 @@
   import type { Layer } from '$lib/bindings/Layer';
   import type { Playback } from '$lib/bindings/Playback';
   import type { TransitionKind } from '$lib/bindings/TransitionKind';
-  import { hexToRgba, mediaOf, rgbaToHex } from '$lib/logic';
-  import { editCue, editLayer, ui } from '$lib/store.svelte';
+  import { hexToRgba, lockAspect, mediaOf, rgbaToHex } from '$lib/logic';
+  import { editLayer, moveLayer, setTransition, ui } from '$lib/store.svelte';
 
   const kinds: TransitionKind[] = ['Cut', 'Fade', 'WipeLeft', 'WipeRight'];
   const playbacks: Playback[] = ['Loop', 'Once', 'HoldLast'];
 
-  const cue = $derived(ui.editCue);
-  const ref = $derived(ui.editRef);
+  const scene = $derived(ui.busScene);
+  const t = $derived(ui.live.transition);
   const layer = $derived(ui.layer);
-  const screens = $derived((ui.show?.screens ?? []).filter((s) => cue && s.id in cue.layersByScreen));
+  const screens = $derived((ui.show?.screens ?? []).filter((s) => s.id in scene));
   const media = $derived(mediaOf(ui.show, layer));
   const screen = $derived(ui.show?.screens.find((s) => s.id === ui.selected?.screenId));
 
@@ -24,6 +24,13 @@
   async function set(patch: Partial<Layer>) {
     if (ui.selected) await editLayer(ui.selected, (l) => ({ ...l, ...patch }));
   }
+  /** `r` with its width or height set to `v` (at least 1); with Keep aspect on, the other side
+   *  follows so the layer keeps its shape. */
+  function sized(r: Layer['rect'], side: 'w' | 'h', v: number): Layer['rect'] {
+    const next = { ...r, [side]: Math.max(1, v) };
+    return ui.keepAspect ? lockAspect(next, r.w / r.h, side) : next;
+  }
+
   /** Commit a number; afterwards the control shows the layer's actual value again (an on-air
    *  confirm may have been declined). */
   async function setNum(e: Event, f: (v: number) => Partial<Layer>, current: () => number) {
@@ -49,21 +56,14 @@
 <section class="panel props">
   <h2>
     Properties
-    {#if ui.canvasTab === 'pgm'}<span class="badge live">ON AIR</span>{:else if ui.pvwLive}<span class="badge live" title="This cue is on air: layer edits here go to a copy of it in the first free slot">LIVE · layer edits copy</span>{/if}
+    {#if ui.canvasTab === 'pgm'}<span class="badge live">ON AIR</span>{/if}
   </h2>
   <div class="body">
-    {#if cue && ref}
-      <h4>Cue {cue.slot + 1}</h4>
-      <label class="row"><span>Name</span><input value={cue.name} onchange={(e) => editCue(ref, (c) => ({ ...c, name: e.currentTarget.value }))} /></label>
+    {#if ui.canvasTab === 'pvw'}
+      <h4>Preview <span class="muted">· {ui.pvwCue ? `from cue ${ui.pvwCue.slot + 1}${ui.pvwEdited ? ', edited' : ''}` : 'not stored in a cue'}</span></h4>
       <label class="row">
         <span>Transition</span>
-        <select
-          value={cue.transition.kind}
-          onchange={(e) => {
-            const kind = e.currentTarget.value as TransitionKind;
-            editCue(ref, (c) => ({ ...c, transition: { ...c.transition, kind } }));
-          }}
-        >
+        <select value={t.kind} onchange={(e) => setTransition({ ...t, kind: e.currentTarget.value as TransitionKind })}>
           {#each kinds as k (k)}<option value={k}>{k}</option>{/each}
         </select>
       </label>
@@ -73,22 +73,26 @@
           type="number"
           min="0"
           step="50"
-          value={cue.transition.durationMs}
-          disabled={cue.transition.kind === 'Cut'}
+          value={t.durationMs}
+          disabled={t.kind === 'Cut'}
           onchange={(e) => {
             const v = num(e);
-            if (v !== null) editCue(ref, (c) => ({ ...c, transition: { ...c.transition, durationMs: Math.max(0, Math.round(v)) } }));
+            if (v !== null) setTransition({ ...t, durationMs: Math.max(0, Math.round(v)) });
           }}
         />
       </label>
+    {/if}
 
       <h4>Layers</h4>
       {#each screens as s (s.id)}
-        <div class="screen">{s.name}{#if !cue.layersByScreen[s.id].length}<span class="muted"> · black</span>{/if}</div>
+        <div class="screen">{s.name}{#if !scene[s.id].length}<span class="muted"> · black</span>{/if}</div>
         <ul class="layers">
-          {#each cue.layersByScreen[s.id].toReversed() as l (l.id)}
+          {#each scene[s.id].toReversed() as l, i (l.id)}
             <li class:sel={ui.selected?.layerId === l.id}>
               <button class="pick" onclick={() => (ui.selected = { screenId: s.id, layerId: l.id })}>{l.name || l.source.type}</button>
+              <!-- Listed top first: the first row is the top layer. -->
+              <button class="icon" title="Move up (in front)" disabled={i === 0} onclick={() => moveLayer({ screenId: s.id, layerId: l.id }, 1)}>▲</button>
+              <button class="icon" title="Move down (behind)" disabled={i === scene[s.id].length - 1} onclick={() => moveLayer({ screenId: s.id, layerId: l.id }, -1)}>▼</button>
               <button
                 class="icon"
                 title={l.visible ? 'Hide' : 'Show'}
@@ -99,7 +103,7 @@
           {/each}
         </ul>
       {:else}
-        <p class="muted">No layers. Drag media or a pattern onto the canvas.</p>
+        <p class="muted">{ui.canvasTab === 'pvw' ? 'No layers. Drag media or a pattern onto the canvas, or click a cue to load it.' : 'Nothing on air.'}</p>
       {/each}
 
       {#if layer}
@@ -118,8 +122,8 @@
         <div class="grid">
           {@render field('X', layer.rect.x, (x) => ({ rect: { ...layer.rect, x } }))}
           {@render field('Y', layer.rect.y, (y) => ({ rect: { ...layer.rect, y } }))}
-          {@render field('W', layer.rect.w, (w) => ({ rect: { ...layer.rect, w: Math.max(1, w) } }))}
-          {@render field('H', layer.rect.h, (h) => ({ rect: { ...layer.rect, h: Math.max(1, h) } }))}
+          {@render field('W', layer.rect.w, (w) => ({ rect: sized(layer.rect, 'w', w) }))}
+          {@render field('H', layer.rect.h, (h) => ({ rect: sized(layer.rect, 'h', h) }))}
         </div>
         {#if screen}
           <button class="fit" onclick={() => set({ rect: { x: 0, y: 0, w: screen.width, h: screen.height } })}>Fit to {screen.name}</button>
@@ -151,12 +155,6 @@
           /></label
         >
       {/if}
-    {:else}
-      <p class="muted">{ui.canvasTab === 'pvw' ? 'Load a cue into Preview (click a cue), or drag media onto the canvas.' : 'No taken cue to edit.'}</p>
-    {/if}
-    {#if !layer && ui.busLayer}
-      <p class="note">“{ui.busLayer.name || 'layer'}” is on air from an earlier cue: transport reaches it; edit it in its own cue.</p>
-    {/if}
   </div>
 </section>
 
@@ -239,9 +237,6 @@
     text-align: left;
     overflow: hidden;
     text-overflow: ellipsis;
-  }
-  .note {
-    color: var(--warn);
   }
   .icon {
     padding: 2px 6px;

@@ -198,6 +198,12 @@ async fn thumb_rejects_non_uuid() {
     assert_eq!(status(&get(&s, &format!("/thumb/{}.jpg?token={TOKEN}", Uuid::new_v4())).await), 404, "absent");
     let ok = get(&s, &format!("/thumb/{id}.jpg?token={TOKEN}")).await;
     assert_eq!(status(&ok), 200);
+    // A thumbnail with transparency is a PNG.
+    let png_id = Uuid::new_v4();
+    std::fs::write(thumbs.join(format!("{png_id}.png")), b"\x89PNGthumb").unwrap();
+    let png = get(&s, &format!("/thumb/{png_id}.png?token={TOKEN}")).await;
+    assert_eq!(status(&png), 200);
+    assert!(find(&png, b"image/png").is_some() && find(&png, b"\x89PNGthumb").is_some());
     assert!(ok.ends_with(b"\r\n\r\n\xFF\xD8thumb"));
 }
 
@@ -235,6 +241,24 @@ async fn mjpeg_preview_streams_jpeg_parts() {
     }
 }
 
+/// Each bus has its own JPEG thread: a slow PGM encode never holds up PVW. (One queue shared by
+/// both, fed PGM first, dropped every PVW frame once encoding was slower than 15 fps.)
+#[test]
+fn slow_pgm_encode_never_holds_up_pvw() {
+    let previews = Previews::new();
+    let encoders = previews.spawn_encoders().unwrap();
+    let big = 4096;
+    // Indexed by `Bus as usize`, as the render loop does.
+    encoders[Bus::Pgm as usize].send((big, big, vec![128; (big * big * 4) as usize])).unwrap(); // ~0.25 s
+    encoders[Bus::Pvw as usize].send((16, 16, vec![255; 16 * 16 * 4])).unwrap();
+    let deadline = Instant::now() + WAIT;
+    while previews.latest(Bus::Pvw).is_empty() {
+        assert!(Instant::now() < deadline, "PVW never published");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(previews.latest(Bus::Pgm).is_empty(), "PVW waited for PGM's encode");
+}
+
 #[test]
 fn probe_fixture_video() {
     let dir = temp_dir();
@@ -246,10 +270,17 @@ fn probe_fixture_video() {
     assert!(ms.abs_diff(1000) <= 50, "{ms} ms");
     assert_eq!(info.thumb, Some(format!("{id}.jpg")));
     assert_eq!(image::image_dimensions(dir.join(format!("{id}.jpg"))).unwrap(), (160, 160));
-    let prores = probe(&fixture("prores4444_64.mov"), &dir, Uuid::new_v4()).unwrap();
+    let id = Uuid::new_v4();
+    let prores = probe(&fixture("prores4444_64.mov"), &dir, id).unwrap();
     assert!(prores.has_alpha && !prores.has_audio, "ProRes 4444 with alpha, silent");
+    // Its left half is transparent: the thumbnail keeps that, so it's a PNG.
+    assert_eq!(prores.thumb, Some(format!("{id}.png")));
+    let thumb = image::open(dir.join(format!("{id}.png"))).unwrap().into_rgba8();
+    assert!(thumb.get_pixel(8, 80)[3] < 26 && thumb.get_pixel(150, 80)[3] > 229, "alpha kept");
 }
 
+/// A still with transparent pixels has alpha and a PNG thumbnail that keeps it; one with an alpha
+/// channel but every pixel opaque (a common export) has neither: it covers what's beneath.
 #[test]
 fn probe_image() {
     let dir = temp_dir();
@@ -259,7 +290,16 @@ fn probe_image() {
     let info = probe(&png, &dir.join("thumbs"), id).unwrap();
     assert_eq!((info.kind, info.width, info.height, info.duration_ms), (MediaKind::Image, 320, 80, None));
     assert!(info.has_alpha && !info.has_audio);
-    assert_eq!(image::image_dimensions(dir.join("thumbs").join(format!("{id}.jpg"))).unwrap(), (160, 40));
+    assert_eq!(info.thumb, Some(format!("{id}.png")));
+    let thumb = image::open(dir.join("thumbs").join(format!("{id}.png"))).unwrap().into_rgba8();
+    assert_eq!((thumb.dimensions(), thumb.get_pixel(80, 20)[3]), ((160, 40), 128));
+
+    let opaque = dir.join("opaque.png");
+    image::RgbaImage::from_pixel(320, 80, image::Rgba([255, 0, 0, 255])).save(&opaque).unwrap();
+    let id = Uuid::new_v4();
+    let info = probe(&opaque, &dir.join("thumbs"), id).unwrap();
+    assert!(!info.has_alpha, "an alpha channel with nothing transparent");
+    assert_eq!(info.thumb, Some(format!("{id}.jpg")));
 }
 
 #[test]

@@ -2,8 +2,8 @@
 //!
 //! Events to the frontend:
 //! - `show-changed`: the full `Show`, after every show mutation
-//! - `live-changed`: `Live { pvw, lastTaken, program }` (cue refs or null; the PGM scene), after every
-//!   command that may move them
+//! - `live-changed`: `Live { pvw, lastTaken, program, preview, transition }` (cue refs or null; the
+//!   PGM and PVW scenes; PVW's transition), after every command that may move them
 //! - `engine-event`: every `FromEngine`, plus `Error`s about engine restarts
 //! - `engine-info`: `EngineInfo { port, token, adopted, held }` on connect and when a show is
 //!   loaded (which releases the hold), `null` on disconnect
@@ -34,7 +34,7 @@ use engine_client::{Engine, EngineInfo};
 use tauri::menu::{Menu, MenuItem, MenuItemKind};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult};
-use tessera_show::{Bus, FromEngine, Show, ShowOp, ToEngine, TransportAction};
+use tessera_show::{Bus, FromEngine, Scene, Show, ShowOp, ToEngine, Transition, TransportAction};
 use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
@@ -180,6 +180,24 @@ fn redo(app: AppHandle) -> Res<()> {
 #[tauri::command]
 fn load_cue(app: AppHandle, group_id: Uuid, slot: u32) -> Res<()> {
     dispatch(&app, Change::Live, |c| c.load_cue(CueRef { group_id, slot }))
+}
+
+/// An edit of PVW (no cue changes).
+#[tauri::command]
+fn set_preview(app: AppHandle, scene: Scene, transition: Transition) -> Res<()> {
+    dispatch(&app, Change::Live, |c| Ok(c.set_preview(scene, transition)))
+}
+
+/// PVW into the cue at the slot (made if empty).
+#[tauri::command]
+fn store_preview(app: AppHandle, group_id: Uuid, slot: u32) -> Res<()> {
+    dispatch(&app, Change::Edit, |c| c.store_preview(CueRef { group_id, slot }))
+}
+
+/// A live edit of PGM.
+#[tauri::command]
+fn set_program(app: AppHandle, scene: Scene) -> Res<()> {
+    dispatch(&app, Change::Live, |c| Ok(c.set_program(scene)))
 }
 
 #[tauri::command]
@@ -406,7 +424,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            get_show, get_live, apply_op, undo, redo, load_cue, take, load_next, transport, list_monitors,
+            get_show, get_live, apply_op, undo, redo, load_cue, set_preview, store_preview, set_program, take, load_next, transport, list_monitors,
             identify, import_media, new_show, open_show, get_recovery, save_show, engine_info
         ])
         .build(tauri::generate_context!())

@@ -3,7 +3,7 @@
 import { ask, open, save } from '@tauri-apps/plugin-dialog';
 import * as api from './api';
 import type { CueRef, EngineInfo, Live } from './api';
-import { copyScene, cueAt, findLayer, firstEmptySlot, forkCue, forksEdit, isAutosave, losesPicture, newCue, newLayer, onAir, sameRef, withLayer, withScreen } from './logic';
+import { cueAt, findLayer, isAutosave, losesPicture, newLayer, onAir, same, sameRef, shiftLayer, withLayer, withScreen, type Scene } from './logic';
 import type { Cue } from '$lib/bindings/Cue';
 import type { FromEngine } from '$lib/bindings/FromEngine';
 import type { Layer } from '$lib/bindings/Layer';
@@ -13,6 +13,7 @@ import type { Screen } from '$lib/bindings/Screen';
 import type { Show } from '$lib/bindings/Show';
 import type { ShowOp } from '$lib/bindings/ShowOp';
 import type { Source } from '$lib/bindings/Source';
+import type { Transition } from '$lib/bindings/Transition';
 import type { TransportAction } from '$lib/bindings/TransportAction';
 
 export type LayerRef = { screenId: string; layerId: string };
@@ -20,7 +21,7 @@ export type Bus = 'pgm' | 'pvw';
 
 class Store {
   show = $state.raw<Show | null>(null);
-  live = $state.raw<Live>({ pvw: null, lastTaken: null, program: {} });
+  live = $state.raw<Live>({ pvw: null, lastTaken: null, program: {}, preview: {}, transition: { kind: 'Fade', durationMs: 500 } });
   engine = $state.raw<EngineInfo | null>(null);
   /** The last "engine restarting: …" message, until the engine is back. */
   restarting = $state('');
@@ -37,6 +38,8 @@ class Store {
 
   activeGroupId = $state<string | null>(null);
   selected = $state<LayerRef | null>(null);
+  /** The screen last clicked on the canvas. */
+  screenId = $state<string | null>(null);
   /** The bus the canvas, properties and transport work on. */
   canvasTab = $state<Bus>('pvw');
   /** While set, show hotkeys are off. */
@@ -46,18 +49,20 @@ class Store {
   dragging = $state.raw<{ source: Source; name: string } | null>(null);
 
   group = $derived(this.show?.groups.find((g) => g.id === this.activeGroupId) ?? this.show?.groups[0]);
-  /** The cue on the canvas bus: PVW's cue, or the last taken one for PGM. */
-  editRef = $derived(this.canvasTab === 'pvw' ? this.live.pvw : this.live.lastTaken);
-  editCue = $derived(cueAt(this.show, this.editRef));
-  /** The selected layer if it is in `editCue` (editable). */
-  layer = $derived(this.selected && this.editCue ? findLayer(this.editCue.layersByScreen, this.selected.screenId, this.selected.layerId) : undefined);
-  /** What the canvas bus shows. On PGM that is more than the last taken cue: screens it doesn't
-   *  define keep earlier cues' layers, which transport must reach too (R41). */
-  busScene = $derived(this.canvasTab === 'pvw' ? (this.editCue?.layersByScreen ?? {}) : this.live.program);
-  /** The selected layer as the bus has it (transport's target). */
-  busLayer = $derived(this.selected ? findLayer(this.busScene, this.selected.screenId, this.selected.layerId) : undefined);
-  /** After a Take the same cue stays in PVW. Edits from the Preview tab then go to a copy (R44). */
+  /** Where "+ PVW" adds: the selected layer's screen, else the one clicked, else the first. */
+  targetScreen = $derived(this.show?.screens.find((s) => s.id === (this.selected?.screenId ?? this.screenId)) ?? this.show?.screens[0]);
+  /** What the canvas bus shows, edited directly: Preview's working scene (no cue changes until it
+   *  is stored into one), or Program (screens the last Take didn't define keep earlier layers: R41). */
+  busScene = $derived(this.canvasTab === 'pvw' ? this.live.preview : this.live.program);
+  /** The selected layer as the canvas bus has it. */
+  layer = $derived(this.selected ? findLayer(this.busScene, this.selected.screenId, this.selected.layerId) : undefined);
+  /** The cue Preview came from, and whether Preview has changed since it was loaded or stored. */
+  pvwCue = $derived(cueAt(this.show, this.live.pvw));
+  pvwEdited = $derived(!!this.pvwCue && !(same(this.pvwCue.layersByScreen, this.live.preview) && same(this.pvwCue.transition, this.live.transition)));
+  /** After a Take PVW still holds what went to air: those clips are Program's (transport them there). */
   pvwLive = $derived(sameRef(this.live.pvw, this.live.lastTaken));
+  /** Resizing on the canvas keeps a layer's shape (Shift while dragging does the other). */
+  keepAspect = $state(true);
   status = $derived<'connected' | 'held' | 'restarting' | 'connecting'>(
     this.engine ? (this.engine.held ? 'held' : 'connected') : this.restarting ? 'restarting' : 'connecting',
   );
@@ -238,84 +243,50 @@ export function applyOps(ops: ShowOp[]): Promise<string> {
 }
 const setCue = (ref: CueRef, cue: Cue) => api.applyOp({ op: 'SetCue', groupId: ref.groupId, cue });
 
-/** Store `next`, an edit of the PVW cue at `ref`. While that cue is on air (R44) the edit goes to a
- *  copy in its group's first empty slot instead, which is loaded into PVW; the on-air cue and
- *  Program stay as they are. Returns the copy's layer ids (old → new), or null if not copied. */
-async function setPvwCue(ref: CueRef, next: Cue): Promise<Record<string, string> | null> {
-  if (!forksEdit('pvw', ui.live)) {
-    await setCue(ref, next);
-    return null;
-  }
-  const group = ui.show?.groups.find((g) => g.id === ref.groupId);
-  if (!group) throw new Error('The on-air cue’s group is gone: nothing changed');
-  const { cue, ids } = forkCue(group, next);
-  await setCue({ groupId: group.id, slot: cue.slot }, cue);
-  await api.loadCue(group.id, cue.slot);
-  toast(`Copied to slot ${cue.slot + 1} — on-air cue unchanged`);
-  return ids;
-}
-
-/** Add a full-screen layer to the PVW cue (on `screen`, else the selected layer's, else the first).
- *  With nothing in PVW, a new cue in the active group's first free slot is created and loaded. */
+/** Add a full-screen layer to Preview (on `screen`, else the selected layer's, else the first). */
 export const addToPvw = action(async (source: Source, name: string, screen?: Screen) => {
-  const show = ui.show;
-  if (!show) return;
-  screen ??= show.screens.find((s) => s.id === ui.selected?.screenId) ?? show.screens[0];
+  screen ??= ui.targetScreen;
   if (!screen) throw new Error('No screens yet: add one in Screen Management');
   const layer = newLayer(source, screen, name);
-  const add = (c: Cue) => withScreen(c, screen.id, [...(c.layersByScreen[screen.id] ?? []), layer]);
-  const ref = ui.live.pvw;
-  const cue = cueAt(show, ref);
-  let ids: Record<string, string> | null = null;
-  if (cue && ref) {
-    ids = await setPvwCue(ref, add(cue));
-  } else {
-    const group = ui.group;
-    if (!group) return;
-    const slot = firstEmptySlot(group);
-    await setCue({ groupId: group.id, slot }, add(newCue(slot)));
-    await api.loadCue(group.id, slot);
-  }
+  const scene = ui.live.preview;
+  await api.setPreview(withScreen(scene, screen.id, [...(scene[screen.id] ?? []), layer]), ui.live.transition);
   ui.canvasTab = 'pvw';
-  ui.selected = { screenId: screen.id, layerId: ids?.[layer.id] ?? layer.id };
+  ui.selected = { screenId: screen.id, layerId: layer.id };
 });
 
-/** Change (or with null, remove) a layer of the cue on the canvas bus. From the Preview tab an edit
- *  to the on-air cue goes to a copy (R44). From the Program tab it changes Program at once, so
- *  taking picture away (or restarting a clip) asks first. */
-export const editLayer = action(async (sel: LayerRef, f: (l: Layer) => Layer | null) => {
-  const ref = ui.editRef;
-  const cue = ui.editCue;
-  const next = cue && withLayer(cue, sel.screenId, sel.layerId, f);
-  if (!ref || !cue || !next || next === cue) return;
-  if (ui.canvasTab === 'pvw') {
-    const ids = await setPvwCue(ref, next);
-    const s = ui.selected;
-    if (ids && s) ui.selected = { screenId: s.screenId, layerId: ids[s.layerId] ?? s.layerId };
-    return;
-  }
+/** Change (or with null, remove) a layer on the canvas bus: Preview (no cue changes), or Program,
+ *  which goes to air at once, so taking picture away (or restarting a clip) asks first. */
+export const editLayer = action((sel: LayerRef, f: (l: Layer) => Layer | null) => editBus((sc) => withLayer(sc, sel.screenId, sel.layerId, f)));
+
+/** Move a layer one place up (towards the top) or down its screen's stack, as `editLayer` edits. */
+export const moveLayer = action((sel: LayerRef, by: 1 | -1) => editBus((sc) => shiftLayer(sc, sel.screenId, sel.layerId, by)));
+
+async function editBus(f: (sc: Scene) => Scene) {
+  const scene = ui.busScene;
+  const next = f(scene);
+  if (next === scene) return;
+  if (ui.canvasTab === 'pvw') return api.setPreview(next, ui.live.transition);
   // An adopted engine never gets SetProgram: the edit reaches air on the next GO, not now.
-  if (sameRef(ref, ui.live.lastTaken) && !ui.engine?.adopted && losesPicture(cue, next)) {
-    const name = findLayer(cue.layersByScreen, sel.screenId, sel.layerId)?.name || 'this layer';
-    const yes = await confirmAsk(`Cue ${cue.slot + 1} “${cue.name}” is on air. This changes “${name}” on Program now: it disappears, or restarts from its first frame.`, 'Change Program');
+  if (!ui.engine?.adopted && losesPicture(scene, next)) {
+    const yes = await confirmAsk('This changes Program now: a layer disappears, or a clip restarts from its first frame.', 'Change Program');
     if (!yes) return;
   }
-  await setCue(ref, next);
-});
+  await api.setProgram(next);
+}
+
+/** Preview's transition (what GO uses). */
+export const setTransition = action((t: Transition) => api.setPreview(ui.live.preview, t));
 
 export const editCue = action(async (ref: CueRef, f: (c: Cue) => Cue) => {
   const cue = cueAt(ui.show, ref);
   if (cue) await setCue(ref, f(cue));
 });
 
-/** Click on a slot: load its cue, or create one there from the PVW cue's layers (or empty) and load it. */
-export const clickSlot = action(async (ref: CueRef) => {
-  if (!cueAt(ui.show, ref)) {
-    const pvw = cueAt(ui.show, ui.live.pvw);
-    await setCue(ref, newCue(ref.slot, pvw ? copyScene(pvw.layersByScreen) : {}, pvw?.transition));
-  }
-  await api.loadCue(ref.groupId, ref.slot);
-});
+/** Click on a slot: load its cue into Preview, or store Preview into the empty slot. */
+export const clickSlot = action((ref: CueRef) => (cueAt(ui.show, ref) ? api.loadCue(ref.groupId, ref.slot) : api.storePreview(ref.groupId, ref.slot)));
+
+/** Overwrite the cue at `ref` with Preview (its layers and transition). */
+export const updateCue = action((ref: CueRef) => api.storePreview(ref.groupId, ref.slot));
 
 export const fire = action(async (ref: CueRef) => {
   await api.loadCue(ref.groupId, ref.slot);

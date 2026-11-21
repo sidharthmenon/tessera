@@ -6,12 +6,12 @@ import type { Mapping } from './bindings/Mapping';
 import type { MediaItem } from './bindings/MediaItem';
 import type { MonitorInfo } from './bindings/MonitorInfo';
 import type { Output } from './bindings/Output';
+import type { Pattern } from './bindings/Pattern';
 import type { Rect } from './bindings/Rect';
 import type { Screen } from './bindings/Screen';
 import type { Show } from './bindings/Show';
 import type { ShowOp } from './bindings/ShowOp';
 import type { Source } from './bindings/Source';
-import type { Transition } from './bindings/Transition';
 import type { CueRef, EngineInfo, Live } from './api';
 
 export type Scene = Cue['layersByScreen'];
@@ -48,6 +48,56 @@ export function dragRect(r: Rect, dx: number, dy: number, mode: DragMode): Rect 
   return mode === 'move'
     ? { ...r, x: Math.round(r.x + dx), y: Math.round(r.y + dy) }
     : { ...r, w: Math.max(1, Math.round(r.w + dx)), h: Math.max(1, Math.round(r.h + dy)) };
+}
+
+/** `r` with its dragged edges pulled onto the nearest line within `tol`: x edges onto `xs`, y edges
+ *  onto `ys`. Moving pulls whichever edge is closer; resizing (bottom-right corner) its right and
+ *  bottom edges. */
+export function snapRect(r: Rect, mode: DragMode, xs: number[], ys: number[], tol: number): Rect {
+  const pull = (edges: number[], lines: number[]) => {
+    let d = Infinity;
+    for (const e of edges) for (const l of lines) if (Math.abs(l - e) < Math.abs(d)) d = l - e;
+    return Math.abs(d) <= tol ? d : 0;
+  };
+  return mode === 'move'
+    ? { ...r, x: r.x + pull([r.x, r.x + r.w], xs), y: r.y + pull([r.y, r.y + r.h], ys) }
+    : { ...r, w: Math.max(1, r.w + pull([r.x + r.w], xs)), h: Math.max(1, r.h + pull([r.y + r.h], ys)) };
+}
+
+/** `r` at aspect `a` (w/h), its top-left kept: sized by its width, its height, or by default
+ *  whichever makes it larger. */
+export function lockAspect(r: Rect, a: number, by: 'w' | 'h' = r.w / r.h > a ? 'w' : 'h'): Rect {
+  return by === 'w' ? { ...r, h: Math.max(1, Math.round(r.w / a)) } : { ...r, w: Math.max(1, Math.round(r.h * a)) };
+}
+
+/** The largest rect at aspect `a` inside a `w`×`h` frame, centred. */
+export function fitInto(a: number, w: number, h: number): Rect {
+  if (w / h > a) {
+    const fw = Math.round(h * a);
+    return { x: Math.round((w - fw) / 2), y: 0, w: fw, h };
+  }
+  const fh = Math.round(w / a);
+  return { x: 0, y: Math.round((h - fh) / 2), w, h: fh };
+}
+
+/** A drag's rect snapped (`snapToEdges`) and, when resizing with `aspect` (w/h) given, kept at that
+ *  shape: the shaped rect snaps, then is re-shaped from whichever side snapped. */
+export function snapDrag(r: Rect, mode: DragMode, others: Rect[], w: number, h: number, scale: number, aspect?: number): Rect {
+  if (!aspect || mode === 'move') return snapToEdges(r, mode, others, w, h, scale);
+  const locked = lockAspect(r, aspect);
+  const snapped = snapToEdges(locked, mode, others, w, h, scale);
+  return lockAspect(snapped, aspect, snapped.w === locked.w && snapped.h !== locked.h ? 'h' : 'w');
+}
+
+/** Within this many display pixels, a dragged edge snaps. */
+const SNAP_PX = 8;
+
+/** `r`, dragged on an editor drawn at `scale` display pixels per unit, snapped to the frame's edges
+ *  (0..`w`, 0..`h`: a screen, an output) and to `others`' edges. */
+export function snapToEdges(r: Rect, mode: DragMode, others: Rect[], w: number, h: number, scale: number): Rect {
+  const xs = [0, w, ...others.flatMap((o) => [o.x, o.x + o.w])];
+  const ys = [0, h, ...others.flatMap((o) => [o.y, o.y + o.h])];
+  return snapRect(r, mode, xs, ys, SNAP_PX / scale);
 }
 
 export const sameRef = (a: CueRef | null, b: CueRef | null) => !!a && !!b && a.groupId === b.groupId && a.slot === b.slot;
@@ -88,29 +138,32 @@ export function newLayer(source: Source, screen: Screen, name: string): Layer {
   };
 }
 
-export function newCue(slot: number, layersByScreen: Scene = {}, transition: Transition = { kind: 'Fade', durationMs: 500 }): Cue {
-  return { id: uuid(), name: `Cue ${slot + 1}`, slot, layersByScreen, transition: { ...transition } };
-}
-
-/** A copy of `scene` with fresh layer ids (as `DuplicateCue` does), so no two cues share a layer. */
-export function copyScene(scene: Scene): Scene {
-  return Object.fromEntries(Object.entries(scene).map(([s, ls]) => [s, ls.map((l) => ({ ...l, id: uuid() }))]));
-}
-
-/** `cue` with `layers` on screen `screenId` (`null` drops the screen: the cue no longer touches it). */
-export function withScreen(cue: Cue, screenId: string, layers: Layer[] | null): Cue {
-  const { [screenId]: _, ...rest } = cue.layersByScreen;
-  return { ...cue, layersByScreen: layers ? { ...rest, [screenId]: layers } : rest };
+/** `scene` with `layers` on screen `screenId` (`null` drops the screen: the scene no longer touches it). */
+export function withScreen(scene: Scene, screenId: string, layers: Layer[] | null): Scene {
+  const { [screenId]: _, ...rest } = scene;
+  return layers ? { ...rest, [screenId]: layers } : rest;
 }
 
 export const findLayer = (scene: Scene, screenId: string, layerId: string) => scene[screenId]?.find((l) => l.id === layerId);
 
-/** `cue` with one layer replaced by `f(layer)`, or removed when `f` returns null. The same `cue`
- *  when it has no such layer: an edit aimed elsewhere must never black out one of its screens. */
-export function withLayer(cue: Cue, screenId: string, layerId: string, f: (l: Layer) => Layer | null): Cue {
-  const layers = cue.layersByScreen[screenId];
-  if (!layers?.some((l) => l.id === layerId)) return cue;
-  return withScreen(cue, screenId, layers.flatMap((l) => (l.id === layerId ? (f(l) ?? []) : [l])));
+/** `scene` with one layer replaced by `f(layer)`, or removed when `f` returns null. The same
+ *  `scene` when it has no such layer: an edit aimed elsewhere must never black out a screen. */
+export function withLayer(scene: Scene, screenId: string, layerId: string, f: (l: Layer) => Layer | null): Scene {
+  const layers = scene[screenId];
+  if (!layers?.some((l) => l.id === layerId)) return scene;
+  return withScreen(scene, screenId, layers.flatMap((l) => (l.id === layerId ? (f(l) ?? []) : [l])));
+}
+
+/** `scene` with a layer moved one place in its screen's stack (`by` 1: up, towards the top);
+ *  unchanged at either end. */
+export function shiftLayer(scene: Scene, screenId: string, layerId: string, by: 1 | -1): Scene {
+  const layers = scene[screenId] ?? [];
+  const i = layers.findIndex((l) => l.id === layerId);
+  const j = i + by;
+  if (i < 0 || j < 0 || j >= layers.length) return scene;
+  const next = [...layers];
+  [next[i], next[j]] = [next[j], next[i]];
+  return withScreen(scene, screenId, next);
 }
 
 /** The media item a layer plays, if it plays one. */
@@ -122,39 +175,30 @@ export function mediaOf(show: Show | null, layer: Layer | undefined): MediaItem 
 /** Whether `after` shows less than `before`: a layer that was showing is removed, hidden or at
  *  opacity 0, or gets another source or playback mode where a clip is involved (the engine opens a
  *  new player, which blanks until its first frame and starts from the top: M6), or a screen the
- *  cue didn't define becomes explicit black. On the cue that is on air such an edit changes
- *  Program at once (SetProgram), so the UI asks first. A screen dropped from the cue
- *  (`withScreen(…, null)`) loses nothing: Program keeps what it shows there. */
-export function losesPicture(before: Cue, after: Cue): boolean {
-  const shown = (c: Cue, s: string) => (c.layersByScreen[s] ?? []).filter((l) => l.visible && l.opacity > 0);
+ *  scene didn't define becomes explicit black. An edit of Program goes to air at once, so such an
+ *  edit asks first. */
+export function losesPicture(before: Scene, after: Scene): boolean {
+  const shown = (sc: Scene, s: string) => (sc[s] ?? []).filter((l) => l.visible && l.opacity > 0);
   const media = (l: Layer) => l.source.type === 'Media';
   const newPlayer = (a: Layer, b: Layer) => (media(a) || media(b)) && (!same(a.source, b.source) || a.playback !== b.playback);
-  return Object.entries(after.layersByScreen).some(([s, layers]) => {
+  return Object.entries(after).some(([s, layers]) => {
     const now = new Map(shown(after, s).map((l) => [l.id, l]));
     const lost = (l: Layer) => {
       const n = now.get(l.id);
       return !n || newPlayer(l, n);
     };
-    return shown(before, s).some(lost) || (!layers.length && !(s in before.layersByScreen));
+    return shown(before, s).some(lost) || (!layers.length && !(s in before));
   });
-}
-
-/** R44: an edit made from the Preview tab while PVW holds the cue that is on air never goes to air:
- *  it goes to a copy of the cue (`forkCue`) instead. */
-export const forksEdit = (tab: 'pvw' | 'pgm', live: Live) => tab === 'pvw' && sameRef(live.pvw, live.lastTaken);
-
-/** A copy of `cue` for `group`'s first empty slot: fresh cue and layer ids, the same layers on the
- *  same screens and the same transition, so PVW still shares PGM's running players (the engine
- *  matches screen, media and position) and the next Take continues them. `ids`: old → new layer id. */
-export function forkCue(group: Group, cue: Cue): { cue: Cue; ids: Record<string, string> } {
-  const ids: Record<string, string> = {};
-  const layersByScreen = Object.fromEntries(Object.entries(cue.layersByScreen).map(([s, ls]) => [s, ls.map((l) => ({ ...l, id: (ids[l.id] = uuid()) }))]));
-  return { cue: { ...cue, id: uuid(), slot: firstEmptySlot(group), layersByScreen, transition: { ...cue.transition } }, ids };
 }
 
 /** An autosave, or one kept from an earlier session (`….autosave.prev`, `….autosave.<ms>.prev`):
  *  it opens as untitled work. */
 export const isAutosave = (p: string) => /\.autosave(\.\d+(-\d+)?)?\.prev$|\.autosave$/.test(p);
+
+/** SVG fill for a test pattern in a cue thumbnail: Solid as its colour, the others from the
+ *  `cue-…` paint servers CueGrid defines (approximating the engine's layer.wgsl). */
+export const patternFill = (p: Pattern) =>
+  p.type === 'Solid' ? `rgba(${p.rgba.slice(0, 3).map((c) => Math.round(c * 255)).join(',')},${p.rgba[3]})` : `url(#cue-${p.type.toLowerCase()})`;
 
 /** `http://127.0.0.1:<port><path>?token=…`, or null while the engine is disconnected. */
 export function engineUrl(e: EngineInfo | null, path: string): string | null {

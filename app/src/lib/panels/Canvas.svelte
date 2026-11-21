@@ -2,7 +2,7 @@
   import type { Layer } from '$lib/bindings/Layer';
   import type { Rect } from '$lib/bindings/Rect';
   import type { Screen } from '$lib/bindings/Screen';
-  import { boxOf, dragRect, engineUrl, findLayer, fitScale, layoutBounds, mediaOf, screenAt, type DragMode } from '$lib/logic';
+  import { boxOf, cueAt, dragRect, engineUrl, fitScale, layoutBounds, mediaOf, screenAt, snapDrag, type DragMode } from '$lib/logic';
   import { addToPvw, editLayer, fail, ui } from '$lib/store.svelte';
 
   let cw = $state(0);
@@ -13,39 +13,43 @@
   const bounds = $derived(layoutBounds(screens));
   const scale = $derived(fitScale(bounds, cw - 16, ch - 16));
   const url = $derived(engineUrl(ui.engine, `/preview/${ui.canvasTab}.mjpg`));
-  const cue = $derived(ui.editCue);
+  const pgmCue = $derived(cueAt(ui.show, ui.live.lastTaken));
 
   type Drag = { screenId: string; layerId: string; mode: DragMode; x0: number; y0: number; start: Rect; rect: Rect };
   let drag = $state.raw<Drag | null>(null);
 
-  // Everything the bus shows. On PGM, layers outside the last taken cue (left by earlier cues on
-  // screens it doesn't define) can be selected for transport but not edited here.
+  // Everything the bus shows, all of it editable.
   const boxes = $derived(
     screens.flatMap((s) =>
       (ui.busScene[s.id] ?? []).map((l) => {
         const rect = drag?.layerId === l.id ? drag.rect : l.rect;
-        const editable = !!cue && !!findLayer(cue.layersByScreen, s.id, l.id);
-        return { s, l, editable, box: boxOf(rect, s, bounds, scale) };
+        return { s, l, box: boxOf(rect, s, bounds, scale) };
       }),
     ),
   );
 
   const label = (l: Layer) => l.name || (l.source.type === 'Media' ? (mediaOf(ui.show, l)?.name ?? 'media') : l.source.pattern.type);
 
-  function down(e: PointerEvent, s: Screen, l: Layer, mode: DragMode, editable: boolean) {
+  function down(e: PointerEvent, s: Screen, l: Layer, mode: DragMode) {
     if (e.button !== 0) return;
     e.stopPropagation();
     ui.selected = { screenId: s.id, layerId: l.id };
-    if (!editable) return;
     (e.currentTarget as Element).setPointerCapture(e.pointerId);
     drag = { screenId: s.id, layerId: l.id, mode, x0: e.clientX, y0: e.clientY, start: l.rect, rect: l.rect };
   }
 
+  /** Edges snap to the layer's screen and to the other layers on it. A resize keeps the layer's
+   *  shape while Keep aspect is on; Shift does the other. */
   function move(e: PointerEvent) {
-    if (drag && scale > 0) drag = { ...drag, rect: dragRect(drag.start, (e.clientX - drag.x0) / scale, (e.clientY - drag.y0) / scale, drag.mode) };
+    const s = drag && screens.find((x) => x.id === drag!.screenId);
+    if (!drag || !s || scale <= 0) return;
+    const r = dragRect(drag.start, (e.clientX - drag.x0) / scale, (e.clientY - drag.y0) / scale, drag.mode);
+    const others = (ui.busScene[s.id] ?? []).filter((l) => l.id !== drag!.layerId).map((l) => l.rect);
+    const aspect = ui.keepAspect !== e.shiftKey ? drag.start.w / drag.start.h : undefined;
+    drag = { ...drag, rect: snapDrag(r, drag.mode, others, s.width, s.height, scale, aspect) };
   }
 
-  /** One SetCue per drag, on release. */
+  /** One edit per drag, on release. */
   async function up() {
     const d = drag;
     if (!d) return;
@@ -56,13 +60,36 @@
     if (drag === d) drag = null; // after the edit lands, so the box doesn't jump back meanwhile
   }
 
+  /** The screen under the pointer. */
+  function screenUnder(e: MouseEvent) {
+    if (!stage || scale <= 0) return undefined;
+    const r = stage.getBoundingClientRect();
+    return screenAt(screens, bounds.x + (e.clientX - r.left) / scale, bounds.y + (e.clientY - r.top) / scale);
+  }
+
+  /** The editable layer box under a drag. */
+  function boxUnder(e: DragEvent) {
+    const id = (e.target as Element).closest?.('[data-layer]')?.getAttribute('data-layer');
+    return boxes.find((b) => b.l.id === id);
+  }
+
+  /** Where a drag from Resources would drop: onto a layer, else onto a screen. */
+  let hover = $state<{ screenId?: string; layerId?: string }>({});
+
+  /** Dropped onto a layer, media replaces its source (rect and settings kept); elsewhere it fills
+   *  the screen it lands on as a new layer. */
   function drop(e: DragEvent) {
     e.preventDefault();
     const item = ui.dragging;
     ui.dragging = null;
-    if (!item || !stage || scale <= 0) return;
-    const r = stage.getBoundingClientRect();
-    const screen = screenAt(screens, bounds.x + (e.clientX - r.left) / scale, bounds.y + (e.clientY - r.top) / scale);
+    hover = {};
+    if (!item) return;
+    const b = boxUnder(e);
+    if (b) {
+      ui.selected = { screenId: b.s.id, layerId: b.l.id };
+      return editLayer(ui.selected, (l) => ({ ...l, source: item.source, name: item.name }));
+    }
+    const screen = screenUnder(e);
     if (!screen) return fail('Drop onto a screen');
     addToPvw(item.source, item.name, screen);
   }
@@ -76,11 +103,19 @@
     </div>
     {#if ui.canvasTab === 'pgm'}
       <!-- M2: an adopted engine never gets SetProgram, so its live edits wait for the next GO. -->
-      <span class="badge live">ON AIR</span><span class="note warn">{ui.engine?.adopted ? 'edits to the last taken cue reach air on the next GO' : 'edits to the last taken cue go to air now'}</span>
-    {:else if ui.pvwLive}
-      <span class="badge live">LIVE</span><span class="note">this cue is on air: an edit here goes to a copy in the first free slot</span>
+      <span class="badge live">ON AIR</span><span class="note warn">{ui.engine?.adopted ? 'edits reach air on the next GO' : 'edits go to air now'}</span>
     {/if}
-    <span class="cue">{cue ? `${cue.slot + 1} · ${cue.name}` : ui.canvasTab === 'pvw' ? 'nothing in preview' : 'nothing taken yet'}</span>
+    <label class="aspect" title="Resizing keeps a layer's shape. Hold Shift while dragging for the other."><input type="checkbox" bind:checked={ui.keepAspect} /> Keep aspect</label>
+    {#if ui.canvasTab === 'pgm'}
+      <span class="cue">{pgmCue ? `${pgmCue.slot + 1} · ${pgmCue.name}` : Object.keys(ui.live.program).length ? 'live' : 'nothing taken yet'}</span>
+    {:else if ui.pvwCue}
+      <span class="cue">
+        {ui.pvwCue.slot + 1} · {ui.pvwCue.name}
+        {#if ui.pvwEdited}<span class="edited" title="Preview differs from this cue: right-click a cue → Update with current view, or click an empty slot to store it">· edited</span>{/if}
+      </span>
+    {:else}
+      <span class="cue muted">{Object.keys(ui.live.preview).length ? 'not stored in a cue: click an empty slot to store it' : 'nothing in preview'}</span>
+    {/if}
   </div>
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
@@ -89,10 +124,19 @@
     bind:clientWidth={cw}
     bind:clientHeight={ch}
     ondragover={(e) => {
-      if (ui.dragging) e.preventDefault();
+      if (!ui.dragging) return;
+      e.preventDefault();
+      const b = boxUnder(e);
+      hover = b ? { layerId: b.l.id } : { screenId: screenUnder(e)?.id };
+    }}
+    ondragleave={(e) => {
+      if (!(e.currentTarget as Element).contains(e.relatedTarget as Node | null)) hover = {};
     }}
     ondrop={drop}
-    onpointerdown={() => (ui.selected = null)}
+    onpointerdown={(e) => {
+      ui.selected = null;
+      ui.screenId = screenUnder(e)?.id ?? null;
+    }}
   >
     {#if screens.length}
       <div
@@ -111,25 +155,25 @@
         {/if}
         {#each screens as s (s.id)}
           {@const b = boxOf({ x: 0, y: 0, w: s.width, h: s.height }, s, bounds, scale)}
-          <div class="screen" style:left="{b.x}px" style:top="{b.y}px" style:width="{b.w}px" style:height="{b.h}px">
+          <div class="screen" class:target={screens.length > 1 && ui.targetScreen?.id === s.id} class:hover={!!ui.dragging && hover.screenId === s.id} style:left="{b.x}px" style:top="{b.y}px" style:width="{b.w}px" style:height="{b.h}px">
             <span>{s.name}</span>
           </div>
         {/each}
-        {#each boxes as { s, l, editable, box } (l.id)}
+        {#each boxes as { s, l, box } (l.id)}
           <div
             class="box"
             class:sel={ui.selected?.layerId === l.id}
             class:hidden={!l.visible}
-            class:fixed={!editable}
-            title={editable ? '' : 'On air from an earlier cue: select it for transport; edit it in its own cue'}
+            class:drop={!!ui.dragging && hover.layerId === l.id}
+            data-layer={l.id}
             style:left="{box.x}px"
             style:top="{box.y}px"
             style:width="{box.w}px"
             style:height="{box.h}px"
-            onpointerdown={(e) => down(e, s, l, 'move', editable)}
+            onpointerdown={(e) => down(e, s, l, 'move')}
           >
             <span class="tag">{label(l)}</span>
-            {#if editable}<div class="handle" onpointerdown={(e) => down(e, s, l, 'resize', true)}></div>{/if}
+            <div class="handle" onpointerdown={(e) => down(e, s, l, 'resize')}></div>
           </div>
         {/each}
       </div>
@@ -152,8 +196,19 @@
     color: var(--live);
     font-weight: 600;
   }
-  .cue {
+  .aspect {
     margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 400;
+  }
+  .edited {
+    color: var(--accent);
+  }
+  .cue {
     text-transform: none;
     letter-spacing: 0;
     color: var(--text);
@@ -195,6 +250,13 @@
     outline: 1px dashed rgba(255, 255, 255, 0.25);
     pointer-events: none;
   }
+  .screen.target {
+    outline: 1px solid rgba(255, 138, 31, 0.6);
+  }
+  .screen.hover {
+    outline: 2px solid var(--accent);
+    background: var(--accent-bg);
+  }
   .screen span {
     position: absolute;
     left: 3px;
@@ -211,11 +273,12 @@
     outline-style: dotted;
     opacity: 0.6;
   }
-  .box.fixed {
-    outline-style: dashed;
-    cursor: pointer;
-  }
   .box.sel {
+    outline: 2px solid var(--accent);
+    background: var(--accent-bg);
+    z-index: 1;
+  }
+  .box.drop {
     outline: 2px solid var(--accent);
     background: var(--accent-bg);
     z-index: 1;

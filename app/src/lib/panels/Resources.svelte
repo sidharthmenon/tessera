@@ -35,7 +35,7 @@
 </script>
 
 {#snippet row(source: Source, name: string, sub: string, thumb: string | null, icon: string)}
-  <li draggable="true" ondragstart={(e) => dragStart(e, source, name)} ondragend={() => (ui.dragging = null)} title="Drag onto the canvas">
+  <li draggable="true" ondragstart={(e) => dragStart(e, source, name)} ondragend={() => (ui.dragging = null)} title="Drag onto a screen in the canvas to fill it, or onto a layer to replace it">
     <span class="thumb">
       {#if thumb}<img src={thumb} alt="" draggable="false" />{:else}{icon}{/if}
     </span>
@@ -43,7 +43,7 @@
       <span class="name">{name}</span>
       <span class="sub">{sub}</span>
     </span>
-    <button class="add" onclick={() => addToPvw(source, name)} title="Add full-screen to the PVW cue">+ PVW</button>
+    <button class="add" onclick={() => addToPvw(source, name)} title="Add to the Preview cue, filling the highlighted screen (click a screen on the canvas to pick it)">+ PVW</button>
   </li>
 {/snippet}
 
@@ -111,6 +111,8 @@
     width: 100%;
     height: 100%;
     object-fit: cover;
+    /* A checkerboard shows through where the media is transparent. */
+    background: repeating-conic-gradient(#3a3d42 0 25%, #24262a 0 50%) 0 0 / 8px 8px;
   }
   .text {
     flex: 1;

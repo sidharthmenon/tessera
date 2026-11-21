@@ -4,14 +4,14 @@
   import { loadNext, op, take, transport, ui } from '$lib/store.svelte';
 
   const bus = $derived(ui.canvasTab);
-  /** As the bus has it: on PGM this reaches layers earlier cues left on air too (R41). */
-  const layer = $derived(ui.busLayer);
+  /** As the bus has it: on PGM this reaches layers earlier takes left on air too (R41). */
+  const layer = $derived(ui.layer);
   const media = $derived(mediaOf(ui.show, layer));
   /** A pattern has no player to drive; with nothing selected, transport drives the whole bus. */
   const usable = $derived(!!ui.engine && (!layer || layer.source.type === 'Media'));
   const pos = $derived(layer ? ui.positions[layer.id] : undefined);
-  const pvwCue = $derived(cueAt(ui.show, ui.live.pvw));
   const pgmCue = $derived(cueAt(ui.show, ui.live.lastTaken));
+  const pvwEmpty = $derived(!Object.keys(ui.live.preview).length);
 
   // The slider moves freely; one SetMasterVolume (one undo step) on release.
   let dragVol = $state<number | null>(null);
@@ -62,11 +62,11 @@
 
   <div class="go">
     <div class="cues">
-      <span><span class="badge pvw">PVW</span> {pvwCue ? `${pvwCue.slot + 1} · ${pvwCue.name}` : '—'}</span>
-      <span><span class="badge live">PGM</span> {pgmCue ? `${pgmCue.slot + 1} · ${pgmCue.name}` : '—'}</span>
+      <span><span class="badge pvw">PVW</span> {ui.pvwCue ? `${ui.pvwCue.slot + 1} · ${ui.pvwCue.name}${ui.pvwEdited ? ' · edited' : ''}` : pvwEmpty ? '—' : 'not stored'}</span>
+      <span><span class="badge live">PGM</span> {pgmCue ? `${pgmCue.slot + 1} · ${pgmCue.name}` : Object.keys(ui.live.program).length ? 'live' : '—'}</span>
     </div>
     <button onclick={() => loadNext()} title="Load the next cue into Preview (→)">Next ▸</button>
-    <button class="primary big" disabled={!pvwCue} onclick={() => take()} title="Take Preview to Program (Space)">GO</button>
+    <button class="primary big" disabled={pvwEmpty} onclick={() => take()} title="Take Preview to Program (Space)">GO</button>
   </div>
 </section>
 

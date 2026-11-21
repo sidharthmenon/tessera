@@ -1,8 +1,9 @@
 <!-- Mapping editor: the selected output, scaled to fit, with the screen slices mapped onto it
-     (dst rects). Drag a slice to move it, its corner to resize; the buffer changes on release. -->
+     (dst rects). Drag a slice to move it, its corner to resize; edges snap to the output's and other
+     slices' edges. The buffer changes on release. -->
 <script lang="ts">
   import type { Rect } from '$lib/bindings/Rect';
-  import { dragRect, fitScale, newMapping, type DragMode, type Setup } from '$lib/logic';
+  import { dragRect, fitInto, fitScale, lockAspect, newMapping, snapDrag, type DragMode, type Setup } from '$lib/logic';
   import NumField from './NumField.svelte';
 
   let { buf = $bindable(), outputId, mappingId = $bindable() }: { buf: Setup; outputId: string | null; mappingId: string | null } = $props();
@@ -20,6 +21,13 @@
   const addScreen = $derived(screen(addScreenId) ?? buf.screens[0]);
   const hue = (screenId: string) => (28 + buf.screens.findIndex((s) => s.id === screenId) * 137) % 360;
 
+  /** Resizing a slice keeps its screen region's shape (dst at the src's aspect), so nothing stretches. */
+  let keepAspect = $state(true);
+  const aspect = (id: string) => {
+    const src = buf.mappings.find((m) => m.id === id)?.src;
+    return src && src.w > 0 && src.h > 0 ? src.w / src.h : 1;
+  };
+
   type Drag = { id: string; mode: DragMode; x0: number; y0: number; start: Rect; rect: Rect };
   let drag = $state.raw<Drag | null>(null);
 
@@ -31,7 +39,10 @@
     drag = { id, mode, x0: e.clientX, y0: e.clientY, start: { ...dst }, rect: { ...dst } };
   }
   function move(e: PointerEvent) {
-    if (drag && scale > 0) drag = { ...drag, rect: dragRect(drag.start, (e.clientX - drag.x0) / scale, (e.clientY - drag.y0) / scale, drag.mode) };
+    if (!drag || !out || scale <= 0) return;
+    const r = dragRect(drag.start, (e.clientX - drag.x0) / scale, (e.clientY - drag.y0) / scale, drag.mode);
+    const others = maps.filter((m) => m.id !== drag!.id).map((m) => m.dst);
+    drag = { ...drag, rect: snapDrag(r, drag.mode, others, out.width, out.height, scale, keepAspect ? aspect(drag.id) : undefined) };
   }
   function up() {
     const m = drag && buf.mappings.find((x) => x.id === drag!.id);
@@ -109,8 +120,11 @@
           <span class="grp">Output (dst)</span>
           <NumField label="X" value={map.dst.x} onset={(v) => (map.dst.x = v)} />
           <NumField label="Y" value={map.dst.y} onset={(v) => (map.dst.y = v)} />
-          <NumField label="W" value={map.dst.w} min={1} onset={(v) => (map.dst.w = v)} />
-          <NumField label="H" value={map.dst.h} min={1} onset={(v) => (map.dst.h = v)} />
+          <NumField label="W" value={map.dst.w} min={1} onset={(v) => (map.dst = keepAspect ? lockAspect({ ...map.dst, w: v }, aspect(map.id), 'w') : { ...map.dst, w: v })} />
+          <NumField label="H" value={map.dst.h} min={1} onset={(v) => (map.dst = keepAspect ? lockAspect({ ...map.dst, h: v }, aspect(map.id), 'h') : { ...map.dst, h: v })} />
+          <label class="check" title="Resizing keeps the screen region's shape, so the picture isn't stretched"><input type="checkbox" bind:checked={keepAspect} /> Keep aspect</label>
+          <button title="As large as fits on the output at the screen region's shape, centred" onclick={() => (map.dst = fitInto(aspect(map.id), out.width, out.height))}>Fit</button>
+          <button title="Fill the whole output, stretching if the shapes differ" onclick={() => (map.dst = { x: 0, y: 0, w: out.width, h: out.height })}>Stretch</button>
           <button onclick={removeMapping}>Remove mapping</button>
         {/key}
       {:else}
@@ -157,6 +171,13 @@
   .grp {
     align-self: center;
     margin-left: 6px;
+  }
+  .check {
+    align-self: center;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
   }
   .which {
     align-self: center;

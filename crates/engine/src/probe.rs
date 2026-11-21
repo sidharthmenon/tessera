@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, ensure};
 use ff::ffi;
 use ffmpeg_next as ff;
-use image::RgbImage;
+use image::{DynamicImage, ImageFormat, RgbaImage};
 use tessera_show::{MediaKind, ProbeInfo};
 use uuid::Uuid;
 
@@ -14,42 +14,51 @@ use crate::video_decode::{init, pix_fmt, sws};
 /// Thumbnail width (videos; stills fit in a square this wide); the aspect ratio is kept.
 const THUMB_WIDTH: u32 = 160;
 
-/// What `path` is, and a `THUMB_WIDTH`-wide JPEG thumbnail written to `<thumb_dir>/<media_id>.jpg`
-/// (`thumb` is set when it was). Stills are what the player loads with the `image` crate (by
+/// What `path` is, and a `THUMB_WIDTH`-wide thumbnail written to `<thumb_dir>/<media_id>.jpg`, or
+/// `.png` when it has transparent pixels (a PNG keeps them) (`thumb` is set when it was). Stills are what the player loads with the `image` crate (by
 /// extension); anything else must be a video FFmpeg decodes, thumbnailed at 10 % of its duration.
 /// Blocking (decodes in software): run it off the render thread.
 pub fn probe(path: &Path, thumb_dir: &Path, media_id: Uuid) -> anyhow::Result<ProbeInfo> {
     // ffmpeg-next unwraps the path as a CString.
     ensure!(!path.as_os_str().as_encoded_bytes().contains(&0), "{}: path contains a NUL byte", path.display());
-    let (mut info, thumb) = match image::ImageFormat::from_path(path) {
+    let (mut info, thumb) = match ImageFormat::from_path(path) {
         Ok(format) if format.reading_enabled() => still(path),
         _ => video(path),
     }
     .with_context(|| path.display().to_string())?;
     // The metadata stands without it: the item is still usable, just without a picture.
-    let name = format!("{media_id}.jpg");
-    match save_jpeg(&thumb, thumb_dir, &name) {
+    let transparent = thumb.pixels().any(|p| p[3] < 255);
+    let name = format!("{media_id}.{}", if transparent { "png" } else { "jpg" });
+    match save_thumb(thumb, transparent, thumb_dir, &name) {
         Ok(()) => info.thumb = Some(name),
         Err(e) => log!("probe {}: no thumbnail in {}: {e:#}", path.display(), thumb_dir.display()),
     }
     Ok(info)
 }
 
-fn save_jpeg(image: &RgbImage, dir: &Path, name: &str) -> anyhow::Result<()> {
+fn save_thumb(thumb: RgbaImage, transparent: bool, dir: &Path, name: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
-    Ok(image.save_with_format(dir.join(name), image::ImageFormat::Jpeg)?)
+    let path = dir.join(name);
+    if transparent {
+        thumb.save_with_format(path, ImageFormat::Png)?;
+    } else {
+        DynamicImage::ImageRgba8(thumb).into_rgb8().save_with_format(path, ImageFormat::Jpeg)?;
+    }
+    Ok(())
 }
 
-fn still(path: &Path) -> anyhow::Result<(ProbeInfo, RgbImage)> {
+fn still(path: &Path) -> anyhow::Result<(ProbeInfo, RgbaImage)> {
     let image = image::open(path).context("cannot open")?;
-    let (width, height, has_alpha) = (image.width(), image.height(), image.color().has_alpha());
+    let (width, height) = (image.width(), image.height());
+    // An alpha channel counts only if some pixel uses it: many exports carry one fully opaque.
+    let has_alpha = image.color().has_alpha() && image.to_rgba8().pixels().any(|p| p[3] < 255);
     // Fits in a THUMB_WIDTH square: a very tall image stays small.
-    let thumb = image.thumbnail(THUMB_WIDTH, THUMB_WIDTH).into_rgb8();
+    let thumb = image.thumbnail(THUMB_WIDTH, THUMB_WIDTH).into_rgba8();
     let info = ProbeInfo { kind: MediaKind::Image, width, height, duration_ms: None, has_audio: false, has_alpha, thumb: None };
     Ok((info, thumb))
 }
 
-fn video(path: &Path) -> anyhow::Result<(ProbeInfo, RgbImage)> {
+fn video(path: &Path) -> anyhow::Result<(ProbeInfo, RgbaImage)> {
     init();
     let mut input = ff::format::input(path).context("cannot open")?;
     let stream = input.streams().best(ff::media::Type::Video).context("no video stream")?;
@@ -79,10 +88,11 @@ fn video(path: &Path) -> anyhow::Result<(ProbeInfo, RgbImage)> {
         (alpha, (*p).color_range == ffi::AVColorRange::AVCOL_RANGE_JPEG)
     };
     let size = (THUMB_WIDTH, ((THUMB_WIDTH as u64 * h as u64 + w as u64 / 2) / w as u64).max(1) as u32);
-    let rgb = sws(&mut None, &frame, ff::format::Pixel::RGB24, size, full_range)?;
-    let row = size.0 as usize * 3;
-    let pixels = rgb.data(0).chunks(rgb.stride(0)).take(size.1 as usize).flat_map(|r| &r[..row]).copied().collect();
-    let thumb = RgbImage::from_raw(size.0, size.1, pixels).context("thumbnail size")?;
+    // RGBA: straight alpha kept where the video has it, 255 elsewhere.
+    let rgba = sws(&mut None, &frame, ff::format::Pixel::RGBA, size, full_range)?;
+    let row = size.0 as usize * 4;
+    let pixels = rgba.data(0).chunks(rgba.stride(0)).take(size.1 as usize).flat_map(|r| &r[..row]).copied().collect();
+    let thumb = RgbaImage::from_raw(size.0, size.1, pixels).context("thumbnail size")?;
     let duration_ms = Some((seconds * 1000.).round() as u64);
     let info = ProbeInfo { kind: MediaKind::Video, width: decoder.width(), height: decoder.height(), duration_ms, has_audio, has_alpha, thumb: None };
     Ok((info, thumb))

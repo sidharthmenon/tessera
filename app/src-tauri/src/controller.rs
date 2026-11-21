@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tessera_show::{
-    Bus, EngineConfig, MediaItem, MediaKind, Playback, ProbeInfo, Scene, Show, ShowOp, Source, ToEngine, TransportAction,
-    next_cue_slot, resolve_shared, take_merge,
+    Bus, Cue, EngineConfig, MediaItem, MediaKind, Playback, ProbeInfo, Scene, Show, ShowOp, Source, ToEngine, Transition,
+    TransitionKind, TransportAction, next_cue_slot, resolve_shared, take_merge,
 };
 use uuid::Uuid;
 
@@ -23,27 +23,46 @@ pub struct CueRef {
     pub slot: u32,
 }
 
-/// Which cues are on the buses, for the UI (`live-changed`).
+/// What the buses hold, for the UI (`live-changed`).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Live {
+    /// The cue Preview was last loaded from or stored into.
     pub pvw: Option<CueRef>,
     pub last_taken: Option<CueRef>,
-    /// What PGM shows (the engine's PGM scene, by the same layer ids): the last taken cue's
-    /// screens plus whatever earlier cues left on the others. Transport targets these ids.
+    /// What PGM shows (the engine's PGM scene, by the same layer ids): the last take's screens
+    /// plus whatever earlier takes left on the others. Transport targets these ids.
     pub program: Scene,
+    /// What PVW shows, and the transition GO takes it with.
+    pub preview: Scene,
+    pub transition: Transition,
+}
+
+/// PVW: a working scene. Editing it changes no cue; a cue changes only when PVW is stored into it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Preview {
+    /// The cue it was last loaded from or stored into (Next walks on from it).
+    pub cue: Option<CueRef>,
+    pub scene: Scene,
+    pub transition: Transition,
+}
+
+impl Default for Preview {
+    fn default() -> Preview {
+        Preview { cue: None, scene: Scene::new(), transition: Transition { kind: TransitionKind::Fade, duration_ms: 500 } }
+    }
 }
 
 #[derive(Default)]
 pub struct Controller {
     pub show: Show,
     pub path: Option<PathBuf>,
-    undo: Vec<Show>,
-    redo: Vec<Show>,
-    pub pvw: Option<CueRef>,
+    /// Each step is the show and PVW before it (PGM is never undone: R32, R36).
+    undo: Vec<(Show, Preview)>,
+    redo: Vec<(Show, Preview)>,
+    pub pvw: Preview,
     pub pgm: Scene,
-    pub pvw_scene: Scene,
-    /// Edits to this cue go live (R32).
+    /// The cue PVW came from at the last Take (none for a Take of an unstored PVW).
     pub last_taken: Option<CueRef>,
     /// The show changed since it was last written (autosave or save).
     pub dirty: bool,
@@ -54,10 +73,26 @@ pub struct Controller {
     positions: BTreeMap<Uuid, u64>,
 }
 
-fn scene_of(show: &Show, cue: Option<CueRef>) -> Option<&Scene> {
+fn cue_at(show: &Show, cue: Option<CueRef>) -> Option<&Cue> {
     let cue = cue?;
     let group = show.groups.iter().find(|g| g.id == cue.group_id)?;
-    group.cues.iter().find(|c| c.slot == cue.slot).map(|c| &c.layers_by_screen)
+    group.cues.iter().find(|c| c.slot == cue.slot)
+}
+
+/// Drops from `scene` what `op` removes from the show (a screen, or a media item's layers), as the
+/// show does from its cues; whether anything went.
+fn prune(scene: &mut Scene, op: &ShowOp) -> bool {
+    match *op {
+        ShowOp::RemoveScreen { id } => scene.remove(&id).is_some(),
+        ShowOp::RemoveMedia { id } => {
+            let before = scene.clone();
+            for layers in scene.values_mut() {
+                layers.retain(|l| !matches!(l.source, Source::Media { media_id } if media_id == id));
+            }
+            *scene != before
+        }
+        _ => false,
+    }
 }
 
 fn guess_kind(path: &Path) -> MediaKind {
@@ -74,7 +109,21 @@ impl Controller {
     }
 
     pub fn live(&self) -> Live {
-        Live { pvw: self.pvw, last_taken: self.last_taken, program: self.pgm.clone() }
+        Live {
+            pvw: self.pvw.cue,
+            last_taken: self.last_taken,
+            program: self.pgm.clone(),
+            preview: self.pvw.scene.clone(),
+            transition: self.pvw.transition.clone(),
+        }
+    }
+
+    fn push_undo(&mut self, step: (Show, Preview)) {
+        self.undo.push(step);
+        if self.undo.len() > UNDO_CAP {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
     }
 
     /// Something is on the outputs: a cue was taken, or PGM shows a layer.
@@ -89,7 +138,8 @@ impl Controller {
         EngineConfig { outputs: s.outputs.clone(), screens: s.screens.clone(), mappings: s.mappings.clone(), media: s.media.clone() }
     }
 
-    /// Apply a user edit (one undo step). PGM changes only when the last taken cue is edited.
+    /// Apply a user edit (one undo step). PVW and PGM change only where the show lost what they
+    /// show (a screen or media removed); editing a cue changes neither.
     pub fn apply(&mut self, op: ShowOp) -> Result<Vec<ToEngine>, String> {
         let relative = |m: &MediaItem| Path::new(&m.path).is_relative();
         if match &op {
@@ -101,22 +151,17 @@ impl Controller {
         }
         let config = self.engine_config();
         let volume = self.show.master_volume;
-        let taken = scene_of(&self.show, self.last_taken).cloned();
         let moved = match op {
             ShowOp::MoveCue { group_id, from, to } => Some((group_id, from, to)),
             _ => None,
         };
-        let before = self.show.clone();
-        self.show.apply(op)?;
+        let before = (self.show.clone(), self.pvw.clone());
+        self.show.apply(op.clone())?;
         self.dirty = true;
-        self.undo.push(before);
-        if self.undo.len() > UNDO_CAP {
-            self.undo.remove(0);
-        }
-        self.redo.clear();
+        self.push_undo(before);
         if let Some((group_id, from, to)) = moved {
             // Bus refs follow their cue (move_cue swaps from and to).
-            for r in [&mut self.pvw, &mut self.last_taken].into_iter().flatten() {
+            for r in [&mut self.pvw.cue, &mut self.last_taken].into_iter().flatten() {
                 if r.group_id == group_id && (r.slot == from || r.slot == to) {
                     r.slot = if r.slot == from { to } else { from };
                 }
@@ -126,97 +171,116 @@ impl Controller {
         if self.engine_config() != config {
             out.push(ToEngine::SetConfig { config: self.engine_config() });
         }
-        match scene_of(&self.show, self.last_taken) {
-            None => self.last_taken = None,
-            Some(scene) if Some(scene) != taken.as_ref() => {
-                self.pgm = take_merge(&self.pgm, scene);
-                self.forget_gone();
-                out.push(ToEngine::SetProgram { scene: self.pgm.clone() });
-            }
-            Some(_) => {}
+        self.forget_gone_cues();
+        if prune(&mut self.pgm, &op) {
+            self.forget_gone();
+            out.push(ToEngine::SetProgram { scene: self.pgm.clone() });
         }
-        out.extend(self.refresh_pvw(false));
+        if prune(&mut self.pvw.scene, &op) {
+            out.push(ToEngine::SetPreview { scene: self.pvw.scene.clone() });
+        }
         if self.show.master_volume != volume {
             out.push(ToEngine::SetMasterVolume { volume: self.show.master_volume });
         }
         Ok(out)
     }
 
-    /// Re-read the PVW cue (emptying PVW if it's gone); `SetPreview` if it differs or `always`.
-    fn refresh_pvw(&mut self, always: bool) -> Option<ToEngine> {
-        let scene = scene_of(&self.show, self.pvw).cloned();
-        if scene.is_none() {
-            self.pvw = None;
+    /// Bus refs to cues that are gone become none.
+    fn forget_gone_cues(&mut self) {
+        for r in [&mut self.pvw.cue, &mut self.last_taken] {
+            if cue_at(&self.show, *r).is_none() {
+                *r = None;
+            }
         }
-        let scene = scene.unwrap_or_default();
-        if !always && scene == self.pvw_scene {
-            return None;
-        }
-        self.pvw_scene = scene;
-        Some(ToEngine::SetPreview { scene: self.pvw_scene.clone() })
     }
 
     pub fn undo(&mut self) -> Vec<ToEngine> {
-        match self.undo.pop() {
-            Some(prev) => {
-                let cur = std::mem::replace(&mut self.show, prev);
-                self.redo.push(cur);
-                self.dirty = true;
-                self.history_moved()
-            }
-            None => vec![],
-        }
+        let Some(prev) = self.undo.pop() else { return vec![] };
+        let cur = (std::mem::replace(&mut self.show, prev.0), std::mem::replace(&mut self.pvw, prev.1));
+        self.dirty |= cur.0 != self.show;
+        self.redo.push(cur);
+        self.history_moved()
     }
 
     pub fn redo(&mut self) -> Vec<ToEngine> {
-        match self.redo.pop() {
-            Some(next) => {
-                let cur = std::mem::replace(&mut self.show, next);
-                self.undo.push(cur);
-                self.dirty = true;
-                self.history_moved()
-            }
-            None => vec![],
-        }
+        let Some(next) = self.redo.pop() else { return vec![] };
+        let cur = (std::mem::replace(&mut self.show, next.0), std::mem::replace(&mut self.pvw, next.1));
+        self.dirty |= cur.0 != self.show;
+        self.undo.push(cur);
+        self.history_moved()
     }
 
     /// After undo/redo: config, PVW and volume; PGM never changes (R32, R36).
     fn history_moved(&mut self) -> Vec<ToEngine> {
-        if scene_of(&self.show, self.last_taken).is_none() {
-            self.last_taken = None;
-        }
-        let preview = self.refresh_pvw(true);
-        let volume = ToEngine::SetMasterVolume { volume: self.show.master_volume };
-        [Some(ToEngine::SetConfig { config: self.engine_config() }), preview, Some(volume)].into_iter().flatten().collect()
+        self.forget_gone_cues();
+        vec![
+            ToEngine::SetConfig { config: self.engine_config() },
+            ToEngine::SetPreview { scene: self.pvw.scene.clone() },
+            ToEngine::SetMasterVolume { volume: self.show.master_volume },
+        ]
     }
 
-    pub fn load_cue(&mut self, cue: CueRef) -> Result<Vec<ToEngine>, String> {
-        if scene_of(&self.show, Some(cue)).is_none() {
-            return Err(format!("no cue in slot {}", cue.slot));
-        }
-        self.pvw = Some(cue);
-        Ok(self.refresh_pvw(true).into_iter().collect())
-    }
-
-    /// PVW cue to PGM with its transition; the PVW cue stays loaded.
-    pub fn take(&mut self) -> Vec<ToEngine> {
-        let Some(cue) = self.pvw else { return vec![] };
-        let Some(transition) = self.show.groups.iter().find(|g| g.id == cue.group_id)
-            .and_then(|g| g.cues.iter().find(|c| c.slot == cue.slot))
-            .map(|c| c.transition.clone())
-        else {
+    /// PVW becomes `next` (one undo step, unless nothing changes).
+    fn set_pvw(&mut self, next: Preview) -> Vec<ToEngine> {
+        if next == self.pvw {
             return vec![];
+        }
+        let send = next.scene != self.pvw.scene;
+        let before = std::mem::replace(&mut self.pvw, next);
+        self.push_undo((self.show.clone(), before));
+        if send { vec![ToEngine::SetPreview { scene: self.pvw.scene.clone() }] } else { vec![] }
+    }
+
+    /// An edit of PVW: its scene and transition. No cue changes.
+    pub fn set_preview(&mut self, scene: Scene, transition: Transition) -> Vec<ToEngine> {
+        self.set_pvw(Preview { scene, transition, ..self.pvw.clone() })
+    }
+
+    /// A copy of the cue at `cue` into PVW (what PVW held before is one undo away).
+    pub fn load_cue(&mut self, cue: CueRef) -> Result<Vec<ToEngine>, String> {
+        let c = cue_at(&self.show, Some(cue)).ok_or_else(|| format!("no cue in slot {}", cue.slot))?;
+        let next = Preview { cue: Some(cue), scene: c.layers_by_screen.clone(), transition: c.transition.clone() };
+        Ok(self.set_pvw(next))
+    }
+
+    /// PVW stored into the cue at `at` (one undo step): its layers and transition replace the
+    /// cue's, or make a new cue in an empty slot. PVW then counts as that cue; PGM is untouched.
+    pub fn store_preview(&mut self, at: CueRef) -> Result<Vec<ToEngine>, String> {
+        let (scene, transition) = (self.pvw.scene.clone(), self.pvw.transition.clone());
+        let cue = match cue_at(&self.show, Some(at)) {
+            Some(c) => Cue { layers_by_screen: scene, transition, ..c.clone() },
+            None => Cue { id: Uuid::new_v4(), name: format!("Cue {}", at.slot + 1), slot: at.slot, layers_by_screen: scene, transition },
         };
+        let out = self.apply(ShowOp::SetCue { group_id: at.group_id, cue })?;
+        self.pvw.cue = Some(at);
+        Ok(out)
+    }
+
+    /// A live edit of PGM (not undoable, like every PGM change: R32).
+    pub fn set_program(&mut self, scene: Scene) -> Vec<ToEngine> {
+        if scene == self.pgm {
+            return vec![];
+        }
+        self.pgm = scene;
+        self.forget_gone();
+        vec![ToEngine::SetProgram { scene: self.pgm.clone() }]
+    }
+
+    /// PVW to PGM with PVW's transition; PVW keeps what it holds.
+    pub fn take(&mut self) -> Vec<ToEngine> {
+        if self.pvw.scene.is_empty() {
+            return vec![];
+        }
         // Players PVW shares with PGM stay as they are (paused, stopped) under the new layer ids.
-        for (incoming, live) in resolve_shared(&self.pgm, &self.pvw_scene) {
+        for (incoming, live) in resolve_shared(&self.pgm, &self.pvw.scene) {
             if let Some(&action) = self.held.get(&live) {
                 self.held.insert(incoming, action);
             }
         }
-        self.pgm = take_merge(&self.pgm, &self.pvw_scene);
+        self.pgm = take_merge(&self.pgm, &self.pvw.scene);
         self.forget_gone();
-        self.last_taken = Some(cue);
-        vec![ToEngine::Take { transition }]
+        self.last_taken = self.pvw.cue;
+        vec![ToEngine::Take { transition: self.pvw.transition.clone() }]
     }
 
     /// A transport command, remembered for PGM (I4): Pause/Stop until Play/Restart.
@@ -283,19 +347,19 @@ impl Controller {
                 Source::Pattern { .. } => true,
             });
         }
-        for l in self.pvw_scene.values().flatten() {
+        for l in self.pvw.scene.values().flatten() {
             if let Source::Media { media_id } = l.source {
                 dropped.push(format!("PVW {}", describe(l, media_id)));
             }
         }
-        (self.pvw, self.pvw_scene) = (None, Scene::new());
+        self.pvw = Preview::default();
         self.forget_gone();
         dropped
     }
 
     /// The next occupied slot after the PVW cue (first group's first cue when PVW is empty).
     pub fn load_next(&mut self) -> Vec<ToEngine> {
-        let (group, after) = match self.pvw {
+        let (group, after) = match self.pvw.cue {
             Some(r) => (self.show.groups.iter().find(|g| g.id == r.group_id), Some(r.slot)),
             None => (self.show.groups.first(), None),
         };
@@ -317,7 +381,7 @@ impl Controller {
         let transports = held.into_iter().map(|(id, action)| ToEngine::Transport { bus: Bus::Pgm, layer: Some(*id), action: *action });
         let mut out = vec![ToEngine::SetConfig { config: self.engine_config() }, ToEngine::SetProgram { scene: program.clone() }];
         out.extend(transports);
-        out.push(ToEngine::SetPreview { scene: self.pvw_scene.clone() });
+        out.push(ToEngine::SetPreview { scene: self.pvw.scene.clone() });
         out.push(ToEngine::SetMasterVolume { volume: self.show.master_volume });
         out
     }
@@ -354,7 +418,8 @@ impl Controller {
         let config = self.engine_config();
         // Only a change to the show itself is unsaved work (M1): not one to an undo snapshot.
         let before = self.show.media.iter().find(|m| m.id == media_id).cloned();
-        for show in std::iter::once(&mut self.show).chain(&mut self.undo).chain(&mut self.redo) {
+        let steps = self.undo.iter_mut().chain(&mut self.redo).map(|(show, _)| show);
+        for show in std::iter::once(&mut self.show).chain(steps) {
             if let Some(m) = show.media.iter_mut().find(|m| m.id == media_id) {
                 m.kind = info.kind.clone();
                 m.width = info.width;
@@ -370,15 +435,20 @@ impl Controller {
     }
 
     /// Replace the show (opened from disk). History and PVW clear; PGM keeps running, and so does
-    /// what the resync must know about it.
+    /// what the resync must know about it. Every media item is probed again, so metadata and
+    /// thumbnails from an older engine (or a cleared thumbnail cache) catch up.
     pub fn open(&mut self, show: Show, path: Option<PathBuf>) -> Vec<ToEngine> {
         let (pgm, held, positions) = (std::mem::take(&mut self.pgm), std::mem::take(&mut self.held), std::mem::take(&mut self.positions));
         *self = Controller { show, path, pgm, held, positions, ..Controller::default() };
-        vec![
+        let probes = self.show.media.iter().map(|m| ToEngine::Probe { media_id: m.id, path: m.path.clone() });
+        [
             ToEngine::SetConfig { config: self.engine_config() },
             ToEngine::SetPreview { scene: Scene::new() },
             ToEngine::SetMasterVolume { volume: self.show.master_volume },
         ]
+        .into_iter()
+        .chain(probes)
+        .collect()
     }
 }
 
@@ -470,31 +540,59 @@ mod tests {
         assert!(set_cue(&mut c, 1, Scene::new()).is_empty());
     }
 
+    /// Editing PVW changes no cue, and editing a cue doesn't change PVW: they meet only on a load
+    /// (cue into PVW) or a store (PVW into a cue).
     #[test]
-    fn edit_pvw_cue_emits_set_preview() {
+    fn preview_is_its_own_scene() {
         let mut c = Controller::new();
         let s = screen().id;
-        set_cue(&mut c, 1, Scene::from([(s, vec![layer()])]));
-        set_cue(&mut c, 2, Scene::new());
+        let original = Scene::from([(s, vec![layer()])]);
+        set_cue(&mut c, 1, original.clone());
         let pvw = at(&c, 1);
         let msgs = c.load_cue(pvw).unwrap();
-        assert_eq!(msgs, vec![ToEngine::SetPreview { scene: c.show.groups[0].cues[0].layers_by_screen.clone() }]);
-        assert_eq!(c.pvw, Some(pvw));
+        assert_eq!(msgs, vec![ToEngine::SetPreview { scene: original.clone() }]);
+        assert_eq!(c.pvw.cue, Some(pvw));
+        let fade = Transition { kind: TransitionKind::Fade, duration_ms: 300 };
         let edited = Scene::from([(s, vec![layer(), layer()])]);
-        let msgs = set_cue(&mut c, 1, edited.clone());
-        assert_eq!(msgs, vec![ToEngine::SetPreview { scene: edited.clone() }]);
-        assert_eq!(c.pvw_scene, edited);
-        // Another cue: PVW untouched.
-        assert!(set_cue(&mut c, 2, Scene::from([(s, vec![])])).is_empty());
-        // The PVW cue moves: PVW follows it, nothing to send.
+        assert_eq!(c.set_preview(edited.clone(), fade.clone()), vec![ToEngine::SetPreview { scene: edited.clone() }]);
+        assert_eq!(c.show.groups[0].cues[0].layers_by_screen, original, "the cue keeps its layers");
+        assert!(c.set_preview(edited.clone(), fade.clone()).is_empty(), "no change, nothing sent");
+        // Editing the cue leaves PVW alone.
+        assert!(set_cue(&mut c, 1, Scene::new()).is_empty());
+        assert_eq!((c.pvw.scene.clone(), c.pvw.transition.clone()), (edited.clone(), fade));
+        // The cue moves: PVW's ref follows it. Deleted: PVW keeps its scene.
         let group_id = group(&c);
         assert!(c.apply(ShowOp::MoveCue { group_id, from: 1, to: 5 }).unwrap().is_empty());
-        assert_eq!(c.pvw, Some(at(&c, 5)));
-        // Deleted: PVW empties.
-        let msgs = c.apply(ShowOp::DeleteCue { group_id, slot: 5 }).unwrap();
-        assert_eq!(msgs, vec![ToEngine::SetPreview { scene: Scene::new() }]);
-        assert_eq!(c.pvw, None);
+        assert_eq!(c.pvw.cue, Some(at(&c, 5)));
+        assert!(c.apply(ShowOp::DeleteCue { group_id, slot: 5 }).unwrap().is_empty());
+        assert_eq!((c.pvw.cue, c.pvw.scene.clone()), (None, edited.clone()));
         assert!(c.load_cue(at(&c, 9)).is_err());
+        // PVW edits undo like show edits, without being unsaved work.
+        c.dirty = false;
+        c.set_preview(Scene::new(), Transition { kind: TransitionKind::Cut, duration_ms: 0 });
+        assert!(has(&c.undo(), |m| *m == ToEngine::SetPreview { scene: edited.clone() }));
+        assert!(!c.dirty);
+    }
+
+    #[test]
+    fn store_preview_into_cues() {
+        let mut c = Controller::new();
+        let s = screen().id;
+        let fade = Transition { kind: TransitionKind::Fade, duration_ms: 750 };
+        let first = Scene::from([(s, vec![layer()])]);
+        c.set_preview(first.clone(), fade.clone());
+        assert!(c.store_preview(at(&c, 3)).unwrap().is_empty(), "storing sends nothing to the engine");
+        let cue = c.show.groups[0].cues[0].clone();
+        assert_eq!((cue.slot, cue.name.as_str(), &cue.layers_by_screen, &cue.transition), (3, "Cue 4", &first, &fade));
+        assert_eq!(c.pvw.cue, Some(at(&c, 3)));
+        // Updating keeps the cue's id and name.
+        let second = Scene::from([(s, vec![layer(), layer()])]);
+        c.set_preview(second.clone(), fade.clone());
+        c.store_preview(at(&c, 3)).unwrap();
+        let updated = &c.show.groups[0].cues[0];
+        assert_eq!((updated.id, &updated.name, &updated.layers_by_screen), (cue.id, &cue.name, &second));
+        c.undo();
+        assert_eq!(c.show.groups[0].cues[0].layers_by_screen, first);
     }
 
     #[test]
@@ -510,7 +608,7 @@ mod tests {
         c.load_cue(at(&c, 1)).unwrap();
         assert_eq!(c.take(), vec![ToEngine::Take { transition: fade }]);
         assert_eq!(c.pgm, first.layers_by_screen);
-        assert_eq!(c.pvw, Some(at(&c, 1)), "PVW cue stays loaded");
+        assert_eq!(c.pvw.cue, Some(at(&c, 1)), "PVW stays loaded");
         assert_eq!(c.last_taken, Some(at(&c, 1)));
         // A cue touching only screen a leaves b on PGM.
         let only_a = Scene::from([(a, vec![])]);
@@ -518,6 +616,12 @@ mod tests {
         c.load_cue(at(&c, 2)).unwrap();
         assert_eq!(c.take(), vec![ToEngine::Take { transition: Transition { kind: TransitionKind::Cut, duration_ms: 0 } }]);
         assert_eq!(c.pgm, tessera_show::take_merge(&first.layers_by_screen, &only_a));
+        // An unstored PVW goes to air too, with its own transition; no cue is on air then.
+        let wipe = Transition { kind: TransitionKind::WipeLeft, duration_ms: 400 };
+        c.set_preview(Scene::from([(b, vec![layer()])]), wipe.clone());
+        c.pvw.cue = None;
+        assert_eq!(c.take(), vec![ToEngine::Take { transition: wipe }]);
+        assert_eq!(c.last_taken, None);
     }
 
     /// R41: the UI addresses live layers (transport) by the ids PGM holds: the last taken cue's on
@@ -539,25 +643,28 @@ mod tests {
         assert_eq!(c.live().program, Scene::from([(a, second[&a].clone()), (b, first[&b].clone())]));
     }
 
+    /// PGM changes by a Take, a live edit (`set_program`), or losing what it shows from the show;
+    /// never by editing a cue, even the one on air.
     #[test]
-    fn edit_last_taken_cue_emits_set_program() {
+    fn program_changes_only_by_take_or_live_edit() {
         let mut c = Controller::new();
-        let (a, b) = (screen().id, screen().id);
-        set_cue(&mut c, 1, Scene::from([(a, vec![layer()])]));
-        set_cue(&mut c, 2, Scene::from([(b, vec![layer()])]));
+        let a = screen();
+        let m = item(Some(1000));
+        c.apply(ShowOp::AddScreen { screen: a.clone() }).unwrap();
+        c.apply(ShowOp::AddMedia { items: vec![m.clone()] }).unwrap();
+        let (bars, bg) = (layer(), clip(&m, Playback::Loop));
+        set_cue(&mut c, 1, Scene::from([(a.id, vec![bars.clone()])]));
         c.load_cue(at(&c, 1)).unwrap();
         c.take();
-        c.load_cue(at(&c, 2)).unwrap();
-        c.take();
-        set_cue(&mut c, 3, Scene::new());
-        c.load_cue(at(&c, 3)).unwrap();
-        let pgm_a = c.pgm[&a].clone();
-        let edited = Scene::from([(b, vec![layer(), layer()])]);
-        let msgs = set_cue(&mut c, 2, edited.clone());
-        assert_eq!(c.pgm, Scene::from([(a, pgm_a), (b, edited[&b].clone())]));
-        assert_eq!(msgs, vec![ToEngine::SetProgram { scene: c.pgm.clone() }]);
-        // Cue 1 was taken earlier but isn't the last taken: editing it stays off air.
-        assert!(set_cue(&mut c, 1, Scene::from([(a, vec![])])).is_empty());
+        let pgm = c.pgm.clone();
+        assert!(set_cue(&mut c, 1, Scene::from([(a.id, vec![])])).is_empty());
+        assert_eq!(c.pgm, pgm, "editing the cue on air leaves PGM");
+        let live = Scene::from([(a.id, vec![bars.clone(), bg.clone()])]);
+        assert_eq!(c.set_program(live.clone()), vec![ToEngine::SetProgram { scene: live.clone() }]);
+        assert!(c.set_program(live).is_empty());
+        let msgs = c.apply(ShowOp::RemoveMedia { id: m.id }).unwrap();
+        assert_eq!(c.pgm, Scene::from([(a.id, vec![bars])]), "removed media leaves PGM");
+        assert!(has(&msgs, |x| *x == ToEngine::SetProgram { scene: c.pgm.clone() }));
     }
 
     #[test]
@@ -567,17 +674,18 @@ mod tests {
         set_cue(&mut c, 1, Scene::from([(a, vec![layer()])]));
         c.load_cue(at(&c, 1)).unwrap();
         c.take();
-        let msgs = set_cue(&mut c, 1, Scene::from([(a, vec![layer(), layer()])]));
-        assert!(has(&msgs, is_program));
+        assert!(has(&c.set_program(Scene::from([(a, vec![layer(), layer()])])), is_program));
+        set_cue(&mut c, 1, Scene::from([(a, vec![])]));
         let pgm = c.pgm.clone();
+        let pvw = c.pvw.scene.clone();
         let msgs = c.undo();
         assert_eq!(msgs, vec![
             ToEngine::SetConfig { config: c.engine_config() },
-            ToEngine::SetPreview { scene: c.show.groups[0].cues[0].layers_by_screen.clone() },
+            ToEngine::SetPreview { scene: pvw.clone() },
             ToEngine::SetMasterVolume { volume: 1.0 },
         ]);
         assert_eq!(c.pgm, pgm, "undo leaves PGM alone");
-        assert_eq!(c.pvw_scene, c.show.groups[0].cues[0].layers_by_screen);
+        assert_eq!(c.pvw.scene, pvw);
         // An unrelated op afterwards doesn't push the undone cue on air either.
         assert!(!has(&c.apply(ShowOp::SetMasterVolume { volume: 0.5 }).unwrap(), is_program));
         // Undoing the volume change puts the engine's volume back too (R36).
@@ -670,7 +778,7 @@ mod tests {
         assert_eq!(dropped.len(), 2, "{dropped:?}");
         assert!(dropped[0].starts_with("PGM “clip”") && dropped[0].contains(&m.path), "{dropped:?}");
         assert!(dropped[1].starts_with("PVW") && dropped[1].contains(&m.path), "{dropped:?}");
-        assert_eq!((c.pvw, c.pvw_scene.clone(), c.pgm.clone()), (None, Scene::new(), Scene::from([(s, vec![bars])])));
+        assert_eq!((c.pvw.clone(), c.pgm.clone()), (Preview::default(), Scene::from([(s, vec![bars])])));
         assert_eq!(c.resync_messages()[1..3], [ToEngine::SetProgram { scene: c.pgm.clone() }, ToEngine::SetPreview { scene: Scene::new() }]);
         assert!(c.on_air(), "patterns and the taken cue are still on air");
     }
@@ -693,12 +801,14 @@ mod tests {
         c.dirty = false;
         c.probed(id, info());
         assert!(!c.dirty, "the same probe again");
-        set_cue(&mut c, 1, Scene::new());
+        set_cue(&mut c, 1, Scene::from([(screen().id, vec![])]));
         c.dirty = false;
         c.load_cue(at(&c, 1)).unwrap();
         c.take();
         c.transport(Bus::Pgm, None, TransportAction::Pause);
         assert!(!c.dirty && c.on_air(), "bus moves aren't show changes");
+        c.undo();
+        assert!(!c.dirty, "undoing the load is a PVW change, not a show change");
         c.undo();
         assert!(c.dirty);
         c.open(Show::new(), None);
@@ -713,11 +823,11 @@ mod tests {
             set_cue(&mut c, slot, Scene::new());
         }
         for slot in [2, 4, 7] {
-            assert_eq!(c.load_next().len(), 1);
-            assert_eq!(c.pvw, Some(at(&c, slot)));
+            c.load_next();
+            assert_eq!(c.pvw.cue, Some(at(&c, slot)));
         }
-        assert!(c.load_next().is_empty(), "no wrap");
-        assert_eq!(c.pvw, Some(at(&c, 7)));
+        c.load_next();
+        assert_eq!(c.pvw.cue, Some(at(&c, 7)), "no wrap");
     }
 
     #[test]
@@ -745,6 +855,13 @@ mod tests {
         c.undo();
         assert_eq!(c.show.media[1].width, 64);
         assert_eq!(c.show.master_volume, 1.0);
+        // Opening a show probes its media again: metadata and thumbnails from an older engine, or a
+        // cleared thumbnail cache, catch up.
+        let msgs = c.open(c.show.clone(), None);
+        assert_eq!(msgs[3..], [
+            ToEngine::Probe { media_id: img.id, path: "/shows/a.PNG".into() },
+            ToEngine::Probe { media_id: vid.id, path: "/shows/b.mov".into() },
+        ]);
     }
 
     #[test]

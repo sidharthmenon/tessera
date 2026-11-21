@@ -89,7 +89,7 @@ Plain `npm run tauri build` still works, but its `.app` and `.dmg` load FFmpeg f
   there is no blackout:
   - The status bar shows *engine held*, and the outputs stay untouched until you open or create
     a show.
-  - After that, edits to the on-air cue reach air on the next GO.
+  - After that, edits on the Program tab reach air on the next GO.
 - **Quitting** (⌘Q, or closing the window). With nothing on air the app stops the engine and
   quits. With something on air (or an adopted engine) it asks:
   - *Keep outputs running and quit*: the screens stay as they are. The next launch adopts the
@@ -109,16 +109,16 @@ Run this in the release app or in `npm run tauri dev`:
 1. Add two **Window** outputs, plus one **Display** output on the second monitor.
 2. Make one 3840×1080 screen and map half of it to each window.
 3. Import an image and an mp4.
-4. Build two cues:
+4. Build two cues. Preview is a working scene: drag media onto it, then click an empty cue slot
+   to store it there (right-click a cue → *Update with current view* to overwrite one).
    - cue 1: looping background video + image;
    - cue 2: the same background video + a ProRes 4444 alpha overlay.
 5. Load cue 2 to PVW. PGM doesn't change, and the overlay is paused on its first frame.
 6. Press Space to fade. The background loop doesn't restart, the overlay starts on Take, and its
    alpha is correct.
 7. Take a cue that touches only screen A. Screen B is untouched.
-   - With the taken cue still in PVW, move a layer on the Preview tab. Program doesn't change: the
-     edit goes to a copy in the first free slot (status bar: *Copied to slot N*). Live edits
-     happen only on the Program tab.
+   - With the taken cue still in PVW, move a layer on the Preview tab. Program and the cue don't
+     change; Preview shows *edited*. Live edits happen only on the Program tab.
 8. 4× 4K layers hold 60 fps (engine fps in the status bar).
 9. Audio is audible.
 10. Kill the engine process. The controller restarts it and the outputs come back.

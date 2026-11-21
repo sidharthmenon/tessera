@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Cue } from '$lib/bindings/Cue';
-  import { firstEmptySlot, sameRef, slotCount, withScreen } from '$lib/logic';
-  import { addGroup, clickSlot, confirmAsk, editCue, fire, op, promptText, ui } from '$lib/store.svelte';
+  import { engineUrl, firstEmptySlot, layoutBounds, mediaOf, patternFill, sameRef, slotCount, withScreen } from '$lib/logic';
+  import { addGroup, clickSlot, confirmAsk, editCue, fire, op, promptText, ui, updateCue } from '$lib/store.svelte';
   import type { CueRef } from '$lib/api';
 
   const group = $derived(ui.group);
@@ -11,6 +11,10 @@
     return Array.from({ length: slotCount(group) }, (_, slot) => ({ slot, cue: bySlot.get(slot) }));
   });
   const ref = (slot: number): CueRef => ({ groupId: group?.id ?? '', slot });
+  const screens = $derived(ui.show?.screens ?? []);
+  const bounds = $derived(layoutBounds(screens));
+  /** Colour bars' stops, hard-edged: [offset, colour] (layer.wgsl's SMPTE order). */
+  const bars = ['#fff', '#ff0', '#0ff', '#0f0', '#f0f', '#f00', '#00f', '#000'].flatMap((c, i) => [[i / 8, c], [(i + 1) / 8, c]] as const);
 
   let menu = $state<{ x: number; y: number; cue: Cue } | null>(null);
   function openMenu(e: MouseEvent, cue: Cue | undefined) {
@@ -24,7 +28,7 @@
     if (ui.modal === 'menu') ui.modal = null; // a Rename prompt may have taken over
   }
 
-  // A double-click on an empty slot creates the cue with its first click: it must not also go to air.
+  // A double-click on an empty slot stores Preview there with its first click: it must not also go to air.
   let created = { slot: -1, at: 0 };
   function click(slot: number, cue: Cue | undefined) {
     if (!cue) created = { slot, at: performance.now() };
@@ -43,12 +47,9 @@
     onAir(cue, 'Deleting removes it from the show, not from air: Program keeps showing it until the next GO. (Undo brings it back.)', 'Delete', () =>
       op({ op: 'DeleteCue', groupId: group?.id ?? '', slot: cue.slot }),
     );
-  const clearScreen = (cue: Cue, s: { id: string; name: string }) =>
-    onAir(cue, `${s.name} goes black on Program now.`, 'Clear on air', () => editCue(ref(cue.slot), (c) => withScreen(c, s.id, [])));
-  const leaveScreen = (cue: Cue, s: { id: string; name: string }) =>
-    onAir(cue, `Program keeps ${s.name} as it is now; from the next GO this cue leaves ${s.name} untouched.`, 'Leave untouched', () =>
-      editCue(ref(cue.slot), (c) => withScreen(c, s.id, null)),
-    );
+  // Cue edits never reach air (or Preview): only a load and a GO do.
+  const clearScreen = (cue: Cue, s: { id: string }) => editCue(ref(cue.slot), (c) => ({ ...c, layersByScreen: withScreen(c.layersByScreen, s.id, []) }));
+  const leaveScreen = (cue: Cue, s: { id: string }) => editCue(ref(cue.slot), (c) => ({ ...c, layersByScreen: withScreen(c.layersByScreen, s.id, null) }));
 
   async function renameCue(cue: Cue) {
     const name = await promptText(`Rename cue ${cue.slot + 1}`, cue.name);
@@ -80,6 +81,45 @@
   }}
 />
 
+{#snippet thumb(cue: Cue)}
+  <!-- The cue's layers at their screens' layout positions, as Preview would show them (media by
+       their thumbnails; brightness/contrast/saturation not drawn). A screen the cue leaves
+       untouched is only outlined; one it defines is black under its layers. -->
+  <svg class="thumb" viewBox="{bounds.x} {bounds.y} {bounds.w} {bounds.h}" aria-hidden="true">
+    {#each screens as s (s.id)}
+      {@const layers = cue.layersByScreen[s.id]}
+      <svg x={s.layoutX} y={s.layoutY} width={s.width} height={s.height} viewBox="0 0 {s.width} {s.height}">
+        {#if layers}<rect width={s.width} height={s.height} fill="#000" />{/if}
+        {#each layers?.filter((l) => l.visible) ?? [] as l (l.id)}
+          {@const m = mediaOf(ui.show, l)}
+          {@const href = m?.thumb ? engineUrl(ui.engine, `/thumb/${encodeURIComponent(m.thumb)}`) : null}
+          {#if href}
+            <image {href} x={l.rect.x} y={l.rect.y} width={l.rect.w} height={l.rect.h} preserveAspectRatio="none" opacity={l.opacity} />
+          {:else}
+            <rect x={l.rect.x} y={l.rect.y} width={l.rect.w} height={l.rect.h} fill={l.source.type === 'Pattern' ? patternFill(l.source.pattern) : '#333'} opacity={l.opacity} />
+          {/if}
+        {/each}
+        <rect class="edge" width={s.width} height={s.height} />
+      </svg>
+    {/each}
+  </svg>
+{/snippet}
+
+<!-- Paint servers for the thumbnails' test patterns (zero-size, not display:none, which WebKit
+     won't paint from). -->
+<svg class="defs" width="0" height="0" aria-hidden="true">
+  <defs>
+    <linearGradient id="cue-bars">
+      {#each bars as [offset, color], i (i)}<stop {offset} stop-color={color} />{/each}
+    </linearGradient>
+    <linearGradient id="cue-gradient"><stop offset="0" stop-color="#000" /><stop offset="1" stop-color="#fff" /></linearGradient>
+    <pattern id="cue-grid" width="64" height="64" patternUnits="userSpaceOnUse">
+      <rect width="64" height="64" fill="#000" />
+      <path d="M0 0H64M0 0V64" stroke="#fff" stroke-width="6" />
+    </pattern>
+  </defs>
+</svg>
+
 <section class="panel cues">
   <div class="panel-head">
     <div class="tabs">
@@ -94,7 +134,7 @@
     <button class="small" onclick={newGroup} title="Add group">+</button>
     <button class="small" onclick={renameGroup} disabled={!group}>Rename</button>
     <button class="small" onclick={removeGroup} disabled={(ui.show?.groups.length ?? 0) < 2}>Remove</button>
-    <span class="hint">click: load to Preview · double-click: load + GO · right-click: more</span>
+    <span class="hint">click: load to Preview (empty: store Preview) · double-click: load + GO · right-click: update, more</span>
   </div>
   <div class="grid">
     {#each slots as { slot, cue } (slot)}
@@ -109,10 +149,11 @@
         onclick={() => click(slot, cue)}
         ondblclick={() => dblclick(slot)}
         oncontextmenu={(e) => openMenu(e, cue)}
-        title={cue ? cue.name : 'Empty: click to create a cue from Preview'}
+        title={cue ? cue.name : 'Empty: click to store Preview here'}
       >
         <span class="num">{slot + 1}</span>
         {#if cue}
+          {@render thumb(cue)}
           <span class="cname">{cue.name}</span>
           <span class="meta">{cue.transition.kind}{cue.transition.kind !== 'Cut' ? ` ${cue.transition.durationMs}` : ''} · {Object.keys(cue.layersByScreen).length} scr</span>
         {/if}
@@ -129,6 +170,7 @@
   {@const cue = menu.cue}
   <div class="menu" class:up={menu.y > innerHeight / 2} class:left={menu.x > innerWidth - 240} style:left="{menu.x}px" style:top="{menu.y}px">
     {#if sameRef(ui.live.lastTaken, ref(cue.slot))}<div class="air"><span class="badge live">ON AIR</span> cue {cue.slot + 1} is on Program</div>{/if}
+    <button onclick={() => updateCue(ref(cue.slot))} disabled={!Object.keys(ui.live.preview).length} title="Replace this cue's layers and transition with what Preview shows now">Update with current view</button>
     <button onclick={() => renameCue(cue)}>Rename…</button>
     <button onclick={() => group && op({ op: 'DuplicateCue', groupId: group.id, from: cue.slot, to: firstEmptySlot(group, cue.slot) })}>Duplicate</button>
     <button onclick={() => deleteCue(cue)}>Delete</button>
@@ -176,7 +218,7 @@
     padding: 6px;
     display: grid;
     grid-template-columns: repeat(9, minmax(0, 1fr));
-    grid-auto-rows: 58px;
+    grid-auto-rows: 84px;
     gap: 5px;
   }
   .slot {
@@ -212,6 +254,24 @@
     left: 6px;
     font-size: 10px;
     color: var(--muted);
+    background: rgba(0, 0, 0, 0.6);
+    padding: 0 3px;
+    border-radius: 2px;
+  }
+  .thumb {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    margin-bottom: 2px;
+  }
+  .edge {
+    fill: none;
+    stroke: var(--border);
+    stroke-width: 1px;
+    vector-effect: non-scaling-stroke;
+  }
+  .defs {
+    position: absolute;
   }
   .cname {
     font-weight: 600;
