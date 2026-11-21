@@ -145,6 +145,56 @@ pub struct ClipTime {
     pub clip: String,
 }
 
+impl Refused {
+    pub fn message(&self) -> &str {
+        match self {
+            Refused::BadRequest(m) | Refused::Conflict(m) | Refused::Unavailable(m) => m,
+        }
+    }
+}
+
+/// Runs `command` on the controller, as the UI would; the engine messages to send. Checks first:
+/// the cue exists (1-based numbers), GO has something in Preview, transport has an engine.
+pub fn apply(c: &mut Controller, command: &Command, engine_connected: bool) -> Result<Vec<tessera_show::ToEngine>, Refused> {
+    use tessera_show::ShowOp;
+    let cue = |c: &Controller, group: usize, cue: u32| -> Result<crate::controller::CueRef, Refused> {
+        let g = c.show.groups.get(group - 1).ok_or_else(|| Refused::BadRequest(format!("there is no group {group}")))?;
+        if !g.cues.iter().any(|x| x.slot == cue - 1) {
+            return Err(Refused::BadRequest(format!("group {group} ({}) has no cue {cue}", g.name)));
+        }
+        Ok(crate::controller::CueRef { group_id: g.id, slot: cue - 1 })
+    };
+    let volume = |c: &mut Controller, v: f32| c.apply(ShowOp::SetMasterVolume { volume: v.clamp(0., 1.) }).map_err(Refused::BadRequest);
+    match *command {
+        Command::Go if c.pvw.scene.is_empty() => Err(Refused::Conflict("Preview is empty: load a cue first".into())),
+        Command::Go => Ok(c.take()),
+        Command::Load { group, cue: n } => {
+            let r = cue(c, group, n)?;
+            c.load_cue(r).map_err(Refused::BadRequest)
+        }
+        Command::Fire { group, cue: n } => {
+            let r = cue(c, group, n)?;
+            let mut out = c.load_cue(r).map_err(Refused::BadRequest)?;
+            out.extend(c.take());
+            Ok(out)
+        }
+        Command::Next => Ok(c.load_next()),
+        Command::Previous => Ok(c.load_prev()),
+        Command::Transport { .. } if !engine_connected => Err(Refused::Unavailable("the engine is not connected".into())),
+        Command::Transport { bus, action } => Ok(c.transport(bus, None, action)),
+        Command::Volume(v) => volume(c, v),
+        Command::VolumeBy(d) => {
+            let v = c.show.master_volume + d;
+            volume(c, v)
+        }
+    }
+}
+
+/// Whether `command` changes the show (an undo step that is autosaved) rather than only the buses.
+pub fn edits_show(command: &Command) -> bool {
+    matches!(command, Command::Volume(_) | Command::VolumeBy(_))
+}
+
 /// The state from the controller and the engine's status word.
 pub fn snapshot(ctl: &Controller, engine: &str) -> Snapshot {
     let show = &ctl.show;
@@ -513,6 +563,39 @@ mod tests {
         // Without the key: refused before the upgrade.
         let bare = format!("ws://127.0.0.1:{}/api/v1/events", server.addr.port());
         assert!(tokio_tungstenite::connect_async(bare).await.is_err());
+    }
+
+    /// Commands on a real controller: 1-based cues, fire, next/previous, GO's empty-Preview check,
+    /// transport needs the engine, volume clamps.
+    #[test]
+    fn apply_runs_commands_on_the_controller() {
+        use tessera_show::{Layer, Pattern, Rect, Scene, ShowOp, Source, ToEngine};
+        let mut c = Controller::new();
+        let s = uuid::Uuid::new_v4();
+        let group_id = c.show.groups[0].id;
+        for slot in [0, 4] {
+            let layers = Scene::from([(s, vec![Layer::new(Source::Pattern { pattern: Pattern::Bars }, Rect { x: 0., y: 0., w: 1., h: 1. })])]);
+            let cue = tessera_show::Cue { id: uuid::Uuid::new_v4(), name: format!("c{slot}"), slot, layers_by_screen: layers,
+                transition: tessera_show::Transition { kind: tessera_show::TransitionKind::Cut, duration_ms: 0 }, hotkey: None };
+            c.apply(ShowOp::SetCue { group_id, cue }).unwrap();
+        }
+        assert!(matches!(apply(&mut c, &Command::Go, true), Err(Refused::Conflict(_))), "nothing in Preview");
+        assert!(matches!(apply(&mut c, &Command::Load { group: 1, cue: 2 }, true), Err(Refused::BadRequest(m)) if m.contains("no cue 2")));
+        assert!(matches!(apply(&mut c, &Command::Load { group: 2, cue: 1 }, true), Err(Refused::BadRequest(m)) if m.contains("no group 2")));
+        apply(&mut c, &Command::Load { group: 1, cue: 5 }, true).unwrap();
+        assert_eq!(c.pvw.cue.map(|r| r.slot), Some(4));
+        apply(&mut c, &Command::Previous, true).unwrap();
+        assert_eq!(c.pvw.cue.map(|r| r.slot), Some(0));
+        apply(&mut c, &Command::Next, true).unwrap();
+        let out = apply(&mut c, &Command::Fire { group: 1, cue: 1 }, true).unwrap();
+        assert!(out.iter().any(|m| matches!(m, ToEngine::Take { .. })), "fire takes");
+        assert_eq!(c.last_taken.map(|r| r.slot), Some(0));
+        assert!(matches!(apply(&mut c, &Command::Transport { bus: Bus::Pgm, action: TransportAction::Pause }, false), Err(Refused::Unavailable(_))));
+        apply(&mut c, &Command::Transport { bus: Bus::Pgm, action: TransportAction::Pause }, true).unwrap();
+        apply(&mut c, &Command::Volume(0.4), true).unwrap();
+        apply(&mut c, &Command::VolumeBy(0.9), true).unwrap();
+        assert_eq!(c.show.master_volume, 1.0, "clamped");
+        assert!(edits_show(&Command::Volume(0.1)) && !edits_show(&Command::Go));
     }
 
     #[test]

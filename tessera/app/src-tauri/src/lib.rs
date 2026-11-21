@@ -130,53 +130,20 @@ fn engine_word(app: &AppHandle) -> &'static str {
 /// Remote commands run through `dispatch`, exactly as the UI's do, so the UI follows.
 struct AppControl(AppHandle);
 
-impl AppControl {
-    /// The cue at 1-based (group, cue), if the show has it.
-    fn cue(&self, group: usize, cue: u32) -> Result<CueRef, remote::Refused> {
-        let state = self.0.state::<AppState>();
-        let ctl = state.ctl();
-        let g = ctl.show.groups.get(group - 1).ok_or_else(|| remote::Refused::BadRequest(format!("there is no group {group}")))?;
-        let slot = cue - 1;
-        if !g.cues.iter().any(|c| c.slot == slot) {
-            return Err(remote::Refused::BadRequest(format!("group {group} ({}) has no cue {cue}", g.name)));
-        }
-        Ok(CueRef { group_id: g.id, slot })
-    }
-}
-
 impl remote::Control for AppControl {
     fn run(&self, command: remote::Command) -> Result<(), remote::Refused> {
-        use remote::{Command as C, Refused};
         let app = &self.0;
-        let preview_empty = || app.state::<AppState>().ctl().pvw.scene.is_empty();
-        let done = match command {
-            C::Go if preview_empty() => return Err(Refused::Conflict("Preview is empty: load a cue first".into())),
-            C::Go => dispatch(app, Change::Live, |c| Ok(c.take())),
-            C::Load { group, cue } => {
-                let r = self.cue(group, cue)?;
-                dispatch(app, Change::Live, |c| c.load_cue(r))
-            }
-            C::Fire { group, cue } => {
-                let r = self.cue(group, cue)?;
-                dispatch(app, Change::Live, |c| {
-                    let mut out = c.load_cue(r)?;
-                    out.extend(c.take());
-                    Ok(out)
-                })
-            }
-            C::Next => dispatch(app, Change::Live, |c| Ok(c.load_next())),
-            C::Previous => dispatch(app, Change::Live, |c| Ok(c.load_prev())),
-            C::Transport { .. } if app.state::<Engine>().info().is_none() => {
-                return Err(Refused::Unavailable("the engine is not connected".into()));
-            }
-            C::Transport { bus, action } => dispatch(app, Change::Live, |c| Ok(c.transport(bus, None, action))),
-            C::Volume(v) => dispatch(app, Change::Edit, |c| c.apply(ShowOp::SetMasterVolume { volume: v.clamp(0., 1.) })),
-            C::VolumeBy(d) => dispatch(app, Change::Edit, |c| {
-                let volume = (c.show.master_volume + d).clamp(0., 1.);
-                c.apply(ShowOp::SetMasterVolume { volume })
-            }),
-        };
-        done.map_err(Refused::BadRequest)
+        let connected = app.state::<Engine>().info().is_some();
+        let change = if remote::edits_show(&command) { Change::Edit } else { Change::Live };
+        let mut refused = None;
+        dispatch(app, change, |c| {
+            remote::apply(c, &command, connected).map_err(|r| {
+                let message = r.message().to_string();
+                refused = Some(r);
+                message
+            })
+        })
+        .map_err(|m| refused.take().unwrap_or(remote::Refused::BadRequest(m)))
     }
 
     fn state(&self) -> remote::Snapshot {
