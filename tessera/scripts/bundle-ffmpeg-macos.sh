@@ -12,7 +12,10 @@ fw="$app/Contents/Frameworks"
 at="@executable_path/../Frameworks"
 
 # Points $1's non-system load paths at Frameworks, copying in (and queueing) dylibs not there yet.
-# Signatures are removed while editing (install_name_tool invalidates them) and redone at the end.
+# install_name_tool edits the signed files (it may warn that the signature is now invalid); every
+# file is re-signed at the end. No `codesign --remove-signature` first: on CI's macOS 15 that left
+# files Xcode 16's install_name_tool refuses ("link edit information does not fill the __LINKEDIT
+# segment").
 todo=""
 fix() {
   for ref in $(otool -L "$1" | tail -n +2 | awk '{print $1}'); do
@@ -25,14 +28,13 @@ fix() {
     if [ ! -e "$fw/$name" ]; then
       cp "$ref" "$fw/$name" # follows Homebrew's opt/ symlinks to the real file
       chmod u+w "$fw/$name"
-      codesign --remove-signature "$fw/$name"
       install_name_tool -id "$at/$name" "$fw/$name"
       todo="$todo $name"
     fi
     install_name_tool -change "$ref" "$at/$name" "$1"
   done
 }
-codesign --remove-signature "$app/Contents/MacOS/tessera-render" # fails first if there is no app
+[ -f "$app/Contents/MacOS/tessera-render" ] || { echo "bundle-ffmpeg-macos: no app at $app" >&2; exit 1; }
 mkdir -p "$fw"
 fix "$app/Contents/MacOS/tessera-render"
 while [ -n "$todo" ]; do
