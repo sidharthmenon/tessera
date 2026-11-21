@@ -3,7 +3,7 @@
 | File | For |
 |---|---|
 | `Tessera_{{VERSION}}_macos_arm64.dmg` | macOS 12 or newer, Apple Silicon |
-| `Tessera_{{VERSION}}_x64-setup.exe` | Windows 10/11, x64. **Untested so far:** run the pre-show checklist in `tessera/README.md` before a show. |
+| `Tessera_{{VERSION}}_x64-setup.exe` | Windows 10/11, x64. **Untested so far:** run the [pre-show checklist](https://github.com/sidharthmenon/tessera/blob/main/tessera/README.md) before a show. |
 | `tessera-companion-{{VERSION}}.tgz` | Bitfocus Companion 4.0 or newer: the Tessera connection module |
 
 ## Install
@@ -17,7 +17,7 @@ start is blocked: open System Settings → Privacy & Security, scroll down and c
 
 **Companion.** In Companion: **Modules** → **Import module package** → the `.tgz`. Then add a
 **Tessera** connection, and turn on remote control in Tessera (status bar → **Remote**). See
-`tessera/docs/external-control.md`.
+[external control](https://github.com/sidharthmenon/tessera/blob/main/tessera/docs/external-control.md).
 
 ## Third-party: FFmpeg
 
@@ -25,7 +25,7 @@ Tessera uses [FFmpeg](https://ffmpeg.org) under the LGPL 2.1 or later, dynamical
 libraries sit next to the app and can be replaced).
 
 - macOS: FFmpeg built from `ffmpeg-9.0.2.tar.xz` (attached to this release) with
-  `tessera/scripts/build-ffmpeg-macos.sh`.
+  [`build-ffmpeg-macos.sh`](https://github.com/sidharthmenon/tessera/blob/main/tessera/scripts/build-ffmpeg-macos.sh).
 - Windows: the LGPL shared build from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds),
   {{FFMPEG_WINDOWS}}. Its source and build scripts are linked there.
 

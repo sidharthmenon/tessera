@@ -6,8 +6,8 @@
 	"description": "Control the Tessera media server: GO, cues, playback, master volume, with live cue and on-air feedback.",
 	"version": "0.0.0",
 	"license": "MIT",
-	"repository": "git+https://github.com/tessera-media-server/companion-module-tessera.git",
-	"bugs": "https://github.com/tessera-media-server/companion-module-tessera/issues",
+	"repository": "git+https://github.com/sidharthmenon/tessera.git",
+	"bugs": "https://github.com/sidharthmenon/tessera/issues",
 	"maintainers": [{ "name": "Tessera" }],
 	"legacyIds": [],
 	"runtime": {
