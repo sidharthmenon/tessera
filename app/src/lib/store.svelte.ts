@@ -1,9 +1,10 @@
 // UI state and the actions the panels call. The controller owns the show: everything that comes
 // from it is `$state.raw`, replaced wholesale by its events, never mutated here.
 import { ask, open, save } from '@tauri-apps/plugin-dialog';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 import * as api from './api';
 import type { CueRef, EngineInfo, Live } from './api';
-import { cueAt, findLayer, isAutosave, losesPicture, newLayer, onAir, same, sameRef, shiftLayer, withLayer, withScreen, type Scene } from './logic';
+import { cueAt, findLayer, isAutosave, isShowFile, losesPicture, newLayer, onAir, same, sameRef, shiftLayer, withLayer, withScreen, type Scene } from './logic';
 import type { Cue } from '$lib/bindings/Cue';
 import type { FromEngine } from '$lib/bindings/FromEngine';
 import type { Layer } from '$lib/bindings/Layer';
@@ -50,8 +51,13 @@ class Store {
   /** While set, show hotkeys are off. */
   modal = $state<'screens' | 'prompt' | 'menu' | null>(null);
   prompt = $state<{ title: string; value: string; done: (v: string | null) => void } | null>(null);
-  /** What is being dragged from Resources (WebKit's dataTransfer is unreliable for custom types). */
-  dragging = $state.raw<{ source: Source; name: string } | null>(null);
+  /** What is being dragged from Resources, and where the pointer is (a pointer drag: HTML drag
+   *  and drop is the native file-drop handler's, which brings files in from the Finder). */
+  dragging = $state.raw<{ source: Source; name: string; x: number; y: number } | null>(null);
+  /** Files from the file manager are being dragged over the window. */
+  fileDrag = $state(false);
+  /** Set by the canvas: drops a Resources item at a window point (no-op off the canvas). */
+  canvasDrop: ((x: number, y: number, item: { source: Source; name: string }) => void) | null = null;
 
   group = $derived(this.show?.groups.find((g) => g.id === this.activeGroupId) ?? this.show?.groups[0]);
   /** Where "+ PVW" adds: the selected layer's screen, else the one clicked, else the first. */
@@ -161,6 +167,10 @@ export async function init(): Promise<() => void> {
         api.on('engine-event', engineEvent),
         api.on('engine-info', setEngine),
         api.on('engine-stopped', (stopped) => (ui.engineStopped = stopped)),
+        getCurrentWebview().onDragDropEvent(({ payload }) => {
+          ui.fileDrag = payload.type === 'enter' || payload.type === 'over';
+          if (payload.type === 'drop') importDropped(payload.paths);
+        }),
         api.on('recovery-available', (p) => offerRecovery(p)),
       ])),
     );
@@ -222,6 +232,23 @@ export const saveShow = action(async (as = false) => {
   if (!path) return;
   await api.saveShow(path);
   ui.path = path;
+});
+
+/** Files dropped from the file manager go into the media list (show files are skipped: open those
+ *  from File → Open). */
+export const importDropped = action(async (paths: string[]) => {
+  const media = paths.filter((p) => !isShowFile(p));
+  const before = ui.show?.media.length ?? 0;
+  if (media.length) {
+    await api.importMedia(media);
+    await sync();
+  }
+  const added = (ui.show?.media.length ?? 0) - before;
+  const notes = [
+    media.length > added && `${media.length - added} already in Media or a folder`,
+    paths.length > media.length && `${paths.length - media.length} show file(s) skipped: use Open…`,
+  ].filter(Boolean);
+  toast([`${added} added to Media`, ...notes].join(' · '));
 });
 
 export const importMedia = action(async () => {

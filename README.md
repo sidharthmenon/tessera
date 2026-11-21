@@ -111,7 +111,7 @@ Run this in the release app or in `npm run tauri dev`:
 
 1. Add two **Window** outputs, plus one **Display** output on the second monitor.
 2. Make one 3840×1080 screen and map half of it to each window.
-3. Import an image and an mp4.
+3. Import an image and an mp4 (Import…, or drag the files from the Finder onto the window).
 4. Build two cues. Preview is a working scene: drag media onto it, then click an empty cue slot
    to store it there (right-click a cue → *Update with current view* to overwrite one).
    - cue 1: looping background video + image;

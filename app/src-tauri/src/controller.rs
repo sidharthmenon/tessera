@@ -391,10 +391,15 @@ impl Controller {
 
     /// Add media (one undo step) and ask the engine to probe each item.
     pub fn import_media(&mut self, paths: &[PathBuf]) -> Result<Vec<ToEngine>, String> {
-        let mut items = vec![];
+        let mut items: Vec<MediaItem> = vec![];
         for p in paths {
             let p = std::path::absolute(p).map_err(|e| format!("{}: {e}", p.display()))?;
             let p = crate::files::normalize(&p);
+            // A dropped folder isn't media; a file already in the list isn't added twice.
+            let path = p.to_string_lossy();
+            if p.is_dir() || self.show.media.iter().chain(&items).any(|m| m.path == path) {
+                continue;
+            }
             items.push(MediaItem {
                 id: Uuid::new_v4(),
                 name: p.file_name().map(|n| n.to_string_lossy().into()).unwrap_or_default(),
@@ -407,6 +412,9 @@ impl Controller {
                 has_alpha: false,
                 thumb: None,
             });
+        }
+        if items.is_empty() {
+            return Ok(vec![]); // nothing new: no undo step
         }
         let probes: Vec<_> =
             items.iter().map(|m| ToEngine::Probe { media_id: m.id, path: m.path.clone() }).collect();
@@ -885,6 +893,19 @@ mod tests {
             ToEngine::Probe { media_id: img.id, path: "/shows/a.PNG".into() },
             ToEngine::Probe { media_id: vid.id, path: "/shows/b.mov".into() },
         ]);
+    }
+
+    /// Drops bring folders and files already in the list: neither is added (and nothing at all is
+    /// no undo step).
+    #[test]
+    fn import_skips_folders_and_duplicates() {
+        let mut c = Controller::new();
+        let dir = std::env::temp_dir();
+        c.import_media(&[PathBuf::from("/shows/a.mov"), dir.clone(), PathBuf::from("/shows/a.mov")]).unwrap();
+        assert_eq!(c.show.media.iter().map(|m| m.path.as_str()).collect::<Vec<_>>(), ["/shows/a.mov"]);
+        let steps = c.undo.len();
+        assert!(c.import_media(&[PathBuf::from("/shows/a.mov"), dir]).unwrap().is_empty());
+        assert_eq!((c.show.media.len(), c.undo.len()), (1, steps));
     }
 
     #[test]

@@ -74,10 +74,24 @@
     listInputs();
   }
 
-  function dragStart(e: DragEvent, source: Source, name: string) {
-    ui.dragging = { source, name };
-    e.dataTransfer?.setData('text/plain', name);
-    if (e.dataTransfer) e.dataTransfer.effectAllowed = 'copy';
+  // A pointer drag (HTML drag and drop belongs to the native handler that brings in Finder files):
+  // past a few pixels it is a drag, shown by a label under the pointer; released over the canvas,
+  // it drops there.
+  let pressed: { source: Source; name: string; x: number; y: number } | null = null;
+  function press(e: PointerEvent, source: Source, name: string) {
+    if (e.button !== 0 || (e.target as Element).closest('button')) return;
+    (e.currentTarget as Element).setPointerCapture(e.pointerId);
+    pressed = { source, name, x: e.clientX, y: e.clientY };
+  }
+  function drag(e: PointerEvent) {
+    if (!pressed || (!ui.dragging && Math.hypot(e.clientX - pressed.x, e.clientY - pressed.y) < 5)) return;
+    ui.dragging = { source: pressed.source, name: pressed.name, x: e.clientX, y: e.clientY };
+  }
+  function release(e: PointerEvent) {
+    const item = ui.dragging;
+    pressed = null;
+    ui.dragging = null;
+    if (item) ui.canvasDrop?.(e.clientX, e.clientY, item);
   }
 </script>
 
@@ -90,10 +104,11 @@
 
 {#snippet row(source: Source, name: string, sub: string, thumb: string | null, icon: string, item?: MediaItem)}
   <li
-    draggable="true"
     class:unused={item && !uses.has(item.id)}
-    ondragstart={(e) => dragStart(e, source, name)}
-    ondragend={() => (ui.dragging = null)}
+    onpointerdown={(e) => press(e, source, name)}
+    onpointermove={drag}
+    onpointerup={release}
+    onpointercancel={() => (pressed = ui.dragging = null)}
     oncontextmenu={(e) => item && openMenu(e, item)}
     title="Drag onto a screen in the canvas to fill it, or onto a layer to replace it{item ? ' · right-click: remove' : ''}"
   >
@@ -108,7 +123,8 @@
   </li>
 {/snippet}
 
-<section class="panel resources">
+<section class="panel resources" class:files={ui.fileDrag}>
+  {#if ui.fileDrag}<div class="drop-files">Drop to add to Media</div>{/if}
   <div class="panel-head">
     <div class="tabs">
       <button class:on={tab === 'media'} onclick={() => (tab = 'media')}>Media</button>
@@ -171,6 +187,10 @@
   {/if}
 </section>
 
+{#if ui.dragging}
+  <div class="ghost" style:left="{ui.dragging.x + 12}px" style:top="{ui.dragging.y + 8}px">{ui.dragging.name}</div>
+{/if}
+
 {#if menu}
   {@const item = menu.item}
   <div class="menu" class:up={menu.y > innerHeight / 2} style:left="{menu.x}px" style:top="{menu.y}px">
@@ -182,6 +202,36 @@
 <style>
   .resources {
     grid-area: res;
+    position: relative;
+  }
+  .resources.files {
+    outline: 2px dashed var(--accent);
+    outline-offset: -2px;
+  }
+  .drop-files {
+    position: absolute;
+    inset: 0;
+    z-index: 5;
+    display: grid;
+    place-items: center;
+    background: rgba(0, 0, 0, 0.6);
+    color: var(--accent-2);
+    font-weight: 600;
+    pointer-events: none;
+  }
+  .ghost {
+    position: fixed;
+    z-index: 50;
+    max-width: 220px;
+    padding: 2px 8px;
+    border-radius: var(--radius);
+    background: var(--accent);
+    color: #000;
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
   }
   .tools {
     display: flex;
@@ -236,6 +286,7 @@
     flex: 1;
   }
   li {
+    user-select: none;
     display: flex;
     align-items: center;
     gap: 8px;

@@ -267,6 +267,9 @@ export function losesPicture(before: Scene, after: Scene): boolean {
   });
 }
 
+/** A show file (or an autosave of one): not media. */
+export const isShowFile = (p: string) => /\.tshow$/i.test(p) || isAutosave(p);
+
 /** An autosave, or one kept from an earlier session (`….autosave.prev`, `….autosave.<ms>.prev`):
  *  it opens as untitled work. */
 export const isAutosave = (p: string) => /\.autosave(\.\d+(-\d+)?)?\.prev$|\.autosave$/.test(p);

@@ -247,6 +247,7 @@ eq([L.cropBox({ left: 0.6, top: 0, right: 0.6, bottom: 0 }), L.cropBox({ left: N
   // Already cropped (the rect shows half the source): a unit is worth twice as much source.
   eq(round(L.cropDrag({ x: 0, y: 0, w: 500, h: 500 }, { ...none, right: 0.5 }, 'left', 100)).crop.left, 0.1, 'scale follows the kept part');
 }
+eq(['/a/b.tshow', '/a/b.TSHOW', '/a/b.tshow.autosave', '/a/clip.mp4', '/a/still.png'].map(L.isShowFile), [true, true, true, false, false], 'show files are not media');
 eq(L.patternFill({ type: 'Bars' }), 'url(#cue-bars)', 'bars fill');
 
 console.log('logic: all checks passed');

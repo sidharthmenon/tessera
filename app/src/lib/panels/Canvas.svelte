@@ -3,6 +3,8 @@
   import type { Rect } from '$lib/bindings/Rect';
   import type { Screen } from '$lib/bindings/Screen';
   import { boxOf, clipTime, cropDrag, cueAt, dragRect, fmtTime, engineUrl, fitScale, layoutBounds, mediaOf, screenAt, snapDrag, type CropSide, type DragMode } from '$lib/logic';
+  import { onMount } from 'svelte';
+  import type { Source } from '$lib/bindings/Source';
   import { addToPvw, editLayer, fail, ui } from '$lib/store.svelte';
 
   let cw = $state(0);
@@ -73,38 +75,48 @@
   }
 
   /** The screen under the pointer. */
-  function screenUnder(e: MouseEvent) {
+  function screenUnder(e: { clientX: number; clientY: number }) {
     if (!stage || scale <= 0) return undefined;
     const r = stage.getBoundingClientRect();
     return screenAt(screens, bounds.x + (e.clientX - r.left) / scale, bounds.y + (e.clientY - r.top) / scale);
   }
 
-  /** The editable layer box under a drag. */
-  function boxUnder(e: DragEvent) {
-    const id = (e.target as Element).closest?.('[data-layer]')?.getAttribute('data-layer');
-    return boxes.find((b) => b.l.id === id);
+  let area = $state<HTMLDivElement>();
+
+  /** What a Resources item dropped at window point (x, y) would land on: a layer box, else a
+   *  screen; `onCanvas` false off the canvas. */
+  function targetAt(x: number, y: number) {
+    const el = document.elementFromPoint(x, y);
+    if (!el || !area?.contains(el)) return { onCanvas: false };
+    const id = el.closest('[data-layer]')?.getAttribute('data-layer');
+    const box = boxes.find((b) => b.l.id === id);
+    return { onCanvas: true, box, screen: box ? undefined : screenUnder({ clientX: x, clientY: y }) };
   }
 
-  /** Where a drag from Resources would drop: onto a layer, else onto a screen. */
-  let hover = $state<{ screenId?: string; layerId?: string }>({});
+  /** Where the dragged Resources item would drop, for the highlight. */
+  const hover = $derived.by(() => {
+    if (!ui.dragging) return {};
+    const t = targetAt(ui.dragging.x, ui.dragging.y);
+    return { layerId: t.box?.l.id, screenId: t.screen?.id };
+  });
 
   /** Dropped onto a layer, media replaces its source (rect and settings kept); elsewhere it fills
-   *  the screen it lands on as a new layer. */
-  function drop(e: DragEvent) {
-    e.preventDefault();
-    const item = ui.dragging;
-    ui.dragging = null;
-    hover = {};
-    if (!item) return;
-    const b = boxUnder(e);
-    if (b) {
-      ui.selected = { screenId: b.s.id, layerId: b.l.id };
+   *  the screen it lands on as a new layer. Off the canvas: nothing. */
+  function drop(x: number, y: number, item: { source: Source; name: string }) {
+    const t = targetAt(x, y);
+    if (!t.onCanvas) return;
+    if (t.box) {
+      ui.selected = { screenId: t.box.s.id, layerId: t.box.l.id };
       return editLayer(ui.selected, (l) => ({ ...l, source: item.source, name: item.name }));
     }
-    const screen = screenUnder(e);
-    if (!screen) return fail('Drop onto a screen');
-    addToPvw(item.source, item.name, screen);
+    if (!t.screen) return fail('Drop onto a screen');
+    addToPvw(item.source, item.name, t.screen);
   }
+
+  onMount(() => {
+    ui.canvasDrop = drop;
+    return () => (ui.canvasDrop = null);
+  });
 </script>
 
 <section class="panel canvas">
@@ -140,18 +152,9 @@
   <div
     class="area"
     class:live={ui.canvasTab === 'pgm'}
+    bind:this={area}
     bind:clientWidth={cw}
     bind:clientHeight={ch}
-    ondragover={(e) => {
-      if (!ui.dragging) return;
-      e.preventDefault();
-      const b = boxUnder(e);
-      hover = b ? { layerId: b.l.id } : { screenId: screenUnder(e)?.id };
-    }}
-    ondragleave={(e) => {
-      if (!(e.currentTarget as Element).contains(e.relatedTarget as Node | null)) hover = {};
-    }}
-    ondrop={drop}
     onpointerdown={(e) => {
       ui.selected = null;
       ui.screenId = screenUnder(e)?.id ?? null;
