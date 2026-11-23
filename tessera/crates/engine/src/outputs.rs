@@ -44,6 +44,9 @@ struct OutputWindow {
     stuck_until: Option<Instant>,
     /// What the last frame's acquire said, logged when it changes.
     state: &'static str,
+    /// wgpu took the surface's configuration. Until then the output is skipped (acquiring from an
+    /// unconfigured surface panics) and set up again every `STUCK_RETRY`.
+    configured: bool,
 }
 
 /// How long an output that timed out waiting for a drawable is left alone.
@@ -150,6 +153,14 @@ impl Outputs {
             if w.stuck_until.is_some_and(|until| start < until) {
                 continue;
             }
+            if !w.configured {
+                // Refused before: a new surface (made while the window isn't on top); drawn from
+                // the next frame on.
+                if let Err(e) = replace_surface(gpu, w) {
+                    w.not_configured(&output.name, &format!("{e:#}"));
+                }
+                continue;
+            }
             let acquired = w.surface.get_current_texture();
             self.acquire += start.elapsed();
             let state = match &acquired {
@@ -165,12 +176,14 @@ impl Outputs {
             let frame = match acquired {
                 wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
                 wgpu::CurrentSurfaceTexture::Outdated => {
-                    configure(gpu, &w.surface, &w.config);
+                    if let Err(e) = configure(gpu, &w.surface, &w.config) {
+                        w.not_configured(&output.name, &e.to_string());
+                    }
                     continue;
                 }
                 wgpu::CurrentSurfaceTexture::Lost => {
                     if let Err(e) = replace_surface(gpu, w) {
-                        log!("output '{}': surface lost, recreate failed: {e}", output.name);
+                        w.not_configured(&output.name, &format!("surface lost, recreate failed: {e:#}"));
                     }
                     continue;
                 }
@@ -257,18 +270,38 @@ fn open(
         alpha_mode,
         view_formats: vec![],
     };
-    configure(gpu, &surface, &config);
-    keep_on_top(&window, &place, true);
-    Ok(OutputWindow { window, surface, config, place, presented: false, stuck_until: None, state: "" })
+    let mut w = OutputWindow { window, surface, config, place, presented: false, stuck_until: None, state: "", configured: false };
+    match configure(gpu, &w.surface, &w.config) {
+        Ok(()) => {
+            w.configured = true;
+            keep_on_top(&w.window, &w.place, true);
+        }
+        Err(e) => w.not_configured(&output.name, &e.to_string()),
+    }
+    Ok(w)
 }
 
-/// After `Lost`: a new surface for `w`'s window. The old one goes first: DXGI makes no second swap
-/// chain for a window while it has one (E_ACCESSDENIED).
+impl OutputWindow {
+    /// The surface was refused: skipped until `render` sets it up again, `STUCK_RETRY` from now.
+    fn not_configured(&mut self, name: &str, why: &str) {
+        self.configured = false;
+        self.stuck_until = Some(Instant::now() + STUCK_RETRY);
+        if std::mem::replace(&mut self.state, "not configured") != "not configured" {
+            let why = why.split_whitespace().collect::<Vec<_>>().join(" "); // wgpu's errors span lines
+            log!("output '{name}': can't present ({why}); trying again every {STUCK_RETRY:?}");
+        }
+    }
+}
+
+/// A new surface for `w`'s window: after `Lost`, or to retry one that was refused. The old one goes
+/// first: DXGI makes no second swap chain for a window while it has one (E_ACCESSDENIED).
 fn replace_surface(gpu: &Gpu, w: &mut OutputWindow) -> anyhow::Result<()> {
     let surface = gpu.instance.create_surface(w.window.clone())?;
     keep_on_top(&w.window, &w.place, false);
     w.surface = surface; // drops the old surface, and its swap chain
-    configure(gpu, &w.surface, &w.config);
+    w.configured = false;
+    configure(gpu, &w.surface, &w.config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    w.configured = true;
     keep_on_top(&w.window, &w.place, true);
     Ok(())
 }
@@ -290,14 +323,19 @@ fn keep_on_top(window: &Window, place: &Place, on_top: bool) {
 /// off, so a display that stops taking frames without its window counting as occluded (an LED
 /// processor losing sync) would hang the single render loop, and every output with it, until the
 /// controller restarts the engine. With the limit that output skips frames (`Timeout`) and the
-/// others carry on.
-fn configure(gpu: &Gpu, surface: &wgpu::Surface<'_>, config: &wgpu::SurfaceConfiguration) {
+/// others carry on. Err: wgpu refused the configuration, and the surface can't be drawn to.
+fn configure(gpu: &Gpu, surface: &wgpu::Surface<'_>, config: &wgpu::SurfaceConfiguration) -> Result<(), wgpu::Error> {
+    let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
     surface.configure(&gpu.device, config);
+    if let Some(e) = pollster::block_on(scope.pop()) {
+        return Err(e);
+    }
     #[cfg(target_os = "macos")]
     // SAFETY: only a CAMetalLayer property is set; the surface stays wgpu's.
     if let Some(hal) = unsafe { surface.as_hal::<wgpu::hal::api::Metal>() } {
         hal.render_layer().lock().setAllowsNextDrawableTimeout(true);
     }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -375,11 +413,12 @@ mod tests {
     }
 
     /// Windows: a Display output gets a swap chain and presents, also once its surface is replaced
-    /// (as after `Lost`). Opens a fullscreen window on the last monitor for a moment; skipped with
-    /// no monitor.
+    /// (as after `Lost`); one whose surface is refused is skipped, not drawn, and comes back when
+    /// set up again. Opens a fullscreen window on the last monitor for a moment; skipped with no
+    /// monitor. (One test: winit allows one event loop per process.)
     #[test]
     #[cfg(windows)]
-    fn display_output_presents_after_open_and_surface_replacement() {
+    fn display_output_presents_and_comes_back_from_a_refused_surface() {
         use winit::application::ApplicationHandler;
         use winit::event_loop::EventLoop;
         use winit::platform::windows::EventLoopBuilderExtWindows;
@@ -428,9 +467,28 @@ mod tests {
                 brightness: 1.0,
             };
             let mut w = scoped(gpu, || open(event_loop, gpu, &output, Place::Display(info.clone()), (info.width, info.height)))??;
+            anyhow::ensure!(w.configured, "not configured after open");
             present(gpu, &w).context("after open")?;
             scoped(gpu, || replace_surface(gpu, &mut w))??;
-            present(gpu, &w).context("after replacing the surface")
+            anyhow::ensure!(w.configured, "not configured after replacing the surface");
+            present(gpu, &w).context("after replacing the surface")?;
+            // A surface wgpu refuses to configure (DXGI makes no swap chain for this window now that
+            // it is on top): that output is skipped, never drawn from (get_current_texture would
+            // panic), and set up again later.
+            w.surface = gpu.instance.create_surface(w.window.clone())?;
+            if let Err(e) = configure(gpu, &w.surface, &w.config) {
+                w.not_configured(&output.name, &e.to_string());
+            }
+            anyhow::ensure!(!w.configured, "configured although the window is on top: the premise of this check is gone");
+            let (id, mut outputs, mut compositor, screens) = (output.id, Outputs::default(), Compositor::new(gpu), HashMap::new());
+            outputs.windows.insert(id, w);
+            let mut render = |outputs: &mut Outputs| outputs.render(gpu, &mut compositor, std::slice::from_ref(&output), &[], &screens);
+            anyhow::ensure!(!render(&mut outputs), "presented from a surface that has no swap chain");
+            outputs.windows.get_mut(&id).context("output gone")?.stuck_until = None; // the retry is due
+            anyhow::ensure!(!render(&mut outputs), "presented in the frame that set the surface up again");
+            anyhow::ensure!(outputs.windows[&id].configured, "not configured after the retry");
+            anyhow::ensure!(render(&mut outputs), "not presenting after the retry");
+            Ok(())
         }
         let gpu = Gpu::new_headless().expect("these tests need a GPU");
         let event_loop = EventLoop::builder().with_any_thread(true).build().unwrap();
