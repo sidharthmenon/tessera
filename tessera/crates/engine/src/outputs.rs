@@ -169,12 +169,8 @@ impl Outputs {
                     continue;
                 }
                 wgpu::CurrentSurfaceTexture::Lost => {
-                    match gpu.instance.create_surface(w.window.clone()) {
-                        Ok(s) => {
-                            configure(gpu, &s, &w.config);
-                            w.surface = s;
-                        }
-                        Err(e) => log!("output '{}': surface lost, recreate failed: {e}", output.name),
+                    if let Err(e) = replace_surface(gpu, w) {
+                        log!("output '{}': surface lost, recreate failed: {e}", output.name);
                     }
                     continue;
                 }
@@ -262,7 +258,32 @@ fn open(
         view_formats: vec![],
     };
     configure(gpu, &surface, &config);
+    keep_on_top(&window, &place, true);
     Ok(OutputWindow { window, surface, config, place, presented: false, stuck_until: None, state: "" })
+}
+
+/// After `Lost`: a new surface for `w`'s window. The old one goes first: DXGI makes no second swap
+/// chain for a window while it has one (E_ACCESSDENIED).
+fn replace_surface(gpu: &Gpu, w: &mut OutputWindow) -> anyhow::Result<()> {
+    let surface = gpu.instance.create_surface(w.window.clone())?;
+    keep_on_top(&w.window, &w.place, false);
+    w.surface = surface; // drops the old surface, and its swap chain
+    configure(gpu, &w.surface, &w.config);
+    keep_on_top(&w.window, &w.place, true);
+    Ok(())
+}
+
+/// Display outputs sit above every other window (macOS: `fullscreen` sets the level). DXGI makes no
+/// swap chain for a window that is always on top and covers its monitor (DXGI_ERROR_INVALID_CALL),
+/// so a Display window goes on top only once its swap chain exists, and down while it gets a new one.
+fn keep_on_top(window: &Window, place: &Place, on_top: bool) {
+    #[cfg(not(target_os = "macos"))]
+    if matches!(place, Place::Display(_)) {
+        use winit::window::WindowLevel;
+        window.set_window_level(if on_top { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal });
+    }
+    #[cfg(target_os = "macos")]
+    let _ = (window, place, on_top);
 }
 
 /// `Surface::configure`, then (macOS) a 1 s limit on waiting for a drawable. wgpu turns that limit
@@ -306,10 +327,10 @@ fn fullscreen(event_loop: &ActiveEventLoop, attrs: WindowAttributes, monitor: &M
     Ok(window)
 }
 
+/// Borderless fullscreen at normal level: `keep_on_top` lifts it once it has a swap chain.
 #[cfg(not(target_os = "macos"))]
 fn fullscreen(event_loop: &ActiveEventLoop, attrs: WindowAttributes, monitor: &MonitorHandle) -> anyhow::Result<Window> {
-    use winit::window::{Fullscreen, WindowLevel};
-    let attrs = attrs.with_window_level(WindowLevel::AlwaysOnTop);
+    use winit::window::Fullscreen;
     Ok(event_loop.create_window(attrs.with_fullscreen(Some(Fullscreen::Borderless(Some(monitor.clone())))))?)
 }
 
@@ -351,6 +372,71 @@ mod tests {
 
     fn display(name: &str, x: i32, y: i32) -> OutputTarget {
         OutputTarget::Display { monitor_name: name.into(), monitor_x: x, monitor_y: y }
+    }
+
+    /// Windows: a Display output gets a swap chain and presents, also once its surface is replaced
+    /// (as after `Lost`). Opens a fullscreen window on the last monitor for a moment; skipped with
+    /// no monitor.
+    #[test]
+    #[cfg(windows)]
+    fn display_output_presents_after_open_and_surface_replacement() {
+        use winit::application::ApplicationHandler;
+        use winit::event_loop::EventLoop;
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+
+        struct Check {
+            gpu: Gpu,
+            result: Option<anyhow::Result<()>>,
+        }
+        impl ApplicationHandler for Check {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                if self.result.is_none() {
+                    self.result = Some(check(event_loop, &self.gpu));
+                }
+                event_loop.exit();
+            }
+            fn window_event(&mut self, _: &ActiveEventLoop, _: winit::window::WindowId, _: winit::event::WindowEvent) {}
+        }
+        /// Any validation error from `f` (wgpu reports surface failures that way).
+        fn scoped<T>(gpu: &Gpu, f: impl FnOnce() -> T) -> anyhow::Result<T> {
+            let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let value = f();
+            match pollster::block_on(scope.pop()) {
+                Some(e) => Err(anyhow::anyhow!("{e}")),
+                None => Ok(value),
+            }
+        }
+        fn present(gpu: &Gpu, w: &OutputWindow) -> anyhow::Result<()> {
+            match scoped(gpu, || w.surface.get_current_texture())? {
+                wgpu::CurrentSurfaceTexture::Success(frame) | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => scoped(gpu, || gpu.queue.present(frame)),
+                other => anyhow::bail!("no frame to present: {:?}", std::mem::discriminant(&other)),
+            }
+        }
+        fn check(event_loop: &ActiveEventLoop, gpu: &Gpu) -> anyhow::Result<()> {
+            let Some(monitor) = event_loop.available_monitors().last() else {
+                eprintln!("skipped: no monitor");
+                return Ok(());
+            };
+            let info = monitor_info(&monitor);
+            let output = Output {
+                id: Uuid::new_v4(),
+                name: "display output test".into(),
+                node: "local".into(),
+                target: display(&info.name, info.x, info.y),
+                width: info.width,
+                height: info.height,
+                brightness: 1.0,
+            };
+            let mut w = scoped(gpu, || open(event_loop, gpu, &output, Place::Display(info.clone()), (info.width, info.height)))??;
+            present(gpu, &w).context("after open")?;
+            scoped(gpu, || replace_surface(gpu, &mut w))??;
+            present(gpu, &w).context("after replacing the surface")
+        }
+        let gpu = Gpu::new_headless().expect("these tests need a GPU");
+        let event_loop = EventLoop::builder().with_any_thread(true).build().unwrap();
+        let mut check = Check { gpu, result: None };
+        event_loop.run_app(&mut check).unwrap();
+        check.result.expect("the event loop never resumed").unwrap();
     }
 
     #[test]
