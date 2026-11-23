@@ -259,6 +259,37 @@ async fn mjpeg_preview_streams_jpeg_parts() {
     }
 }
 
+/// One viewer per bus: a newer stream ends the older. WebKit never closes the stream of an `<img>`
+/// it removed, and it opens at most 6 connections to a host: after three leaked pairs the next
+/// previews waited for a connection forever (black canvas and output monitor).
+#[tokio::test]
+async fn a_newer_stream_ends_the_older() {
+    let s = server();
+    let previews = s.previews.clone();
+    std::thread::spawn(move || {
+        for _ in 0..500 {
+            if previews.watched(Bus::Pgm) {
+                previews.publish_rgba(Bus::Pgm, 8, 8, vec![200; 8 * 8 * 4]).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let path = format!("/preview/pgm.mjpg?token={TOKEN}");
+    let mut old = TcpStream::connect(s.addr).await.unwrap();
+    old.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let (mut seen, mut chunk) = (vec![], [0; 4096]);
+    while find(&seen, b"--frame").is_none() {
+        let n = timeout(WAIT, old.read(&mut chunk)).await.expect("no part within 5 s").unwrap();
+        assert!(n > 0, "closed before its first part");
+        seen.extend_from_slice(&chunk[..n]);
+    }
+    let parts = |r: &[u8]| r.windows(7).filter(|w| *w == b"--frame").count();
+    let newer = tokio::spawn(async move { get_until(&s, &path, |r| parts(r) >= 3).await });
+    let ended = timeout(WAIT, async { while old.read(&mut chunk).await.is_ok_and(|n| n > 0) {} }).await;
+    assert!(ended.is_ok(), "the older stream still runs alongside the newer");
+    assert!(parts(&newer.await.unwrap()) >= 3, "the newer stream keeps going");
+}
+
 /// Each bus has its own JPEG thread: a slow PGM encode never holds up PVW. (One queue shared by
 /// both, fed PGM first, dropped every PVW frame once encoding was slower than 15 fps.)
 #[test]

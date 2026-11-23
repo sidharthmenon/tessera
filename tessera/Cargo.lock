@@ -3382,6 +3382,7 @@ dependencies = [
  "block2 0.6.2",
  "objc2 0.6.5",
  "objc2-foundation 0.3.2",
+ "objc2-io-surface",
 ]
 
 [[package]]
@@ -5365,6 +5366,7 @@ dependencies = [
  "getrandom 0.4.3",
  "http-body-util",
  "libc",
+ "objc2-foundation 0.3.2",
  "serde",
  "serde_json",
  "tauri",
@@ -5377,6 +5379,7 @@ dependencies = [
  "tokio-tungstenite",
  "tower",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5390,10 +5393,13 @@ dependencies = [
  "ffmpeg-next",
  "futures-util",
  "image",
+ "libc",
  "libloading 0.8.9",
  "objc2 0.5.3",
  "objc2-app-kit 0.2.2",
  "objc2-foundation 0.2.2",
+ "objc2-io-surface",
+ "objc2-metal 0.3.2",
  "pollster",
  "serde_json",
  "tessera-show",
@@ -5401,6 +5407,8 @@ dependencies = [
  "tokio-tungstenite",
  "uuid",
  "wgpu",
+ "windows",
+ "windows-sys 0.61.2",
  "winit",
 ]
 

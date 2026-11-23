@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Sender, SyncSender};
 use std::time::{Duration, Instant};
@@ -24,6 +24,10 @@ const IDENTIFY: Duration = Duration::from_secs(3);
 const IDLE_TICK: Duration = Duration::from_millis(16);
 const STATS: Duration = Duration::from_secs(1);
 const POSITIONS: Duration = Duration::from_millis(200);
+/// Unchanged positions (nothing playing) are re-sent this often.
+const POSITIONS_IDLE: Duration = Duration::from_secs(1);
+/// How often the perf line (render-loop cost) is logged.
+const PERF: Duration = Duration::from_secs(10);
 /// At most 15 preview frames a second per bus.
 const PREVIEW_PERIOD: Duration = Duration::from_nanos(1_000_000_000 / 15);
 const PREVIEW_WIDTH: u32 = 960;
@@ -53,6 +57,9 @@ impl EngineHandle {
 
 /// The engine's event loop (macOS: Accessory app, no Dock icon) plus a handle into it.
 pub fn event_loop() -> anyhow::Result<(EventLoop<UserEvent>, EngineHandle)> {
+    // This thread runs the render loop for the process lifetime.
+    crate::os::keep_awake();
+    crate::os::set_priority(crate::os::Priority::Render);
     let mut builder = EventLoop::with_user_event();
     #[cfg(target_os = "macos")]
     {
@@ -86,6 +93,9 @@ pub struct App {
     dropped: u64,
     stats_since: Instant,
     next_positions: Instant,
+    /// The last Positions sent, and when.
+    positions: (BTreeMap<Uuid, u64>, Instant),
+    perf: Perf,
     previews: Arc<Previews>,
     /// Indexed by `Bus as usize`.
     captures: [Capture; 2],
@@ -97,11 +107,49 @@ pub struct App {
     views: HashMap<Uuid, wgpu::TextureView>,
     mappings: Vec<Mapping>,
     taps: Vec<(AudioTap, f32)>,
+    /// What the mixer has: `set_taps` (a lock the audio callback contends for) only on a change.
+    taps_sent: Vec<(AudioTap, f32)>,
+}
+
+/// Render-loop cost since `since`: loop time minus the vsync wait in `get_current_texture`.
+struct Perf {
+    since: Instant,
+    loops: u32,
+    busy: Duration,
+    busy_max: Duration,
+    acquire_max: Duration,
+    dropped: u64,
+}
+
+impl Perf {
+    fn new(now: Instant) -> Perf {
+        Perf { since: now, loops: 0, busy: Duration::ZERO, busy_max: Duration::ZERO, acquire_max: Duration::ZERO, dropped: 0 }
+    }
+
+    /// One loop iteration; every `PERF` logs the line and starts over.
+    fn add(&mut self, busy: Duration, acquire: Duration, dropped: u64, now: Instant) {
+        (self.loops, self.busy, self.dropped) = (self.loops + 1, self.busy + busy, self.dropped + dropped);
+        (self.busy_max, self.acquire_max) = (self.busy_max.max(busy), self.acquire_max.max(acquire));
+        if now - self.since >= PERF {
+            let ms = |d: Duration| d.as_secs_f64() * 1000.;
+            log!(
+                "perf: {} loops, busy mean {:.2} ms max {:.2} ms, acquire max {:.2} ms, {} dropped",
+                self.loops,
+                ms(self.busy) / self.loops.max(1) as f64,
+                ms(self.busy_max),
+                ms(self.acquire_max),
+                self.dropped
+            );
+            *self = Perf::new(now);
+        }
+    }
 }
 
 /// A bus's preview: the readback in flight, and when the next one may start.
 struct Capture {
     pending: Option<Readback>,
+    /// The last readback's buffer, reused by the next.
+    spare: Option<wgpu::Buffer>,
     next: Instant,
 }
 
@@ -113,6 +161,15 @@ impl App {
         let gpu = Gpu::new_headless()?;
         // A live show must not die on a GPU validation error (the default handler panics).
         gpu.device.on_uncaptured_error(Arc::new(|e| log!("GPU error: {e}")));
+        // After a GPU reset the outputs would freeze while Stats keep flowing, so the controller's
+        // watchdog would never restart us: exit instead (its supervisor restarts the engine).
+        gpu.device.set_device_lost_callback(|reason, message| {
+            if matches!(reason, wgpu::DeviceLostReason::Unknown) {
+                log!("GPU device lost ({message}): exiting so the engine is restarted");
+                std::thread::sleep(Duration::from_millis(200)); // the log thread writes the line
+                std::process::exit(70);
+            }
+        });
         let mixer = match Mixer::start() {
             Ok(mixer) => {
                 let (rate, channels) = mixer.format();
@@ -144,13 +201,16 @@ impl App {
             dropped: 0,
             stats_since: now,
             next_positions: now,
+            positions: (BTreeMap::new(), now),
+            perf: Perf::new(now),
             previews,
-            captures: [(); 2].map(|()| Capture { pending: None, next: now }),
+            captures: [(); 2].map(|()| Capture { pending: None, spare: None, next: now }),
             encoders,
             mixer,
             views: HashMap::new(),
             mappings: vec![],
             taps: vec![],
+            taps_sent: vec![],
         })
     }
 
@@ -162,6 +222,8 @@ impl App {
         match command {
             ToEngine::SetConfig { config } => {
                 self.buses.opener().media = config.media.clone();
+                let ids = config.screens.iter().map(|s| s.id).chain(config.outputs.iter().map(|o| o.id));
+                self.compositor.retain(&ids.collect());
                 self.config = config;
                 self.apply(event_loop, true);
                 // Opens media layers that couldn't open before (e.g. their media wasn't listed yet).
@@ -203,17 +265,24 @@ impl App {
         }
     }
 
-    /// Forwards audio output errors; 5 times a second reports media positions, once a second
-    /// presented fps and total dropped frames.
+    /// Forwards audio output errors; reports media positions 5 times a second while they change
+    /// (once a second while they don't), presented fps and total dropped frames once a second.
     fn report(&mut self, real: Instant) {
         if real >= self.next_positions {
             self.next_positions = real + POSITIONS;
-            self.send(FromEngine::Positions { positions: self.buses.positions(self.now) });
+            let positions = self.buses.positions(self.now);
+            if positions != self.positions.0 || real - self.positions.1 >= POSITIONS_IDLE {
+                self.positions = (positions.clone(), real);
+                self.send(FromEngine::Positions { positions });
+            }
         }
         if let Some(message) = self.mixer.as_ref().and_then(Mixer::take_error) {
             self.send(FromEngine::Error { message });
         }
-        self.dropped += self.buses.take_dropped();
+        let dropped = self.buses.take_dropped();
+        self.dropped += dropped;
+        let acquire = std::mem::take(&mut self.outputs.acquire);
+        self.perf.add((Instant::now() - real).saturating_sub(acquire), acquire, dropped, real);
         self.presented += self.paced as u32;
         let elapsed = real - self.stats_since;
         if elapsed >= STATS {
@@ -238,6 +307,8 @@ impl App {
             return false;
         }
         self.render_screens(Bus::Pgm);
+        // The screens go to the GPU now, so it composites while this thread waits for drawables.
+        self.gpu.submit();
         let mappings = if self.identify.is_empty() {
             &self.config.mappings
         } else {
@@ -267,6 +338,7 @@ impl App {
                     Some(Ok(rgba)) => {
                         let (width, height) = readback.size();
                         let _ = self.encoders[bus as usize].try_send((width, height, rgba)); // its JPEG thread busy: skip it
+                        capture.spare = capture.pending.take().map(Readback::into_buffer);
                     }
                     Some(Err(e)) => log!("preview {bus:?}: {e:#}"),
                 }
@@ -280,7 +352,8 @@ impl App {
                 self.render_screens(bus);
             }
             let view = self.compositor.render_layout(&self.gpu, &self.config.screens, &self.views, PREVIEW_WIDTH);
-            self.captures[bus as usize].pending = Some(Readback::start(&self.gpu, view.texture()));
+            let capture = &mut self.captures[bus as usize];
+            capture.pending = Some(Readback::start_into(&self.gpu, view.texture(), capture.spare.take()));
         }
     }
 }
@@ -352,10 +425,16 @@ impl ApplicationHandler<UserEvent> for App {
         }
         if let Some(mixer) = &self.mixer {
             self.buses.audio_taps(self.now, &mut self.taps);
-            mixer.set_taps(self.taps.drain(..));
+            let same = |(a, x): &(AudioTap, f32), (b, y): &(AudioTap, f32)| a.same(b) && x == y;
+            if self.taps.len() != self.taps_sent.len() || !self.taps.iter().zip(&self.taps_sent).all(|(a, b)| same(a, b)) {
+                mixer.set_taps(self.taps.iter().cloned());
+                std::mem::swap(&mut self.taps, &mut self.taps_sent);
+            }
         }
         self.paced = self.render();
         self.preview(real);
+        self.gpu.submit(); // what's left (PVW screens, uploads), if anything
+        self.compositor.end_frame();
         self.report(real);
         let flow = if self.paced { ControlFlow::Poll } else { ControlFlow::WaitUntil(real + IDLE_TICK) };
         event_loop.set_control_flow(flow);

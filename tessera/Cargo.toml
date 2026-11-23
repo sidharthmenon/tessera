@@ -10,3 +10,9 @@ opt-level = 2
 
 [profile.dev.package.tessera-engine]
 opt-level = 2
+
+# The engine renders in real time: whole-program inlining for the per-frame paths. Panics stay
+# unwinding (a probe's panic is caught and reported, not fatal).
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -31,7 +31,7 @@ pub(crate) fn open(id: &str) -> anyhow::Result<Box<dyn LiveSource>> {
     let input = dshow::open(id)?;
     #[cfg(not(any(target_os = "macos", windows)))]
     let input: ff::format::context::Input = bail!("capture devices: not supported on this platform ({id})");
-    let decoder = Decoder::from_input(input, None, Path::new(id), true)?;
+    let decoder = Decoder::from_input(input, None, Path::new(id), true, None)?;
     Ok(Box::new(Device(decoder)))
 }
 

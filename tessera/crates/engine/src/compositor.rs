@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
 use tessera_show::{Crop, Layer, Mapping, Output, Pattern, Rect, Screen, Source, TransitionKind};
 use uuid::Uuid;
-use wgpu::util::DeviceExt;
 
 use crate::gpu::Gpu;
 
@@ -15,6 +14,9 @@ pub struct LayerTexture {
     pub premultiplied: bool,
     /// YUV full range 0–255 instead of limited Y 16–235 / UV 16–240.
     pub full_range: bool,
+    /// The frame's part of its textures in uv: `[1, 1]` unless the decoder padded the allocation
+    /// (e.g. a 1080-row frame in a 1088-row texture).
+    pub uv_scale: [f32; 2],
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +45,9 @@ pub enum ScreenSlot {
     Transition,
 }
 
+/// Room for the largest per-draw parameters (`LayerUniform`), passed as immediates.
+const IMMEDIATE_SIZE: u32 = size_of::<LayerUniform>() as u32;
+
 /// Mirrors `U` in shaders/layer.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -60,6 +65,19 @@ struct LayerUniform {
     rotation: f32,
     _pad: [f32; 2],
     crop: [f32; 4],
+}
+
+/// `l` is drawn opaque over the whole `size` screen: visible, fully opaque, unrotated, its rect
+/// covering the screen, its source without alpha (crop only picks what fills the rect).
+fn covers(l: &Layer, tex: Option<&LayerTexture>, size: [f32; 2]) -> bool {
+    let opaque_source = match (&l.source, tex) {
+        (Source::Pattern { pattern: Pattern::Solid { rgba } }, _) => rgba[3] >= 1.,
+        (Source::Pattern { .. }, _) => true, // bars, grid, gradient
+        (Source::Media { .. }, Some(t)) => matches!(t.planes, Planes::Nv12 { .. } | Planes::P010 { .. } | Planes::Rgbx(_)),
+        (Source::Media { .. }, None) => false, // nothing drawn
+    };
+    let r = &l.rect;
+    l.visible && opaque_source && l.opacity >= 1. && l.rotation % 360. == 0. && r.x <= 0. && r.y <= 0. && r.x + r.w >= size[0] && r.y + r.h >= size[1]
 }
 
 /// The part of the source a layer draws, in uv (x0, y0, x1, y1). A crop that leaves (almost)
@@ -91,17 +109,19 @@ struct MapUniform {
 }
 
 pub struct Compositor {
-    bind_layout: wgpu::BindGroupLayout,
+    binds: Binds,
     pipeline_layout: wgpu::PipelineLayout,
     map_shader: wgpu::ShaderModule,
     layer_pipeline: wgpu::RenderPipeline,
     transition_pipeline: wgpu::RenderPipeline,
     /// Keyed by target format: outputs may be surfaces (e.g. Bgra8Unorm).
     map_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
-    sampler: wgpu::Sampler,
     blank: wgpu::TextureView,
-    // ponytail: never evicted; prune against EngineConfig.screens if screens churn.
+    /// Pruned to the config's screens (and outputs, for identify overlays) by `retain`.
     screens: HashMap<(Uuid, ScreenSlot), wgpu::TextureView>,
+    /// `render_layout`'s target, reused while its size holds. PGM's and PVW's previews share it:
+    /// each one's readback copy is queued before the next draw into it.
+    layout: Option<wgpu::TextureView>,
 }
 
 impl Compositor {
@@ -113,21 +133,18 @@ impl Compositor {
             view_dimension: wgpu::TextureViewDimension::D2,
             multisampled: false,
         };
-        let uniform =
-            wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None };
         let bind_layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
                 entry(0, wgpu::ShaderStages::FRAGMENT, texture),
                 entry(1, wgpu::ShaderStages::FRAGMENT, texture),
                 entry(2, wgpu::ShaderStages::FRAGMENT, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
-                entry(3, wgpu::ShaderStages::VERTEX_FRAGMENT, uniform),
             ],
         });
         let pipeline_layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[Some(&bind_layout)],
-            immediate_size: 0,
+            immediate_size: IMMEDIATE_SIZE,
         });
         let shader = |src: &str| {
             d.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) })
@@ -138,20 +155,39 @@ impl Compositor {
         let transition_pipeline = pipeline(gpu, &pipeline_layout, &transition_shader, wgpu::TextureFormat::Rgba8Unorm);
         Compositor {
             map_shader: shader(include_str!("shaders/map.wgsl")),
-            bind_layout,
+            binds: Binds {
+                layout: bind_layout,
+                // Linear + clamp-to-edge (the default address mode).
+                sampler: d.create_sampler(&wgpu::SamplerDescriptor {
+                    mag_filter: wgpu::FilterMode::Linear,
+                    min_filter: wgpu::FilterMode::Linear,
+                    ..Default::default()
+                }),
+                cache: HashMap::new(),
+                frame: 0,
+            },
             pipeline_layout,
             layer_pipeline,
             transition_pipeline,
             map_pipelines: HashMap::new(),
-            // Linear + clamp-to-edge (the default address mode).
-            sampler: d.create_sampler(&wgpu::SamplerDescriptor {
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Linear,
-                ..Default::default()
-            }),
             blank: gpu.upload(1, 1, wgpu::TextureFormat::Rgba8Unorm, &[0; 4]).create_view(&Default::default()),
             screens: HashMap::new(),
+            layout: None,
         }
+    }
+
+    /// Frees the cached textures of screens (and identify overlays) whose id isn't in `ids`: a
+    /// removed 4K screen held up to four 33 MB textures for the rest of the session.
+    pub fn retain(&mut self, ids: &std::collections::HashSet<Uuid>) {
+        self.screens.retain(|(id, _), _| ids.contains(id));
+    }
+
+    /// Once per frame: forgets bind groups not used in this one or the last, so the textures they
+    /// hold (a replaced video frame's, a closed screen's) are freed.
+    pub fn end_frame(&mut self) {
+        let frame = self.binds.frame;
+        self.binds.cache.retain(|_, (_, used)| *used + 1 >= frame);
+        self.binds.frame += 1;
     }
 
     /// Composites `layers` bottom→top into the cached Rgba8Unorm texture for `(screen, slot)`
@@ -166,7 +202,9 @@ impl Compositor {
     ) -> wgpu::TextureView {
         let view = self.target(gpu, slot, screen);
         let size = [view.texture().width() as f32, view.texture().height() as f32];
-        let groups: Vec<_> = layers
+        // Layers under the topmost one that hides the whole screen would only be overdrawn.
+        let first = layers.iter().rposition(|(l, t)| covers(l, t.as_ref(), size)).unwrap_or(0);
+        let groups: Vec<_> = layers[first..]
             .iter()
             .filter(|(l, _)| l.visible)
             .filter_map(|(l, t)| self.layer_group(gpu, size, l, t.as_ref()))
@@ -195,8 +233,8 @@ impl Compositor {
         };
         let view = self.target(gpu, ScreenSlot::Transition, screen);
         let u = TransitionUniform { kind, p: p.clamp(0., 1.), _pad: [0.; 2] };
-        let group = self.bind(gpu, outgoing, incoming, bytemuck::bytes_of(&u));
-        draw(gpu, &view, wgpu::Color::TRANSPARENT, &self.transition_pipeline, &[group]);
+        let group = self.binds.get(gpu, outgoing, incoming);
+        draw(gpu, &view, wgpu::Color::TRANSPARENT, &self.transition_pipeline, &[(group, u)]);
         view
     }
 
@@ -253,7 +291,14 @@ impl Compositor {
         let y1 = screens.iter().map(|s| s.layout_y as i64 + s.height as i64).max().unwrap_or(1);
         let bounds = Rect { x: x0 as f32, y: y0 as f32, w: (x1 - x0).max(1) as f32, h: (y1 - y0).max(1) as f32 };
         // `as u32` saturates and `target` clamps to the device limit, so a tall layout can't overflow.
-        let texture = gpu.target(width, (bounds.h * width as f32 / bounds.w).round() as u32);
+        let height = (bounds.h * width as f32 / bounds.w).round() as u32;
+        let size = gpu.target_size(width, height);
+        let view = match self.layout.take() {
+            Some(v) if (v.texture().width(), v.texture().height()) == size => v,
+            _ => gpu.target(width, height).create_view(&Default::default()),
+        };
+        self.layout = Some(view.clone());
+        let texture = view.texture();
         let out = Rect { x: 0., y: 0., w: texture.width() as f32, h: texture.height() as f32 };
         let full_uv = Rect { x: 0., y: 0., w: 1., h: 1. };
         let groups: Vec<_> = screens
@@ -264,12 +309,11 @@ impl Compositor {
                 Some(self.map_group(gpu, views.get(&s.id)?, &full_uv, &dst, [out.w, out.h], 1.0))
             })
             .collect();
-        let view = texture.create_view(&Default::default());
         self.map_pass(gpu, &view, &groups);
         view
     }
 
-    fn layer_group(&self, gpu: &Gpu, size: [f32; 2], l: &Layer, tex: Option<&LayerTexture>) -> Option<wgpu::BindGroup> {
+    fn layer_group(&mut self, gpu: &Gpu, size: [f32; 2], l: &Layer, tex: Option<&LayerTexture>) -> Option<(wgpu::BindGroup, LayerUniform)> {
         let mut u = LayerUniform {
             rect: [l.rect.x, l.rect.y, l.rect.w, l.rect.h],
             color: [0.; 4],
@@ -298,6 +342,8 @@ impl Compositor {
             (Source::Media { .. }, None) => return None,
             (Source::Media { .. }, Some(t)) => {
                 u.flags = t.premultiplied as u32 | (t.full_range as u32) << 1;
+                let [sx, sy] = t.uv_scale;
+                u.crop = [u.crop[0] * sx, u.crop[1] * sy, u.crop[2] * sx, u.crop[3] * sy];
                 match &t.planes {
                     Planes::Rgba(v) => (v, &self.blank),
                     Planes::Nv12 { y, uv } => {
@@ -319,34 +365,15 @@ impl Compositor {
                 }
             }
         };
-        Some(self.bind(gpu, a, b, bytemuck::bytes_of(&u)))
+        Some((self.binds.get(gpu, a, b), u))
     }
 
-    fn map_group(&self, gpu: &Gpu, view: &wgpu::TextureView, uv: &Rect, dst: &Rect, size: [f32; 2], gain: f32) -> wgpu::BindGroup {
+    fn map_group(&mut self, gpu: &Gpu, view: &wgpu::TextureView, uv: &Rect, dst: &Rect, size: [f32; 2], gain: f32) -> (wgpu::BindGroup, MapUniform) {
         let u = MapUniform { src: [uv.x, uv.y, uv.w, uv.h], dst: [dst.x, dst.y, dst.w, dst.h], size, gain, _pad: 0. };
-        self.bind(gpu, view, &self.blank, bytemuck::bytes_of(&u))
+        (self.binds.get(gpu, view, &self.blank), u)
     }
 
-    // ponytail: a uniform buffer + bind group per draw per frame; move to a dynamic-offset ring if profiling flags it.
-    fn bind(&self, gpu: &Gpu, a: &wgpu::TextureView, b: &wgpu::TextureView, uniform: &[u8]) -> wgpu::BindGroup {
-        let buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: uniform,
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.bind_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(a) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(b) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                wgpu::BindGroupEntry { binding: 3, resource: buffer.as_entire_binding() },
-            ],
-        })
-    }
-
-    fn map_pass(&mut self, gpu: &Gpu, target: &wgpu::TextureView, groups: &[wgpu::BindGroup]) {
+    fn map_pass(&mut self, gpu: &Gpu, target: &wgpu::TextureView, groups: &[(wgpu::BindGroup, MapUniform)]) {
         let format = target.texture().format();
         let pipeline = self
             .map_pipelines
@@ -389,16 +416,40 @@ fn pipeline(
     })
 }
 
-/// One render pass: clear `target`, draw a 6-vertex quad per bind group, submit.
-fn draw(
-    gpu: &Gpu,
-    target: &wgpu::TextureView,
-    clear: wgpu::Color,
-    pipeline: &wgpu::RenderPipeline,
-    groups: &[wgpu::BindGroup],
-) {
-    let mut enc = gpu.device.create_command_encoder(&Default::default());
-    {
+/// The bind groups (two textures + the sampler) of the frame's draws, kept while their textures are
+/// in use: per-draw parameters go as immediates, so a layer's group is reused frame after frame.
+struct Binds {
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    /// Each group with the frame it was last used in (`Compositor::end_frame` prunes).
+    cache: HashMap<(wgpu::TextureView, wgpu::TextureView), (wgpu::BindGroup, u64)>,
+    frame: u64,
+}
+
+impl Binds {
+    fn get(&mut self, gpu: &Gpu, a: &wgpu::TextureView, b: &wgpu::TextureView) -> wgpu::BindGroup {
+        let (layout, sampler, frame) = (&self.layout, &self.sampler, self.frame);
+        let (group, used) = self.cache.entry((a.clone(), b.clone())).or_insert_with(|| {
+            let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(a) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(b) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+                ],
+            });
+            (group, frame)
+        });
+        *used = frame;
+        group.clone()
+    }
+}
+
+/// One render pass, recorded into the frame's encoder (see `Gpu::submit`): clear `target`, then a
+/// 6-vertex quad per (bind group, parameters).
+fn draw<U: Pod>(gpu: &Gpu, target: &wgpu::TextureView, clear: wgpu::Color, pipeline: &wgpu::RenderPipeline, draws: &[(wgpu::BindGroup, U)]) {
+    gpu.record(|enc| {
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: None,
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -413,10 +464,70 @@ fn draw(
             multiview_mask: None,
         });
         pass.set_pipeline(pipeline);
-        for g in groups {
-            pass.set_bind_group(0, g, &[]);
+        for (group, u) in draws {
+            pass.set_bind_group(0, group, &[]);
+            pass.set_immediates(0, bytemuck::bytes_of(u));
             pass.draw(0..6, 0..1);
         }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A layer's bind group is reused while its texture stays, and dropped a frame after the
+    /// texture is replaced (a video's new GpuFrame, an imported frame per frame).
+    #[test]
+    fn bind_groups_are_reused_then_pruned() {
+        let gpu = Gpu::new_headless().expect("these tests need a GPU");
+        let mut c = Compositor::new(&gpu);
+        let screen = Screen { id: Uuid::new_v4(), name: "S".into(), width: 8, height: 8, layout_x: 0, layout_y: 0 };
+        let layer = Layer::new(Source::Media { media_id: Uuid::new_v4() }, Rect { x: 0., y: 0., w: 8., h: 8. });
+        let texture = || {
+            let view = gpu.upload(1, 1, wgpu::TextureFormat::Rgba8Unorm, &[255; 4]).create_view(&Default::default());
+            LayerTexture { planes: Planes::Rgba(view), premultiplied: false, full_range: false, uv_scale: [1., 1.] }
+        };
+        let stable = texture();
+        for _ in 0..10 {
+            c.render_screen(&gpu, ScreenSlot::Pgm, &screen, &[(layer.clone(), Some(stable.clone()))]);
+            gpu.submit();
+            c.end_frame();
+        }
+        assert_eq!(c.binds.cache.len(), 1, "one group, reused");
+        for _ in 0..10 {
+            c.render_screen(&gpu, ScreenSlot::Pgm, &screen, &[(layer.clone(), Some(texture()))]);
+            gpu.submit();
+            c.end_frame();
+        }
+        assert!(c.binds.cache.len() <= 2, "{} groups kept for textures long gone", c.binds.cache.len());
     }
-    gpu.queue.submit([enc.finish()]);
+
+    /// Only layers from the topmost screen-covering opaque one up are drawn.
+    #[test]
+    fn covered_layers_are_skipped() {
+        let size = [100., 50.];
+        let full = Rect { x: 0., y: 0., w: 100., h: 50. };
+        let solid = |a: f32, rect: Rect| Layer::new(Source::Pattern { pattern: Pattern::Solid { rgba: [1., 0., 0., a] } }, rect);
+        assert!(covers(&solid(1., full.clone()), None, size));
+        assert!(!covers(&solid(0.5, full.clone()), None, size), "translucent colour");
+        assert!(!covers(&solid(1., Rect { w: 99., ..full.clone() }), None, size), "doesn't reach the right edge");
+        assert!(!covers(&Layer { opacity: 0.9, ..solid(1., full.clone()) }, None, size));
+        assert!(!covers(&Layer { rotation: 10., ..solid(1., full.clone()) }, None, size));
+        assert!(!covers(&Layer { visible: false, ..solid(1., full.clone()) }, None, size));
+        let media = Layer::new(Source::Media { media_id: Uuid::new_v4() }, full);
+        assert!(!covers(&media, None, size), "no frame yet: nothing drawn");
+    }
+
+    /// Retired things live until the GPU has done the submit after them, then drop.
+    #[test]
+    fn retired_drops_after_the_gpu_is_done() {
+        let gpu = Gpu::new_headless().expect("these tests need a GPU");
+        let marker = std::sync::Arc::new(());
+        gpu.retire(marker.clone());
+        assert_eq!(std::sync::Arc::strong_count(&marker), 2, "held until a submit");
+        gpu.submit();
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        assert_eq!(std::sync::Arc::strong_count(&marker), 1, "dropped once the work is done");
+    }
 }

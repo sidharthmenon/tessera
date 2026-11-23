@@ -92,12 +92,54 @@ fn prores4444_has_alpha() {
     let frames = decode_all_frames(&fixture("prores4444_64.mov")).unwrap();
     assert!(matches!(frames[0].format, PixelFormatKind::Ayuv64 | PixelFormatKind::Rgba), "{:?}", frames[0]);
     let gpu = gpu();
-    let mut player = Player::open(&fixture("prores4444_64.mov"), Playback::Loop, None).unwrap();
+    let mut player = Player::open(&gpu, &fixture("prores4444_64.mov"), Playback::Loop, None).unwrap();
     let data = render(&gpu, frame(&mut player, &gpu, Instant::now()).expect("first frame, shown while paused"));
     let (left, right) = (px(&data, 8, 32), px(&data, 56, 32));
     assert!(left[3] < 26, "left alpha {left:?} should be < 0.1");
     assert!(right[3] > 229, "right alpha {right:?} should be > 0.9");
     assert_near(right, [255, 0, 0, 255], 4); // red: proves the A/Y/Cb/Cr swizzle
+    assert_zero_copy(&gpu, &player, frames[0].hardware);
+}
+
+/// A hardware-decoded frame is drawn from the decoder's buffer (`zero_copy`: macOS IOSurface,
+/// Windows D3D12 texture on DX12), unless the kill switch is set: a silent fallback to copying
+/// mustn't pass the format tests.
+#[track_caller]
+fn assert_zero_copy(gpu: &Gpu, player: &Player, hardware: bool) {
+    let platform = cfg!(target_os = "macos") || gpu.adapter.get_info().backend == wgpu::Backend::Dx12;
+    let want = hardware && platform && tessera_engine::zero_copy::enabled();
+    assert_eq!(player.imported(), want, "zero-copy import (hardware decode: {hardware})");
+}
+
+/// 64×40 H.264 (coded 64×48): a hardware decoder may allocate the padded size, but only the
+/// frame's rows are drawn. White, the bottom 8 rows red: the screen's bottom fifth is red.
+#[test]
+fn padded_frame_draws_only_its_rows() {
+    let gpu = gpu();
+    let mut player = Player::open(&gpu, &fixture("h264_64x40.mp4"), Playback::Loop, None).unwrap();
+    let data = render(&gpu, frame(&mut player, &gpu, Instant::now()).expect("first frame, shown while paused"));
+    assert_near(px(&data, 32, 40), [255, 255, 255, 255], 8);
+    assert_near(px(&data, 32, 60), [255, 0, 0, 255], 8);
+    assert_near(px(&data, 32, 63), [255, 0, 0, 255], 8); // not the padding below the frame
+    assert_zero_copy(&gpu, &player, decode_all_frames(&fixture("h264_64x40.mp4")).unwrap()[0].hardware);
+}
+
+/// Windows on DX12: D3D12VA frames, NV12 and P010, are drawn from the decoder's own textures, not
+/// copied (the engine log says why if they are). Skipped on other backends (`WGPU_BACKEND`).
+#[test]
+#[cfg(windows)]
+fn d3d12_frames_are_imported() {
+    let gpu = gpu();
+    let backend = gpu.adapter.get_info().backend;
+    if backend != wgpu::Backend::Dx12 || !tessera_engine::zero_copy::enabled() {
+        eprintln!("skipped: {backend:?} backend (zero-copy enabled: {})", tessera_engine::zero_copy::enabled());
+        return;
+    }
+    for name in ["h264_64.mp4", "h264_64x40.mp4", "hevc10_64.mp4"] {
+        let mut player = Player::open(&gpu, &fixture(name), Playback::Loop, None).unwrap();
+        frame(&mut player, &gpu, Instant::now()).unwrap();
+        assert!(player.imported(), "{name}: copied, not imported");
+    }
 }
 
 #[test]
@@ -106,21 +148,23 @@ fn software_fallback_keeps_alpha() {
     let frames = decode_all_frames(&fixture("ffv1_alpha_64.mkv")).unwrap();
     assert!(frames.iter().all(|f| !f.hardware && f.format == PixelFormatKind::Rgba), "{:?}", frames[0]);
     let gpu = gpu();
-    let mut player = Player::open(&fixture("ffv1_alpha_64.mkv"), Playback::Loop, None).unwrap();
+    let mut player = Player::open(&gpu, &fixture("ffv1_alpha_64.mkv"), Playback::Loop, None).unwrap();
     let data = render(&gpu, frame(&mut player, &gpu, Instant::now()).expect("first frame, shown while paused"));
     assert!(px(&data, 8, 32)[3] < 26, "left alpha {:?}", px(&data, 8, 32));
     assert_near(px(&data, 56, 32), [255, 0, 0, 255], 4); // BT.709, limited range
+    assert_zero_copy(&gpu, &player, false);
 }
 
 #[test]
 fn hevc_main10_converts() {
     // Real decoded Main10 (P010, MSB-aligned) frame: white left half, 75 % grey right half.
     let gpu = gpu();
-    let mut player = Player::open(&fixture("hevc10_64.mp4"), Playback::Loop, None).unwrap();
+    let mut player = Player::open(&gpu, &fixture("hevc10_64.mp4"), Playback::Loop, None).unwrap();
     let data = render(&gpu, frame(&mut player, &gpu, Instant::now()).expect("first frame, shown while paused"));
     // ±2: scale 256 lands within 1 code value here; 255 (LSB-style scaling) is 3 off.
     assert_near(px(&data, 8, 32), [255, 255, 255, 255], 2);
     assert_near(px(&data, 56, 32), [191, 191, 191, 255], 2);
+    assert_zero_copy(&gpu, &player, decode_all_frames(&fixture("hevc10_64.mp4")).unwrap()[0].hardware);
 }
 
 #[test]
@@ -129,22 +173,23 @@ fn prores422_converts() {
     // red | blue / green | white. Wrong UV plane height or width would smear the bottom row or
     // the right column's colour.
     let gpu = gpu();
-    let mut player = Player::open(&fixture("prores422hq_64.mov"), Playback::Loop, None).unwrap();
+    let mut player = Player::open(&gpu, &fixture("prores422hq_64.mov"), Playback::Loop, None).unwrap();
     let data = render(&gpu, frame(&mut player, &gpu, Instant::now()).expect("first frame, shown while paused"));
     assert_near(px(&data, 16, 16), [255, 0, 0, 255], 4);
     assert_near(px(&data, 48, 16), [0, 0, 255, 255], 4);
     assert_near(px(&data, 16, 48), [0, 255, 0, 255], 4);
     assert_near(px(&data, 48, 48), [255, 255, 255, 255], 4);
+    assert_zero_copy(&gpu, &player, decode_all_frames(&fixture("prores422hq_64.mov")).unwrap()[0].hardware);
 }
 
 #[test]
 fn open_missing_file_is_err() {
     // `open` never blocks (R22), so the error arrives through `take_error`; no frame meanwhile.
     let gpu = gpu();
-    let mut missing = Player::open(Path::new(MISSING), Playback::Loop, None).unwrap();
+    let mut missing = Player::open(&gpu, Path::new(MISSING), Playback::Loop, None).unwrap();
     let error = frame(&mut missing, &gpu, Instant::now()).unwrap_err();
     assert!(error.contains(MISSING) && error.contains("cannot open"), "{error}");
-    let mut not_video = Player::open(&fixture("gen.sh"), Playback::Loop, None).unwrap();
+    let mut not_video = Player::open(&gpu, &fixture("gen.sh"), Playback::Loop, None).unwrap();
     assert!(frame(&mut not_video, &gpu, Instant::now()).is_err(), "not a video");
     assert!(decode_all_frames(Path::new(MISSING)).is_err());
     let mut image = ImageSource::open(&gpu, Path::new("/nonexistent/still.png")).unwrap();
@@ -155,7 +200,7 @@ fn open_missing_file_is_err() {
 fn nul_in_path_is_error_not_panic() {
     // MediaItem.path is unvalidated JSON: a NUL must not panic (thread name, CString), only error.
     let gpu = gpu();
-    let mut player = Player::open(Path::new("/tmp/bad\0clip.mp4"), Playback::Loop, None).unwrap();
+    let mut player = Player::open(&gpu, Path::new("/tmp/bad\0clip.mp4"), Playback::Loop, None).unwrap();
     let error = frame(&mut player, &gpu, Instant::now()).unwrap_err();
     assert!(error.contains("/tmp/bad\0clip.mp4") && error.contains("NUL"), "{error:?}");
     let mut image = ImageSource::open(&gpu, Path::new("/tmp/bad\0still.png")).unwrap();
@@ -171,8 +216,8 @@ fn open_does_not_block() {
     let fifo = std::env::temp_dir().join(format!("tessera-test-{}.fifo", Uuid::new_v4()));
     assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
     let (tx, rx) = std::sync::mpsc::channel();
-    let path = fifo.clone();
-    std::thread::spawn(move || tx.send(Player::open(&path, Playback::Loop, None).is_ok()));
+    let (path, gpu) = (fifo.clone(), gpu());
+    std::thread::spawn(move || tx.send(Player::open(&gpu, &path, Playback::Loop, None).is_ok()));
     let opened = rx.recv_timeout(Duration::from_secs(2));
     std::fs::remove_file(&fifo).unwrap();
     assert_eq!(opened, Ok(true), "Player::open blocked on opening the file");
@@ -181,7 +226,7 @@ fn open_does_not_block() {
 #[test]
 fn loop_wraps_position() {
     let gpu = gpu();
-    let mut player = Player::open(&fixture("h264_64.mp4"), Playback::Loop, None).unwrap();
+    let mut player = Player::open(&gpu, &fixture("h264_64.mp4"), Playback::Loop, None).unwrap();
     let t0 = Instant::now();
     frame(&mut player, &gpu, t0).unwrap(); // opened: duration known
     assert_eq!(player.position_ms(t0 + ms(700)), 0, "starts paused at 0");
@@ -193,7 +238,7 @@ fn loop_wraps_position() {
 #[test]
 fn once_ends_transparent() {
     let gpu = gpu();
-    let mut player = Player::open(&fixture("h264_64.mp4"), Playback::Once, None).unwrap();
+    let mut player = Player::open(&gpu, &fixture("h264_64.mp4"), Playback::Once, None).unwrap();
     let t0 = Instant::now();
     player.play(t0);
     frame(&mut player, &gpu, t0).expect("first frame while playing");
@@ -204,7 +249,7 @@ fn once_ends_transparent() {
 #[test]
 fn hold_last_keeps_frame() {
     let gpu = gpu();
-    let mut player = Player::open(&fixture("h264_64.mp4"), Playback::HoldLast, None).unwrap();
+    let mut player = Player::open(&gpu, &fixture("h264_64.mp4"), Playback::HoldLast, None).unwrap();
     let t0 = Instant::now();
     player.play(t0);
     frame(&mut player, &gpu, t0 + ms(1200)).expect("last frame held");
@@ -246,7 +291,8 @@ fn audio_tap_receives_tone() {
     // channel: RMS 0.125 × 0.707 / √2 ≈ 0.062. Silence, a wrong sample format or doubled mixing
     // misses 0.04..0.08 (measured 0.0635). The zero-crossing count proves the rate conversion:
     // 44.1 kHz samples played as 48 kHz would read 479 Hz, 48 crossings in 0.05 s instead of 44.
-    let mut player = Player::open(&fixture("h264_64.mp4"), Playback::Loop, AUDIO).unwrap();
+    let gpu = gpu();
+    let mut player = Player::open(&gpu, &fixture("h264_64.mp4"), Playback::Loop, AUDIO).unwrap();
     let tap = player.audio().expect("a tap when a mixer format is given");
     assert!(settled(&tap) >= 4800, "at least 0.05 s decoded ahead (measured 0.116 s)");
     player.play(Instant::now());
@@ -261,7 +307,8 @@ fn audio_tap_receives_tone() {
 
 #[test]
 fn paused_tap_not_consumed() {
-    let mut player = Player::open(&fixture("h264_64.mp4"), Playback::Loop, AUDIO).unwrap();
+    let gpu = gpu();
+    let mut player = Player::open(&gpu, &fixture("h264_64.mp4"), Playback::Loop, AUDIO).unwrap();
     let tap = player.audio().unwrap();
     let held = settled(&tap); // decoded while paused (a player starts paused)
     assert!(silent(&mixed(&tap, 4800)), "paused: silent");
@@ -279,7 +326,7 @@ fn stop_clears_tap() {
     // The decode thread is blocked on its full video queue, so it can't take the seek (and refill
     // the tap) until `current_frame` drains the stale frames.
     let gpu = gpu();
-    let mut player = Player::open(&fixture("h264_64.mp4"), Playback::Loop, AUDIO).unwrap();
+    let mut player = Player::open(&gpu, &fixture("h264_64.mp4"), Playback::Loop, AUDIO).unwrap();
     let tap = player.audio().unwrap();
     settled(&tap);
     let t0 = Instant::now();
@@ -293,10 +340,10 @@ fn stop_clears_tap() {
 
 #[test]
 fn audio_is_optional() {
-    let player = Player::open(&fixture("h264_64.mp4"), Playback::Loop, None).unwrap();
-    assert!(player.audio().is_none(), "no mixer: audio skipped");
     let gpu = gpu();
-    let mut player = Player::open(&fixture("prores4444_64.mov"), Playback::Loop, AUDIO).unwrap();
+    let player = Player::open(&gpu, &fixture("h264_64.mp4"), Playback::Loop, None).unwrap();
+    assert!(player.audio().is_none(), "no mixer: audio skipped");
+    let mut player = Player::open(&gpu, &fixture("prores4444_64.mov"), Playback::Loop, AUDIO).unwrap();
     frame(&mut player, &gpu, Instant::now()).expect("a file without audio plays");
     assert_eq!(player.audio().unwrap().buffered(), 0);
     assert_eq!(player.take_error(), None);
@@ -306,7 +353,7 @@ fn audio_is_optional() {
 fn corrupt_audio_keeps_video() {
     // h264_64.mp4's streams with every AAC packet corrupted (gen.sh, `noise` bsf).
     let gpu = gpu();
-    let mut player = Player::open(&fixture("h264_badaudio_64.mp4"), Playback::Loop, AUDIO).unwrap();
+    let mut player = Player::open(&gpu, &fixture("h264_badaudio_64.mp4"), Playback::Loop, AUDIO).unwrap();
     let t0 = Instant::now();
     player.play(t0);
     let error = poll(|| {
@@ -366,7 +413,7 @@ fn player_stop_shows_first_frame() {
     // After stop the layer shows nothing until the new epoch's first frame is back, then that
     // frame: never the stale mid-clip one.
     let gpu = gpu();
-    let mut player = Player::open(&fixture("h264_64.mp4"), Playback::Loop, None).unwrap();
+    let mut player = Player::open(&gpu, &fixture("h264_64.mp4"), Playback::Loop, None).unwrap();
     let t0 = Instant::now();
     let first = render(&gpu, frame(&mut player, &gpu, t0).unwrap());
     player.play(t0);
@@ -381,7 +428,7 @@ fn player_stop_shows_first_frame() {
 #[test]
 fn player_restart_resets_position() {
     let gpu = gpu();
-    let mut player = Player::open(&fixture("h264_64.mp4"), Playback::Loop, None).unwrap();
+    let mut player = Player::open(&gpu, &fixture("h264_64.mp4"), Playback::Loop, None).unwrap();
     let t0 = Instant::now();
     let first = render(&gpu, frame(&mut player, &gpu, t0).unwrap());
     player.play(t0);
@@ -398,7 +445,7 @@ fn player_restart_resets_position() {
 #[test]
 fn player_pause_holds_position() {
     let gpu = gpu();
-    let mut player = Player::open(&fixture("h264_64.mp4"), Playback::Loop, None).unwrap();
+    let mut player = Player::open(&gpu, &fixture("h264_64.mp4"), Playback::Loop, None).unwrap();
     let t0 = Instant::now();
     frame(&mut player, &gpu, t0).unwrap(); // opened: duration known
     player.play(t0);
@@ -417,7 +464,8 @@ fn player_pause_holds_position() {
 fn speed_rebases_the_timeline() {
     let t0 = Instant::now();
     // HoldLast: no wrap within the 1 s fixture, so positions read straight.
-    let mut player = Player::open(&fixture("h264_64.mp4"), Playback::HoldLast, None).unwrap();
+    let gpu = gpu();
+    let mut player = Player::open(&gpu, &fixture("h264_64.mp4"), Playback::HoldLast, None).unwrap();
     player.play(t0);
     player.set_speed(2., t0 + ms(200));
     assert_eq!(player.position_ms(t0 + ms(400)), 600, "200 at 1×, then 200 ms at 2×");
@@ -429,4 +477,24 @@ fn speed_rebases_the_timeline() {
     player.set_speed(f32::NAN, t0 + ms(1200));
     player.set_speed(100., t0 + ms(1200));
     assert_eq!(player.position_ms(t0 + ms(1225)), 1000, "clamped to 4× (900 + 100), not 100×");
+}
+
+/// Software-decoded planar YUV (FFV1 here; also DNxHR, VP9, H.264 4:2:2 the hardware won't take)
+/// goes up as the YUV shader's planes, U and V interleaved on the decode thread, instead of an
+/// RGBA conversion: quadrants red | blue / green | white in 4:2:0, 4:2:2 10-bit and 4:4:4 8/10-bit.
+#[test]
+fn planar_yuv_converts() {
+    let gpu = gpu();
+    let cases = [("yuv420p", PixelFormatKind::Nv12), ("yuv422p10le", PixelFormatKind::P210), ("yuv444p", PixelFormatKind::Nv24), ("yuv444p10le", PixelFormatKind::P410)];
+    for (fmt, kind) in cases {
+        let path = fixture(&format!("ffv1_{fmt}_64.mkv"));
+        let frames = decode_all_frames(&path).unwrap();
+        assert!(frames.iter().all(|f| !f.hardware && f.format == kind), "{fmt}: {:?}", frames[0]);
+        let mut player = Player::open(&gpu, &path, Playback::Loop, None).unwrap();
+        let data = render(&gpu, frame(&mut player, &gpu, Instant::now()).expect("first frame"));
+        for ((x, y), want) in [((16, 16), [255, 0, 0, 255]), ((48, 16), [0, 0, 255, 255]), ((16, 48), [0, 255, 0, 255]), ((48, 48), [255, 255, 255, 255])] {
+            let got = px(&data, x, y);
+            assert!(got.iter().zip(want).all(|(g, w)| g.abs_diff(w) <= 4), "{fmt} at ({x}, {y}): {got:?}, want {want:?}");
+        }
+    }
 }

@@ -1,19 +1,27 @@
 //! Audio: each player's decode thread resamples its audio stream into an `AudioTap`; the cpal
 //! output callback mixes the taps × layer volume × master volume.
 //!
-//! ponytail: no audio-clock slaving. Video runs on the frame clock and audio on the device clock,
-//! so they drift by the clocks' ~ppm difference; add resample-based sync if long clips drift. A tap
-//! is a plain FIFO that starts and stops with its video, so sync also assumes the audio is
-//! contiguous from the video's t = 0. A stall longer than the decode lead (~4 video frames) leaves
-//! audio late by the excess until the next stop or seek. A loop whose audio is longer or shorter
-//! than its video drifts by the difference on each pass (the fixture's matches exactly). Upgrade:
-//! place samples by pts on the player's timeline and read them by wall-clock position.
+//! Sync: a tap is a FIFO placed on its player's timeline. Its samples are taken as contiguous from
+//! the video's t = 0, and each Loop pass is placed again at its start (`wrap`). Each frame the render
+//! thread compares where the device was in the tap at its last callback with the player's position
+//! then (`sync`), and more than `SYNC` off drops the oldest samples (audio late) or puts silence in
+//! front (audio early). Video runs on the frame clock and audio on the device clock, which drift by
+//! their ppm difference; a loop's audio is often a little longer or shorter than its video; and a
+//! decode stall leaves the audio behind. Over hours each of these would otherwise add up.
+//!
+//! ponytail: a correction is a jump (a click, or a gap of ≥ `SYNC`; every few minutes at typical
+//! ppm); resample by the measured drift (swr_set_compensation) if that is ever audible. Neither the
+//! device's output latency nor the video's present latency is compensated.
 
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::time::{Duration, Instant};
+
+/// How far a tap may drift from its player's timeline before `sync` moves it back.
+const SYNC: Duration = Duration::from_millis(20);
 
 use anyhow::{Context, ensure};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -39,19 +47,39 @@ struct Ring {
     silent: bool,
     /// Why the audio failed, reported once through `Player::take_error`.
     error: Option<String>,
+    /// Timeline position (in interleaved samples) just past the newest sample pushed this epoch,
+    /// dropped ones included: the newest sample is at `end - 1`, the oldest at `end - samples.len()`.
+    end: i64,
+    /// The last mix while playing: when, and the timeline position of the first sample it took.
+    mixed: Option<(Instant, i64)>,
 }
 
 impl AudioTap {
     pub(crate) fn new(format: (u32, u16)) -> AudioTap {
         let capacity = format.0 as usize * format.1 as usize;
-        let ring = Ring { samples: VecDeque::with_capacity(capacity), capacity, epoch: 0, playing: false, silent: false, error: None };
+        let samples = VecDeque::with_capacity(capacity);
+        let ring = Ring { samples, capacity, epoch: 0, playing: false, silent: false, error: None, end: 0, mixed: None };
         AudioTap { ring: Arc::new(mutex(ring)), format }
+    }
+
+    /// `t` on the timeline, in interleaved samples (whole frames).
+    fn index(&self, t: Duration) -> i64 {
+        (t.as_secs_f64() * self.format.0 as f64).round() as i64 * self.format.1 as i64
+    }
+
+    /// Clones of one tap.
+    pub fn same(&self, other: &AudioTap) -> bool {
+        Arc::ptr_eq(&self.ring, &other.ring)
     }
 
     /// Decode thread. When full, the oldest samples go: the decoder never waits for the mixer.
     pub(crate) fn push(&self, epoch: u64, samples: &[f32]) {
         let mut ring = lock(&self.ring);
-        if ring.epoch != epoch || ring.silent {
+        if ring.epoch != epoch {
+            return;
+        }
+        ring.end += samples.len() as i64;
+        if ring.silent {
             return;
         }
         let keep = &samples[samples.len().saturating_sub(ring.capacity)..];
@@ -60,15 +88,55 @@ impl AudioTap {
         ring.samples.extend(keep);
     }
 
+    /// Loop wrap (decode thread): the next pass's samples go at `offset` on the player's timeline,
+    /// wherever the last pass's audio ended.
+    pub(crate) fn wrap(&self, epoch: u64, offset: Duration) {
+        let mut ring = lock(&self.ring);
+        if ring.epoch == epoch {
+            ring.end = self.index(offset);
+        }
+    }
+
     /// Player stop/restart/seek: empty and paused; from now on only `epoch`'s samples go in.
     pub(crate) fn reset(&self, epoch: u64) {
         let mut ring = lock(&self.ring);
         ring.samples.clear();
-        (ring.epoch, ring.playing) = (epoch, false);
+        (ring.epoch, ring.playing, ring.end, ring.mixed) = (epoch, false, 0, None);
     }
 
     pub(crate) fn set_playing(&self, playing: bool) {
-        lock(&self.ring).playing = playing;
+        let mut ring = lock(&self.ring);
+        ring.playing = playing;
+        if !playing {
+            ring.mixed = None;
+        }
+    }
+
+    /// Render thread, while the player plays: back onto the player's timeline (`elapsed`: its
+    /// position at an instant) if more than `SYNC` off. Late, the oldest samples go; early, silence
+    /// goes in front (up to the tap's capacity). Nothing until the mixer has taken from the tap.
+    pub(crate) fn sync(&self, elapsed: impl Fn(Instant) -> Duration) {
+        let mut ring = lock(&self.ring);
+        let Some((at, first)) = ring.mixed else { return };
+        if ring.silent {
+            return;
+        }
+        let late = self.index(elapsed(at)) - first; // whole frames, like every count here
+        if late.unsigned_abs() < self.index(SYNC).unsigned_abs() {
+            return;
+        }
+        let shift = if late > 0 {
+            let n = (late as usize).min(ring.samples.len());
+            ring.samples.drain(..n);
+            n as i64
+        } else {
+            let n = (late.unsigned_abs() as usize).min(ring.capacity - ring.samples.len());
+            for _ in 0..n {
+                ring.samples.push_front(0.);
+            }
+            -(n as i64)
+        };
+        ring.mixed = Some((at, first + shift));
     }
 
     /// While silent nothing is kept (not even samples already in): a clip off 1× speed. Dropping
@@ -95,10 +163,16 @@ impl AudioTap {
     /// callback: no allocation, no blocking). Nothing while paused, or if the lock stays contended
     /// (this buffer is then silent for this tap).
     pub fn mix(&self, out: &mut [f32], volume: f32) {
+        self.mix_at(out, volume, Instant::now());
+    }
+
+    /// `mix` by the callback at `now`, which `sync` measures the tap's position from.
+    fn mix_at(&self, out: &mut [f32], volume: f32, now: Instant) {
         let Some(mut ring) = try_lock(&self.ring) else { return };
         if !ring.playing {
             return;
         }
+        ring.mixed = Some((now, ring.end - ring.samples.len() as i64));
         let n = out.len().min(ring.samples.len());
         let (a, b) = ring.samples.as_slices();
         add(out, a, volume);
@@ -173,13 +247,13 @@ impl Mixer {
         self.format
     }
 
-    /// Replaces the mixed taps; volumes clamp to 0..1 (non-finite: 0). Refilled in place (no
-    /// allocation once the list has grown) under a lock the callback only try-locks; replaced taps
-    /// are dropped here, never in the callback.
+    /// Replaces the mixed taps; volumes clamp to 0..1 (non-finite: 0). The list is built before
+    /// and the replaced one dropped after the lock the callback try-locks, which is held only for a
+    /// swap; replaced taps are dropped here, never in the callback. Call it only on a change.
     pub fn set_taps(&self, taps: impl IntoIterator<Item = (AudioTap, f32)>) {
-        let mut current = lock(&self.shared.taps);
-        current.clear();
-        current.extend(taps.into_iter().map(|(tap, volume)| (tap, unit(volume).unwrap_or(0.))));
+        let mut taps: Vec<_> = taps.into_iter().map(|(tap, volume)| (tap, unit(volume).unwrap_or(0.))).collect();
+        std::mem::swap(&mut *lock(&self.shared.taps), &mut taps);
+        drop(taps); // a removed player's last tap (its 1 s buffer) is freed here, unlocked
     }
 
     /// Clamped to 0..1; a non-finite volume is ignored.
@@ -315,6 +389,11 @@ impl AudioDecoder {
     /// Back to the start (loop wrap or seek). A loop's next pass follows on without a gap.
     pub fn rewind(&mut self) {
         self.decoder.flush();
+    }
+
+    /// Loop wrap: the next pass's samples go at `offset` on the player's timeline.
+    pub fn wrap(&self, offset: Duration) {
+        self.tap.wrap(self.epoch, offset);
     }
 
     /// After a player seek: from now on samples belong to `epoch`; the resampler's leftovers go.
@@ -484,5 +563,64 @@ mod tests {
         let mut out = [9.; 3];
         shared.render(&mut out);
         assert_eq!(out, [0.375, 0.375, 0.], "(0.5 + 0.25) × 0.5, then silence");
+    }
+
+    /// 300 passes of a 1 s loop whose audio is `audio_ms` per pass, the decode thread 100 ms ahead
+    /// of the timeline, the device consuming `ppm` fast, and (`sync`) the render thread syncing
+    /// every 16 ms. Returns the worst |offset| in ms between a heard sample's place on the video's
+    /// timeline and when it is heard, and the fraction of the output that was audio (not gaps).
+    fn loop_drift(ppm: f64, audio_ms: u64, sync: bool) -> (f64, f64) {
+        const VIDEO_MS: u64 = 1000;
+        let tap = AudioTap::new((1000, 1)); // 1 kHz mono: one sample per ms
+        let t0 = Instant::now();
+        let at = |ms: f64| t0 + Duration::from_secs_f64(ms / 1000.);
+        tap.set_playing(true);
+        let callback_ms = 10. / (1. + ppm / 1e6); // 10 samples per device callback
+        let (mut pass, mut pushed, mut next_mix, mut worst, mut heard, mut total) = (0, 0, 0., 0f64, 0, 0);
+        let mut out = [0f32; 10];
+        for ms in 0..300 * VIDEO_MS {
+            // Decode thread, in 20 ms packets; each sample's value is its place on the timeline + 1.
+            while pass * VIDEO_MS + pushed < ms + 100 {
+                if pushed < audio_ms {
+                    let n = (audio_ms - pushed).min(20);
+                    let packet: Vec<f32> = (pushed..pushed + n).map(|i| (pass * VIDEO_MS + i + 1) as f32).collect();
+                    tap.push(0, &packet);
+                    pushed += n;
+                } else if (pass + 1) * VIDEO_MS < ms + 100 {
+                    (pass, pushed) = (pass + 1, 0); // the video's pass is decoded too: Loop wrap
+                    tap.wrap(0, Duration::from_millis(pass * VIDEO_MS));
+                } else {
+                    break;
+                }
+            }
+            while next_mix <= ms as f64 {
+                out.fill(0.);
+                tap.mix_at(&mut out, 1., at(next_mix));
+                for (j, &v) in out.iter().enumerate() {
+                    let when = next_mix + j as f64 * callback_ms / 10.;
+                    if v > 0. {
+                        (worst, heard) = (worst.max((f64::from(v) - 1. - when).abs()), heard + 1);
+                    }
+                }
+                (next_mix, total) = (next_mix + callback_ms, total + out.len());
+            }
+            if sync && ms % 16 == 0 {
+                tap.sync(|i| i.saturating_duration_since(t0)); // playing at 1× since t0
+            }
+        }
+        (worst, heard as f64 / total as f64)
+    }
+
+    /// Real devices are ~±50 ppm off; 0.1 % here drifts as far in 5 min as they do in ~2 h.
+    #[test]
+    fn sync_keeps_long_loops_on_the_timeline() {
+        for (ppm, audio_ms) in [(1000., 1000), (-1000., 1000), (0., 990), (0., 1010), (1000., 1010)] {
+            let case = format!("device {ppm:+} ppm, {audio_ms} ms of audio per 1 s pass");
+            let (drift, _) = loop_drift(ppm, audio_ms, false);
+            assert!(drift > 40., "{case}: unsynced only drifts {drift} ms; the case tests nothing");
+            let (worst, heard) = loop_drift(ppm, audio_ms, true);
+            assert!(worst <= 40., "{case}: {worst} ms off the video");
+            assert!(heard > 0.98, "{case}: only {heard} of the output was audio");
+        }
     }
 }

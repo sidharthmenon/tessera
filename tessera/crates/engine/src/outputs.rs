@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use tessera_show::{EngineConfig, Mapping, MonitorInfo, Output, OutputState, OutputTarget};
@@ -13,10 +14,22 @@ use crate::compositor::Compositor;
 use crate::gpu::Gpu;
 
 /// Where an output's window lives. Any change (or a new output size) recreates the window.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 enum Place {
     Window { x: i32, y: i32 },
     Display(MonitorInfo),
+}
+
+/// The refresh rate doesn't count: the frame clock follows it (`refresh_mhz`), and a monitor whose
+/// reported rate wavers must not get its live window closed and reopened (a visible blink).
+impl PartialEq for Place {
+    fn eq(&self, other: &Place) -> bool {
+        match (self, other) {
+            (Place::Window { x, y }, Place::Window { x: x2, y: y2 }) => (x, y) == (x2, y2),
+            (Place::Display(a), Place::Display(b)) => MonitorInfo { refresh_mhz: b.refresh_mhz, ..a.clone() } == *b,
+            _ => false,
+        }
+    }
 }
 
 struct OutputWindow {
@@ -26,12 +39,24 @@ struct OutputWindow {
     config: wgpu::SurfaceConfiguration,
     place: Place,
     presented: bool,
+    /// After a drawable timeout: not drawn until then, so one stuck display costs the others a
+    /// single 1 s stall per `STUCK_RETRY`, not one per frame.
+    stuck_until: Option<Instant>,
+    /// What the last frame's acquire said, logged when it changes.
+    state: &'static str,
 }
+
+/// How long an output that timed out waiting for a drawable is left alone.
+const STUCK_RETRY: Duration = Duration::from_secs(5);
 
 /// One window per bound output, keyed by output id.
 #[derive(Default)]
 pub struct Outputs {
     windows: HashMap<Uuid, OutputWindow>,
+    /// Time spent waiting in `get_current_texture` (vsync), summed until the caller takes it.
+    pub acquire: Duration,
+    /// `render` scratch: the frame's acquired surface textures.
+    frames: Vec<(Uuid, wgpu::SurfaceTexture)>,
 }
 
 impl Outputs {
@@ -89,7 +114,9 @@ impl Outputs {
             });
             states.push(OutputState { output_id: output.id, bound: window.is_some(), monitor });
             if let Some(w) = window {
-                w.window.set_title(&output.name);
+                if w.window.title() != output.name {
+                    w.window.set_title(&output.name); // a rename; checked every monitor poll
+                }
                 self.windows.insert(output.id, w);
             }
         }
@@ -104,9 +131,10 @@ impl Outputs {
         self.windows.values().filter_map(|w| w.window.current_monitor()?.refresh_rate_millihertz()).min()
     }
 
-    /// Draws each windowed output from `screens` through `mappings` and presents it. Returns
-    /// whether anything presented (all surfaces are Fifo, so that frame waited for vsync). Never
-    /// panics on surface errors: Outdated reconfigures, Lost recreates the surface, the rest skip.
+    /// Draws each windowed output from `screens` through `mappings`, submits that (with whatever
+    /// else was recorded) and presents them all. Returns whether anything presented (all surfaces
+    /// are Fifo, so that frame waited for vsync). Never panics on surface errors: Outdated
+    /// reconfigures, Lost recreates the surface, the rest skip.
     pub fn render(
         &mut self,
         gpu: &Gpu,
@@ -115,37 +143,67 @@ impl Outputs {
         mappings: &[Mapping],
         screens: &HashMap<Uuid, wgpu::TextureView>,
     ) -> bool {
-        let mut paced = false;
+        let mut frames = std::mem::take(&mut self.frames);
         for output in outputs {
             let Some(w) = self.windows.get_mut(&output.id) else { continue };
-            let frame = match w.surface.get_current_texture() {
+            let start = Instant::now();
+            if w.stuck_until.is_some_and(|until| start < until) {
+                continue;
+            }
+            let acquired = w.surface.get_current_texture();
+            self.acquire += start.elapsed();
+            let state = match &acquired {
+                wgpu::CurrentSurfaceTexture::Success(_) | wgpu::CurrentSurfaceTexture::Suboptimal(_) => "showing",
+                wgpu::CurrentSurfaceTexture::Occluded => "hidden (occluded)",
+                wgpu::CurrentSurfaceTexture::Timeout => "stuck (no drawable)",
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => "reconfiguring",
+                _ => "not drawable",
+            };
+            if std::mem::replace(&mut w.state, state) != state {
+                log!("output '{}': {state}", output.name); // for the show log: when an output stopped and came back
+            }
+            let frame = match acquired {
                 wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
                 wgpu::CurrentSurfaceTexture::Outdated => {
-                    w.surface.configure(&gpu.device, &w.config);
+                    configure(gpu, &w.surface, &w.config);
                     continue;
                 }
                 wgpu::CurrentSurfaceTexture::Lost => {
                     match gpu.instance.create_surface(w.window.clone()) {
                         Ok(s) => {
-                            s.configure(&gpu.device, &w.config);
+                            configure(gpu, &s, &w.config);
                             w.surface = s;
                         }
                         Err(e) => log!("output '{}': surface lost, recreate failed: {e}", output.name),
                     }
                     continue;
                 }
-                _ => continue, // Timeout, Occluded, Validation: try again next frame.
+                wgpu::CurrentSurfaceTexture::Timeout => {
+                    log!("output '{}': no drawable for {:?}, skipped for {STUCK_RETRY:?}", output.name, start.elapsed());
+                    w.stuck_until = Some(Instant::now() + STUCK_RETRY);
+                    continue;
+                }
+                _ => continue, // Occluded, Validation: try again next frame.
             };
+            w.stuck_until = None;
             let view = frame.texture.create_view(&Default::default());
             compositor.render_output(gpu, &view, output, mappings, screens);
+            frames.push((output.id, frame));
+        }
+        // One submit for every output's pass, then the presents back to back (a present must
+        // follow the submit that draws its surface).
+        gpu.submit();
+        let paced = !frames.is_empty();
+        for (id, frame) in frames.drain(..) {
+            let Some(w) = self.windows.get_mut(&id) else { continue };
             w.window.pre_present_notify();
             gpu.queue.present(frame);
-            paced = true;
             if !w.presented {
                 w.presented = true;
-                log!("output '{}': first frame presented ({:?})", output.name, w.config.present_mode);
+                log!("output '{}': first frame presented ({:?})", w.window.title(), w.config.present_mode);
             }
         }
+        self.frames = frames;
         paced
     }
 }
@@ -203,8 +261,22 @@ fn open(
         alpha_mode,
         view_formats: vec![],
     };
-    surface.configure(&gpu.device, &config);
-    Ok(OutputWindow { window, surface, config, place, presented: false })
+    configure(gpu, &surface, &config);
+    Ok(OutputWindow { window, surface, config, place, presented: false, stuck_until: None, state: "" })
+}
+
+/// `Surface::configure`, then (macOS) a 1 s limit on waiting for a drawable. wgpu turns that limit
+/// off, so a display that stops taking frames without its window counting as occluded (an LED
+/// processor losing sync) would hang the single render loop, and every output with it, until the
+/// controller restarts the engine. With the limit that output skips frames (`Timeout`) and the
+/// others carry on.
+fn configure(gpu: &Gpu, surface: &wgpu::Surface<'_>, config: &wgpu::SurfaceConfiguration) {
+    surface.configure(&gpu.device, config);
+    #[cfg(target_os = "macos")]
+    // SAFETY: only a CAMetalLayer property is set; the surface stays wgpu's.
+    if let Some(hal) = unsafe { surface.as_hal::<wgpu::hal::api::Metal>() } {
+        hal.render_layer().lock().setAllowsNextDrawableTimeout(true);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -295,6 +367,14 @@ mod tests {
     fn bind_monitor_falls_back_to_position() {
         let monitors = [mon("Built-in", 0, 0), mon("Renamed", 1920, 0)];
         assert_eq!(bind_monitor(&display("LED A", 1920, 0), &monitors), Some(1));
+    }
+
+    #[test]
+    fn a_wavering_refresh_rate_keeps_the_window() {
+        let a = Place::Display(mon("LED A", 1920, 0));
+        let b = Place::Display(MonitorInfo { refresh_mhz: Some(59_940), ..mon("LED A", 1920, 0) });
+        assert_eq!(a, b);
+        assert_ne!(a, Place::Display(MonitorInfo { width: 3840, ..mon("LED A", 1920, 0) }));
     }
 
     #[test]

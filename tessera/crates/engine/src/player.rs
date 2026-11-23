@@ -1,4 +1,5 @@
-//! Video players (decode thread → small frame queue → GPU planes) and still images.
+//! Video players (decode thread → staging buffers in a small frame queue → GPU planes) and still
+//! images.
 
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
@@ -7,23 +8,34 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use tessera_show::Playback;
 use wgpu::TextureFormat as F;
-use wgpu::util::StagingBelt;
 
 use crate::audio::AudioTap;
 use crate::compositor::{LayerTexture, Planes};
 use crate::gpu::Gpu;
+use crate::staging::{Pool, Staged};
 use crate::video_decode::{Decoder, Frame, PixelFormatKind};
 
 /// Frames decoded ahead of the clock; also the loop pre-roll.
 const QUEUE: usize = 4;
-/// `copy_buffer_to_texture` needs 256-byte rows and offsets.
+/// Staging buffers per player: the queue, the pending and due frames, and one or two the GPU is
+/// still copying from.
+const STAGING: usize = QUEUE + 3;
+/// `copy_buffer_to_texture` needs 256-byte rows.
 const ALIGN: u64 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64;
+
+/// A decoded frame on its way to the screen.
+pub(crate) enum Upload {
+    /// Copied into a staging buffer: the render thread records the copy into its textures.
+    Staged(Staged),
+    /// Sampled straight from the decoder's buffer (macOS IOSurface): nothing to copy.
+    Imported(Box<GpuFrame>),
+}
 
 enum Msg {
     /// The file opened; always the first message on success.
     Opened(Duration),
     /// `t` is on the player's timeline: Loop adds one duration per pass.
-    Frame { epoch: u64, t: Duration, frame: Frame },
+    Frame { epoch: u64, t: Duration, frame: Upload },
     /// No more frames until the next seek (Once, HoldLast).
     End { epoch: u64 },
     /// The decode thread stopped.
@@ -55,9 +67,9 @@ pub struct Player {
     epoch: u64,
     state: State,
     /// Next frame, not due yet.
-    pending: Option<(Duration, Frame)>,
+    pending: Option<(Duration, Upload)>,
     /// Newest due frame, not uploaded yet (`texture` uploads it).
-    due: Option<Frame>,
+    due: Option<Upload>,
     ended: bool,
     /// Once, past its end: transparent.
     over: bool,
@@ -79,22 +91,32 @@ impl Player {
     /// missing file, unsupported codec or decode error shows up in `take_error`. `Err` only if
     /// the thread can't be spawned. `audio`: the mixer's (sample rate, channels), which the decode
     /// thread resamples the file's audio to (see `audio()`); `None` skips audio.
-    pub fn open(path: &Path, playback: Playback, audio: Option<(u32, u16)>) -> anyhow::Result<Player> {
-        Player::open_trimmed(path, playback, audio, 0, None)
+    pub fn open(gpu: &Gpu, path: &Path, playback: Playback, audio: Option<(u32, u16)>) -> anyhow::Result<Player> {
+        Player::open_trimmed(gpu, path, playback, audio, 0, None)
     }
 
     /// `open`, playing only `[trim_in_ms, trim_out_ms)` of the file (see `Decoder::trimmed`):
     /// Loop, Once and HoldLast use that part; positions are still reported in the file.
-    pub fn open_trimmed(path: &Path, playback: Playback, audio: Option<(u32, u16)>, trim_in_ms: u64, trim_out_ms: Option<u64>) -> anyhow::Result<Player> {
+    pub fn open_trimmed(
+        gpu: &Gpu,
+        path: &Path,
+        playback: Playback,
+        audio: Option<(u32, u16)>,
+        trim_in_ms: u64,
+        trim_out_ms: Option<u64>,
+    ) -> anyhow::Result<Player> {
         let (tx, frames) = mpsc::sync_channel(QUEUE);
         let (seek, seeks) = mpsc::channel();
         let (owned, looping) = (path.to_path_buf(), playback == Playback::Loop);
         let audio = audio.map(AudioTap::new);
         let tap = audio.clone();
+        let (mut pool, gpu) = (Pool::new(gpu, STAGING), gpu.clone());
         std::thread::Builder::new().name(thread_name("decode", path)).spawn(move || {
-            let result = Decoder::open(&owned, tap).and_then(|d| d.trimmed(trim_in_ms, trim_out_ms)).and_then(|d| {
+            crate::os::set_priority(crate::os::Priority::Decode);
+            let result = Decoder::open(&owned, tap, Some(&gpu)).and_then(|d| d.trimmed(trim_in_ms, trim_out_ms)).and_then(|mut d| {
+                d.zero_copy = crate::zero_copy::enabled();
                 let _ = tx.send(Msg::Opened(d.length));
-                decode(d, looping, &tx, &seeks, &owned)
+                decode(d, looping, &tx, &seeks, &owned, &mut pool, &gpu)
             });
             if let Err(e) = result {
                 let _ = tx.send(Msg::Error(format!("{}: {e:#}", owned.display())));
@@ -197,10 +219,13 @@ impl Player {
     /// (pts ≤ position + `period`/2, so frame boundaries sit half a vsync away from the ticks: R19)
     /// for `texture`. Call it every loop iteration, drawn or not, so errors and readiness surface
     /// and the queue keeps moving; frames that come due while the layer isn't drawn are skipped
-    /// without an upload.
+    /// without an upload. Also keeps the audio on the timeline (`AudioTap::sync`).
     pub fn poll(&mut self, now: Instant, period: Duration) {
         let shown = std::mem::take(&mut self.shown);
         let t = self.elapsed(now);
+        if let (Some(tap), State::Playing { .. }) = (&self.audio, self.state) {
+            tap.sync(|at| self.elapsed(at));
+        }
         self.over = self.playback == Playback::Once && self.duration.is_some_and(|d| t >= d);
         if self.failed || self.over {
             return;
@@ -255,14 +280,31 @@ impl Player {
         if self.failed || self.over {
             return None;
         }
-        if let Some(frame) = self.due.take() {
-            if let Err(e) = self.upload(gpu, &frame) {
-                self.fail(format!("{e:#}"));
-                return None;
+        match self.due.take() {
+            Some(Upload::Staged(frame)) => {
+                if let Err(e) = upload_into(&mut self.gpu, gpu, &frame) {
+                    self.fail(format!("{e:#}"));
+                    return None;
+                }
+                gpu.retire(frame); // back to its pool once the GPU has copied it
+                self.stale = false;
             }
-            self.stale = false;
+            Some(Upload::Imported(frame)) => {
+                // The shown frame's decoder buffer is reused once released: not before the GPU
+                // is done with what was drawn from it.
+                if let Some(old) = self.gpu.replace(*frame) {
+                    gpu.retire(old);
+                }
+                self.stale = false;
+            }
+            None => {}
         }
         self.gpu.as_ref().filter(|_| !self.stale).map(|g| g.layer.clone())
+    }
+
+    /// The frame shown is drawn straight from the decoder's buffer (`zero_copy`), not a copy.
+    pub fn imported(&self) -> bool {
+        self.gpu.as_ref().is_some_and(|g| g.keep.is_some())
     }
 
     fn showing(&self) -> bool {
@@ -301,23 +343,30 @@ impl Player {
     fn fail(&mut self, error: String) {
         (self.failed, self.error, self.gpu, self.due) = (true, Some(error), None, None);
     }
-
-    fn upload(&mut self, gpu: &Gpu, frame: &Frame) -> anyhow::Result<()> {
-        upload_into(&mut self.gpu, gpu, frame).map(drop)
-    }
 }
 
-/// Uploads `frame` into `slot`'s textures (made, or remade when the format or size changes) and
-/// returns them as a layer texture.
-pub(crate) fn upload_into(slot: &mut Option<GpuFrame>, gpu: &Gpu, frame: &Frame) -> anyhow::Result<LayerTexture> {
-    let (w, h) = frame.size();
+/// Records the upload of `frame` into `slot`'s textures (made, or remade when the format or size
+/// changes) and returns them as a layer texture. The caller keeps `frame` alive until the GPU has
+/// copied it (`Gpu::retire`).
+pub(crate) fn upload_into(slot: &mut Option<GpuFrame>, gpu: &Gpu, frame: &Staged) -> anyhow::Result<LayerTexture> {
+    let (kind, w, h) = frame.key;
     check_size(gpu, w, h)?;
-    if slot.as_ref().is_none_or(|g| g.key != (frame.kind, w, h)) {
-        *slot = Some(GpuFrame::new(gpu, frame.kind, w, h));
+    // New textures for a new layout or size, or after an imported frame (its textures can't be
+    // copied into); the old ones (an imported frame's decoder buffer too) kept until the GPU is done.
+    if slot.as_ref().is_none_or(|g| g.key != frame.key || g.keep.is_some())
+        && let Some(old) = slot.replace(GpuFrame::new(gpu, kind, w, h))
+    {
+        gpu.retire(old);
     }
     let g = slot.as_mut().context("no textures")?;
     g.layer.full_range = frame.full_range;
-    g.upload(gpu, frame)?;
+    // Two uploads into these textures with no submit between (a test polling in a loop): the first
+    // goes out now, or its staging buffer, retired until a submit, would never come back.
+    if g.uploaded_at == Some(gpu.submits()) {
+        gpu.submit();
+    }
+    frame.copy_to(gpu, &g.textures);
+    g.uploaded_at = Some(gpu.submits());
     Ok(g.layer.clone())
 }
 
@@ -326,7 +375,16 @@ pub(crate) fn upload_into(slot: &mut Option<GpuFrame>, gpu: &Gpu, frame: &Frame)
 /// after this pass has shown frames is the pass's end (a corrupt tail, a bad packet: I1), reported
 /// once as a `Warning`; one before any frame of the pass is fatal (nothing would ever show, and a
 /// Loop would spin rewinding).
-fn decode(mut d: Decoder, looping: bool, tx: &SyncSender<Msg>, seeks: &Receiver<u64>, path: &Path) -> anyhow::Result<()> {
+/// Each frame is imported (zero-copy) or copied into a staging buffer from `pool` here.
+fn decode(
+    mut d: Decoder,
+    looping: bool,
+    tx: &SyncSender<Msg>,
+    seeks: &Receiver<u64>,
+    path: &Path,
+    pool: &mut Pool,
+    gpu: &Gpu,
+) -> anyhow::Result<()> {
     let (mut epoch, mut offset, mut sent, mut warned) = (0, Duration::ZERO, false, false);
     // pts of the last frame sent this pass.
     let mut last: Option<Duration> = None;
@@ -348,7 +406,20 @@ fn decode(mut d: Decoder, looping: bool, tx: &SyncSender<Msg>, seeks: &Receiver<
         match next {
             Some(frame) => {
                 last = Some(frame.pts);
-                if tx.send(Msg::Frame { epoch, t: offset + frame.pts, frame }).is_err() {
+                let t = offset + frame.pts;
+                let frame = if frame.pixel_buffer().is_some() {
+                    match crate::zero_copy::import(gpu, frame) {
+                        Ok(imported) => Upload::Imported(Box::new(imported)),
+                        Err((e, frame)) => {
+                            log!("{}: zero-copy off for this clip ({e:#}); copying its frames", path.display());
+                            d.zero_copy = false;
+                            Upload::Staged(pool.stage(&frame, true)?.context("no staging buffer")?)
+                        }
+                    }
+                } else {
+                    Upload::Staged(pool.stage(&frame, true)?.context("no staging buffer")?)
+                };
+                if tx.send(Msg::Frame { epoch, t, frame }).is_err() {
                     return Ok(()); // player dropped
                 }
                 sent = true;
@@ -363,7 +434,7 @@ fn decode(mut d: Decoder, looping: bool, tx: &SyncSender<Msg>, seeks: &Receiver<
                     None => d.length,
                 };
                 last = None;
-                d.rewind()?;
+                d.wrap(offset)?;
             }
             None => {
                 if tx.send(Msg::End { epoch }).is_err() {
@@ -390,11 +461,14 @@ fn check_size(gpu: &Gpu, w: u32, h: u32) -> anyhow::Result<()> {
 }
 
 /// Texture format, subsampling divisor (x, y) and bytes per texel of each plane.
-fn layout(kind: PixelFormatKind) -> &'static [(F, (u32, u32), u32)] {
+pub(crate) fn layout(kind: PixelFormatKind) -> &'static [(F, (u32, u32), u32)] {
     match kind {
         PixelFormatKind::Nv12 => &[(F::R8Unorm, (1, 1), 1), (F::Rg8Unorm, (2, 2), 2)],
         PixelFormatKind::P010 => &[(F::R16Unorm, (1, 1), 2), (F::Rg16Unorm, (2, 2), 4)],
         PixelFormatKind::P210 => &[(F::R16Unorm, (1, 1), 2), (F::Rg16Unorm, (2, 1), 4)],
+        PixelFormatKind::P410 => &[(F::R16Unorm, (1, 1), 2), (F::Rg16Unorm, (1, 1), 4)],
+        PixelFormatKind::Nv16 => &[(F::R8Unorm, (1, 1), 1), (F::Rg8Unorm, (2, 1), 2)],
+        PixelFormatKind::Nv24 => &[(F::R8Unorm, (1, 1), 1), (F::Rg8Unorm, (1, 1), 2)],
         PixelFormatKind::Ayuv64 => &[(F::Rgba16Unorm, (1, 1), 8)],
         PixelFormatKind::Rgba => &[(F::Rgba8Unorm, (1, 1), 4)],
         PixelFormatKind::Bgra | PixelFormatKind::Bgrx => &[(F::Bgra8Unorm, (1, 1), 4)],
@@ -406,8 +480,10 @@ pub(crate) struct GpuFrame {
     key: (PixelFormatKind, u32, u32),
     textures: Vec<wgpu::Texture>,
     pub(crate) layer: LayerTexture,
-    /// Persistent staging (R20): `Queue::write_texture` allocates a staging buffer per call.
-    belt: StagingBelt,
+    /// `Gpu::submits` when the last upload was recorded.
+    uploaded_at: Option<u64>,
+    /// Imported textures: the decoder frame whose buffer they sample.
+    keep: Option<Frame>,
 }
 
 impl GpuFrame {
@@ -427,57 +503,38 @@ impl GpuFrame {
                 })
             })
             .collect();
-        let view = |i: usize| textures[i].create_view(&Default::default());
+        GpuFrame::from_textures(kind, w, h, textures, None)
+    }
+
+    /// `textures` in `layout(kind)` order, or one multi-planar texture (NV12/P010: a view per
+    /// plane); `keep`: imported ones, sampling that frame's buffer. Textures larger than the frame
+    /// (a decoder's padded allocation) are drawn only where the frame is.
+    pub(crate) fn from_textures(kind: PixelFormatKind, w: u32, h: u32, textures: Vec<wgpu::Texture>, keep: Option<Frame>) -> GpuFrame {
+        let view = |i: usize| match textures[0].format().is_multi_planar_format() {
+            true => textures[0].create_view(&wgpu::TextureViewDescriptor {
+                aspect: [wgpu::TextureAspect::Plane0, wgpu::TextureAspect::Plane1][i],
+                ..Default::default()
+            }),
+            false => textures[i].create_view(&Default::default()),
+        };
         let planes = match kind {
-            PixelFormatKind::Nv12 => Planes::Nv12 { y: view(0), uv: view(1) },
-            // 4:2:2 is P010's shader path too: the half-width, full-height UV plane is sampled by
-            // normalized coordinates.
-            PixelFormatKind::P010 | PixelFormatKind::P210 => Planes::P010 { y: view(0), uv: view(1) },
+            // 4:2:2 and 4:4:4 take the 4:2:0 shader paths too: the UV plane, whatever its size, is
+            // sampled by normalized coordinates.
+            PixelFormatKind::Nv12 | PixelFormatKind::Nv16 | PixelFormatKind::Nv24 => Planes::Nv12 { y: view(0), uv: view(1) },
+            PixelFormatKind::P010 | PixelFormatKind::P210 | PixelFormatKind::P410 => Planes::P010 { y: view(0), uv: view(1) },
             PixelFormatKind::Ayuv64 => Planes::Ayuv64(view(0)),
             PixelFormatKind::Rgba | PixelFormatKind::Bgra => Planes::Rgba(view(0)),
             PixelFormatKind::Bgrx => Planes::Rgbx(view(0)),
         };
-        // One frame per chunk: each frame's planes go up in one belt chunk.
-        let bytes = textures.iter().zip(layout(kind)).map(|(t, &(_, _, bpp))| pitch(t.width(), bpp) * t.height() as u64).sum();
-        GpuFrame {
-            key: (kind, w, h),
-            textures,
-            layer: LayerTexture { planes, premultiplied: false, full_range: false },
-            belt: StagingBelt::new(gpu.device.clone(), bytes),
-        }
-    }
-
-    fn upload(&mut self, gpu: &Gpu, frame: &Frame) -> anyhow::Result<()> {
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        for (i, (texture, &(_, _, bpp))) in self.textures.iter().zip(layout(self.key.0)).enumerate() {
-            let (row, rows, pitch) = ((texture.width() * bpp) as usize, texture.height(), pitch(texture.width(), bpp));
-            let (src, stride) = frame.plane(i, row, rows as usize)?;
-            let size = wgpu::BufferSize::new(pitch * rows as u64).context("empty plane")?;
-            let slice = self.belt.allocate(size, wgpu::BufferSize::new(ALIGN).context("alignment")?);
-            {
-                let mut staging = slice.get_mapped_range_mut().context("staging buffer not mapped")?;
-                if stride as u64 == pitch {
-                    staging.slice(..src.len()).copy_from_slice(src);
-                } else {
-                    let pitch = pitch as usize;
-                    for (r, line) in src.chunks(stride).enumerate() {
-                        staging.slice(r * pitch..r * pitch + row).copy_from_slice(&line[..row]);
-                    }
-                }
-            }
-            let layout = wgpu::TexelCopyBufferLayout { offset: slice.offset(), bytes_per_row: Some(pitch as u32), rows_per_image: Some(rows) };
-            encoder.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo { buffer: slice.buffer(), layout }, texture.as_image_copy(), texture.size());
-        }
-        self.belt.finish();
-        gpu.queue.submit([encoder.finish()]);
-        self.belt.recall();
-        let _ = gpu.device.poll(wgpu::PollType::Poll); // hands finished chunks back to the belt
-        Ok(())
+        let full_range = keep.as_ref().is_some_and(|f| f.full_range);
+        let uv_scale = [w as f32 / textures[0].width() as f32, h as f32 / textures[0].height() as f32];
+        let layer = LayerTexture { planes, premultiplied: false, full_range, uv_scale };
+        GpuFrame { key: (kind, w, h), textures, layer, uploaded_at: None, keep }
     }
 }
 
 /// Staging row pitch for `width` texels of `bpp` bytes.
-fn pitch(width: u32, bpp: u32) -> u64 {
+pub(crate) fn pitch(width: u32, bpp: u32) -> u64 {
     (width as u64 * bpp as u64).next_multiple_of(ALIGN)
 }
 
@@ -496,6 +553,7 @@ impl ImageSource {
         let (tx, loaded) = mpsc::sync_channel(1);
         let (gpu, owned) = (gpu.clone(), path.to_path_buf());
         std::thread::Builder::new().name(thread_name("image", path)).spawn(move || {
+            crate::os::set_priority(crate::os::Priority::Decode);
             let _ = tx.send(load_image(&gpu, &owned).with_context(|| owned.display().to_string()));
         })?;
         Ok(ImageSource { loaded: Some(loaded), layer: None, error: None, failed: false })
@@ -543,7 +601,7 @@ fn load_image(gpu: &Gpu, path: &Path) -> anyhow::Result<LayerTexture> {
     }
     let texture = gpu.upload(w, h, F::Rgba8Unorm, &image);
     let planes = Planes::Rgba(texture.create_view(&Default::default()));
-    Ok(LayerTexture { planes, premultiplied: true, full_range: false })
+    Ok(LayerTexture { planes, premultiplied: true, full_range: false, uv_scale: [1., 1.] })
 }
 
 #[cfg(test)]
@@ -559,7 +617,8 @@ mod tests {
     fn corrupt_tail_loops_on() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/h264_trunc_64.mp4");
         assert!(crate::video_decode::decode_all_frames(&path).is_err(), "the fixture must end in an error");
-        let mut player = Player::open(&path, Playback::Loop, None).unwrap();
+        let gpu = Gpu::new_headless().expect("these tests need a GPU");
+        let mut player = Player::open(&gpu, &path, Playback::Loop, None).unwrap();
         let t0 = Instant::now();
         player.play(t0);
         let (mut frames, mut errors) = (0, vec![]);
@@ -586,11 +645,39 @@ mod tests {
         assert!(errors[0].contains("h264_trunc_64.mp4"), "{errors:?}");
         assert!(frames >= steps - 3, "{frames} of {steps} steps showed a new frame");
     }
+    /// Frames are copied into staging buffers on the decode thread and go back to the pool once
+    /// the GPU has uploaded them: ten passes of a clip, every frame drawn (uploaded, submitted, the
+    /// device polled as the render loop does), never run the pool dry.
+    #[test]
+    fn staged_frames_keep_flowing() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/h264_64.mp4");
+        let gpu = Gpu::new_headless().expect("these tests need a GPU");
+        let mut player = Player::open(&gpu, &path, Playback::Loop, None).unwrap();
+        let t0 = Instant::now();
+        player.play(t0);
+        for step in 0..300 {
+            let now = t0 + Duration::from_secs(1) * step / 30;
+            let give_up = Instant::now() + Duration::from_secs(2);
+            loop {
+                player.poll(now, PERIOD);
+                assert!(!player.failed(), "{:?}", player.take_error());
+                if player.due.is_some() {
+                    assert!(player.texture(&gpu).is_some());
+                    gpu.submit();
+                    let _ = gpu.device.poll(wgpu::PollType::Poll);
+                    break;
+                }
+                assert!(Instant::now() < give_up, "no new frame at step {step}: the staging pool ran dry");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod packed_tests {
     use super::*;
+    use crate::video_decode::Frame;
     use crate::compositor::{Compositor, ScreenSlot};
     use crate::gpu::read_rgba;
     use tessera_show::{Layer, Rect, Screen, Source};
@@ -599,13 +686,31 @@ mod packed_tests {
     fn drawn(kind: PixelFormatKind, pixel: [u8; 4]) -> [u8; 4] {
         let gpu = Gpu::new_headless().expect("these tests need a GPU");
         let frame = Frame::packed(2, 2, &pixel.repeat(4), 8, kind).unwrap();
+        let staged = crate::staging::Pool::new(&gpu, 1).stage(&frame, true).unwrap().unwrap();
         let mut slot = None;
-        let texture = upload_into(&mut slot, &gpu, &frame).unwrap();
+        let texture = upload_into(&mut slot, &gpu, &staged).unwrap();
+        gpu.retire(staged);
         let screen = Screen { id: uuid::Uuid::new_v4(), name: "S".into(), width: 4, height: 4, layout_x: 0, layout_y: 0 };
         let layer = Layer::new(Source::Media { media_id: uuid::Uuid::new_v4() }, Rect { x: 0., y: 0., w: 4., h: 4. });
         let mut c = Compositor::new(&gpu);
         let view = c.render_screen(&gpu, ScreenSlot::Pgm, &screen, &[(layer, Some(texture))]);
         read_rgba(&gpu, view.texture()).unwrap()[..4].try_into().unwrap()
+    }
+
+    /// A frame in a larger texture (a decoder's padded allocation): only the frame's part is drawn.
+    #[test]
+    fn padded_texture_draws_only_the_frame() {
+        let gpu = Gpu::new_headless().expect("these tests need a GPU");
+        let (red, blue) = ([255, 0, 0, 255], [0, 0, 255, 255]);
+        let texels: Vec<u8> = (0..16).flat_map(|i| if i % 4 < 2 && i / 4 < 2 { red } else { blue }).collect();
+        let texture = gpu.upload(4, 4, F::Rgba8Unorm, &texels);
+        let frame = GpuFrame::from_textures(PixelFormatKind::Rgba, 2, 2, vec![texture], None);
+        assert_eq!(frame.layer.uv_scale, [0.5, 0.5]);
+        // 1:1 onto a 2×2 screen, so linear filtering samples texel centres only.
+        let screen = Screen { id: uuid::Uuid::new_v4(), name: "S".into(), width: 2, height: 2, layout_x: 0, layout_y: 0 };
+        let layer = Layer::new(Source::Media { media_id: uuid::Uuid::new_v4() }, Rect { x: 0., y: 0., w: 2., h: 2. });
+        let view = Compositor::new(&gpu).render_screen(&gpu, ScreenSlot::Pgm, &screen, &[(layer, Some(frame.layer))]);
+        assert_eq!(read_rgba(&gpu, view.texture()).unwrap(), red.repeat(4));
     }
 
     #[test]

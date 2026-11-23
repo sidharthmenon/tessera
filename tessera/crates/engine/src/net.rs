@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 
 use anyhow::{Context, ensure};
@@ -36,11 +37,13 @@ pub type RgbaFrame = (u32, u32, Vec<u8>);
 /// back only while it is `watched`: the channel's receiver count is the per-bus subscriber count.
 pub struct Previews {
     frames: [watch::Sender<Bytes>; 2],
+    /// Streams opened per bus: the newest one is the only one served (`mjpeg`).
+    streams: [AtomicU64; 2],
 }
 
 impl Previews {
     pub fn new() -> Arc<Previews> {
-        Arc::new(Previews { frames: [watch::Sender::new(Bytes::new()), watch::Sender::new(Bytes::new())] })
+        Arc::new(Previews { frames: [watch::Sender::new(Bytes::new()), watch::Sender::new(Bytes::new())], streams: Default::default() })
     }
 
     /// At least one MJPEG client is streaming `bus`.
@@ -66,6 +69,7 @@ impl Previews {
             let (tx, frames) = mpsc::sync_channel::<RgbaFrame>(1);
             let previews = self.clone();
             std::thread::Builder::new().name(format!("preview jpeg {bus:?}")).spawn(move || {
+                crate::os::set_priority(crate::os::Priority::Background);
                 for (width, height, rgba) in frames {
                     if let Err(e) = previews.publish_rgba(bus, width, height, rgba) {
                         crate::log!("preview {bus:?}: {e:#}");
@@ -117,8 +121,8 @@ pub fn serve(
     let shared = Shared { handle, events, previews, thumbs: thumbs.into(), probes: Arc::new(Semaphore::new(PROBES)) };
     let app = Router::new()
         .route("/ws", get(ws))
-        .route("/preview/pgm.mjpg", get(|State(s): State<Shared>| async move { mjpeg(&s.previews, Bus::Pgm) }))
-        .route("/preview/pvw.mjpg", get(|State(s): State<Shared>| async move { mjpeg(&s.previews, Bus::Pvw) }))
+        .route("/preview/pgm.mjpg", get(|State(s): State<Shared>| async move { mjpeg(s.previews, Bus::Pgm) }))
+        .route("/preview/pvw.mjpg", get(|State(s): State<Shared>| async move { mjpeg(s.previews, Bus::Pvw) }))
         .route("/thumb/{file}", get(thumb))
         .layer(middleware::from_fn_with_state(Arc::<str>::from(token), auth))
         .with_state(shared);
@@ -228,7 +232,11 @@ impl Shared {
         let (events, thumbs, probes) = (self.events.clone(), self.thumbs.clone(), self.probes.clone());
         tokio::spawn(async move {
             let Ok(_permit) = probes.acquire_owned().await else { return };
-            let probed = tokio::task::spawn_blocking(move || probe(Path::new(&path), &thumbs, media_id)).await;
+            let probed = tokio::task::spawn_blocking(move || {
+                crate::os::set_priority(crate::os::Priority::Background); // software decode: off the cores playback needs
+                probe(Path::new(&path), &thumbs, media_id)
+            })
+            .await;
             let (info, error) = match probed {
                 Ok(Ok(info)) => (Some(info), None),
                 Ok(Err(e)) => (None, Some(format!("{e:#}"))),
@@ -241,15 +249,23 @@ impl Shared {
 
 /// `bus`'s JPEGs as `multipart/x-mixed-replace`, a part per new frame (the render loop makes at
 /// most 15 a second while a stream is open). A new stream waits for a fresh frame.
-fn mjpeg(previews: &Previews, bus: Bus) -> Response {
+///
+/// One viewer per bus: a new stream ends the older ones at their next frame. WebKit never closes
+/// the stream of an `<img>` it removed, and opens at most 6 connections to a host: three leaked
+/// pairs and the UI's next previews would wait for a connection forever.
+fn mjpeg(previews: Arc<Previews>, bus: Bus) -> Response {
+    let me = previews.streams[bus as usize].fetch_add(1, Ordering::Relaxed) + 1;
     let frames = previews.frames[bus as usize].subscribe(); // marks the current (stale) frame seen
-    let parts = futures_util::stream::unfold(frames, |mut frames| async move {
+    let parts = futures_util::stream::unfold((frames, previews), move |(mut frames, previews)| async move {
         frames.changed().await.ok()?;
+        if previews.streams[bus as usize].load(Ordering::Relaxed) != me {
+            return None; // a newer stream took over
+        }
         let jpeg = frames.borrow_and_update().clone();
         let mut part = format!("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", jpeg.len()).into_bytes();
         part.extend_from_slice(&jpeg);
         part.extend_from_slice(b"\r\n");
-        Some((Ok::<_, Infallible>(Bytes::from(part)), frames))
+        Some((Ok::<_, Infallible>(Bytes::from(part)), (frames, previews)))
     });
     let headers = [(header::CONTENT_TYPE, "multipart/x-mixed-replace; boundary=frame"), (header::CACHE_CONTROL, "no-store")];
     (headers, Body::from_stream(parts)).into_response()

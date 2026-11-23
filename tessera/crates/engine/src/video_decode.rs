@@ -1,5 +1,6 @@
-//! FFmpeg decode of one video stream: hardware first (VideoToolbox / D3D11VA), frames made
-//! CPU-addressable in place with `av_hwframe_map` (R20) for the player to upload.
+//! FFmpeg decode of one video stream: hardware first (VideoToolbox; D3D12VA on the engine's DX12
+//! device, else D3D11VA), frames kept on the GPU for `zero_copy` or made CPU-addressable in place
+//! with `av_hwframe_map` (R20) for the player to upload.
 
 use std::path::Path;
 use std::ptr;
@@ -10,6 +11,7 @@ use ffmpeg_next as ff;
 use ff::ffi;
 
 use crate::audio::{AudioDecoder, AudioTap};
+use crate::gpu::Gpu;
 
 /// How a frame's planes reach the GPU (see `player::layout`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,6 +22,12 @@ pub enum PixelFormatKind {
     P010,
     /// 10-bit 4:2:2 like P010 with a full-height CbCr plane: VideoToolbox's ProRes 422 (`p210le`).
     P210,
+    /// 10-bit 4:4:4 like P010 with a full-size CbCr plane (software `yuv444p10le`, interleaved).
+    P410,
+    /// 8-bit 4:2:2 like NV12 with a full-height CbCr plane (software `yuv422p`, interleaved).
+    Nv16,
+    /// 8-bit 4:4:4 like NV12 with a full-size CbCr plane (software `yuv444p`, interleaved).
+    Nv24,
     /// Packed 16-bit A, Y, Cb, Cr: VideoToolbox's ProRes 4444 with alpha (`y416`).
     Ayuv64,
     /// Straight-alpha RGBA8, converted by `sws_scale` (software fallback for everything else).
@@ -40,7 +48,7 @@ pub struct DecodedFrameInfo {
 
 /// Decodes `path` to the end on this thread and describes every frame (tests, diagnostics).
 pub fn decode_all_frames(path: &Path) -> anyhow::Result<Vec<DecodedFrameInfo>> {
-    let mut decoder = Decoder::open(path, None).with_context(|| path.display().to_string())?;
+    let mut decoder = Decoder::open(path, None, None).with_context(|| path.display().to_string())?;
     let mut frames = vec![];
     while let Some(f) = decoder.next()? {
         frames.push(DecodedFrameInfo { pts_ms: f.pts.as_millis() as u64, format: f.kind, hardware: f.hardware });
@@ -56,6 +64,9 @@ pub(crate) struct Frame {
     pub kind: PixelFormatKind,
     pub hardware: bool,
     pub full_range: bool,
+    /// Planar Y, U, V (software decode) for a semi-planar `kind`: staging interleaves U and V,
+    /// shifting each sample left this much (6: 10-bit samples to P010's MSB alignment).
+    pub(crate) planar: Option<u32>,
     frame: ff::frame::Video,
 }
 
@@ -71,7 +82,7 @@ impl Frame {
         for (dst, src) in frame.data_mut(0).chunks_mut(out_stride).zip(data.chunks(stride)).take(h as usize) {
             dst[..row].copy_from_slice(&src[..row]);
         }
-        Ok(Frame { pts: Duration::ZERO, kind, hardware: false, full_range: false, frame })
+        Ok(Frame { pts: Duration::ZERO, kind, hardware: false, full_range: false, planar: None, frame })
     }
 
     /// A solid `w`×`h` RGBA frame, for tests.
@@ -84,15 +95,39 @@ impl Frame {
                 px.copy_from_slice(&rgba);
             }
         }
-        Frame { pts: Duration::ZERO, kind: PixelFormatKind::Rgba, hardware: false, full_range: false, frame }
+        Frame { pts: Duration::ZERO, kind: PixelFormatKind::Rgba, hardware: false, full_range: false, planar: None, frame }
     }
 
     pub fn size(&self) -> (u32, u32) {
         (self.frame.width(), self.frame.height())
     }
 
-    /// Plane `i` (`rows` rows of `row` bytes) and its stride in bytes.
+    /// A hardware frame kept as the decoder made it (`Decoder::zero_copy`), whose planes can't be
+    /// read until `mapped`: macOS, its CVPixelBuffer; Windows, its `AVD3D12VAFrame`.
+    pub(crate) fn pixel_buffer(&self) -> Option<*mut std::ffi::c_void> {
+        // SAFETY: plain field reads on a live frame.
+        unsafe {
+            let p = self.frame.as_ptr();
+            let plane = if (*p).format == ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32 { 3 } else { 0 };
+            is_hw((*p).format).then(|| (*p).data[plane].cast())
+        }
+    }
+
+    /// For a frame kept on the hardware (`pixel_buffer`), a copy whose planes are CPU-addressable
+    /// (mapped in place where the platform allows); `None` for a frame that already is.
+    pub(crate) fn mapped(&self) -> anyhow::Result<Option<Frame>> {
+        if self.pixel_buffer().is_none() {
+            return Ok(None);
+        }
+        // SAFETY: a hardware frame (checked above).
+        let frame = unsafe { map_hw(&self.frame)? };
+        Ok(Some(Frame { pts: self.pts, kind: self.kind, hardware: true, full_range: self.full_range, planar: None, frame }))
+    }
+
+    /// Plane `i` (`rows` rows of `row` bytes) and its stride in bytes. Not for a frame kept on the
+    /// hardware: `mapped` it first.
     pub fn plane(&self, i: usize, row: usize, rows: usize) -> anyhow::Result<(&[u8], usize)> {
+        anyhow::ensure!(self.pixel_buffer().is_none(), "plane {i}: frame not mapped");
         // SAFETY: the frame owns (or maps) its planes for as long as it lives; FFmpeg and
         // CVPixelBuffer planes are `stride × rows` bytes, and the last row is read only to `row`.
         unsafe {
@@ -127,22 +162,34 @@ pub(crate) struct Decoder {
     trim_out: Option<Duration>,
     /// What plays: `[trim_in, trim_out or duration)`.
     pub length: Duration,
+    /// Hardware frames in a layout the GPU can sample straight from the decoder's buffer are
+    /// returned unmapped (`Frame::pixel_buffer`), for `zero_copy::import`. Off: always mapped.
+    pub(crate) zero_copy: bool,
 }
 
 impl Decoder {
-    pub fn open(path: &Path, audio: Option<AudioTap>) -> anyhow::Result<Decoder> {
+    /// `gpu`: decode on its device where the platform can (Windows: D3D12VA on DX12, so
+    /// `zero_copy` can draw the frames); `None`, the platform's own hardware device.
+    pub fn open(path: &Path, audio: Option<AudioTap>, gpu: Option<&Gpu>) -> anyhow::Result<Decoder> {
         // ffmpeg-next unwraps the path as a CString.
         ensure!(!path.as_os_str().as_encoded_bytes().contains(&0), "path contains a NUL byte");
         init();
         let input = ff::format::input(path).context("cannot open")?;
-        let d = Decoder::from_input(input, audio, path, false)?;
+        let d = Decoder::from_input(input, audio, path, false, gpu)?;
         ensure!(d.duration > Duration::ZERO, "unknown duration");
         Ok(d)
     }
 
     /// Decodes `input`'s best video stream (and audio, given a tap). `live`: a capture device, which
     /// has no duration and must not queue frames for frame threads (that would add latency).
-    pub fn from_input(input: ff::format::context::Input, audio: Option<AudioTap>, path: &Path, live: bool) -> anyhow::Result<Decoder> {
+    /// `gpu`: as for `open`.
+    pub fn from_input(
+        input: ff::format::context::Input,
+        audio: Option<AudioTap>,
+        path: &Path,
+        live: bool,
+        gpu: Option<&Gpu>,
+    ) -> anyhow::Result<Decoder> {
         let stream = input.streams().best(ff::media::Type::Video).context("no video stream")?;
         let time_base = f64::from(stream.time_base());
         let start = if stream.start_time() == ffi::AV_NOPTS_VALUE { 0 } else { stream.start_time() };
@@ -158,12 +205,25 @@ impl Decoder {
         let frame_interval = Duration::from_secs_f64(if fps > 0. { 1. / fps } else { 1. / 30. });
         let index = stream.index();
         let mut ctx = ff::codec::Context::from_parameters(stream.parameters())?;
-        if !attach_hw(&mut ctx) {
-            // SAFETY: the codec context is not opened yet.
+        if !attach_hw(&mut ctx, gpu) {
+            let cores = std::thread::available_parallelism().map_or(4, |n| n.get() as i32);
+            // SAFETY: the codec context is not opened yet; the descriptor is static (or null).
             unsafe {
-                // Software only (e.g. FFV1, DNxHD): frame threads on every core, so a 4K clip keeps up.
-                (*ctx.as_mut_ptr()).thread_count = 0;
-                (*ctx.as_mut_ptr()).thread_type = if live { ffi::FF_THREAD_SLICE } else { ffi::FF_THREAD_FRAME | ffi::FF_THREAD_SLICE };
+                let c = ctx.as_mut_ptr();
+                let desc = ffi::avcodec_descriptor_get((*c).codec_id);
+                #[allow(clippy::unnecessary_cast)] // the constant's binding type differs by platform
+                let intra = !desc.is_null() && (*desc).props & ffi::AV_CODEC_PROP_INTRA_ONLY as i32 != 0;
+                // Software only (e.g. FFV1, DNxHR, ProRes without hardware): enough threads that a 4K
+                // clip keeps up, but not every core per decoder, since several layers decode at once.
+                // Intra-only codecs slice-thread well; others get frame threads too, which cost a
+                // frame of memory and of latency each, so fewer. Live inputs: slices only (latency).
+                // ponytail: a fixed cap per decoder; share a budget across active players if many
+                // software layers still oversubscribe.
+                ((*c).thread_type, (*c).thread_count) = if live || intra {
+                    (ffi::FF_THREAD_SLICE, cores.min(8))
+                } else {
+                    (ffi::FF_THREAD_FRAME | ffi::FF_THREAD_SLICE, cores.min(4))
+                };
             }
         }
         let decoder = ctx.decoder().video().context("unsupported video codec")?;
@@ -183,6 +243,7 @@ impl Decoder {
             trim_in: Duration::ZERO,
             trim_out: None,
             length: Duration::from_secs_f64(seconds),
+            zero_copy: false,
         })
     }
 
@@ -244,6 +305,15 @@ impl Decoder {
         Ok(())
     }
 
+    /// Loop wrap: `rewind`, the next pass starting at `offset` on the player's timeline (its audio
+    /// too, however long the last pass's audio was).
+    pub fn wrap(&mut self, offset: Duration) -> anyhow::Result<()> {
+        if let Some(audio) = &self.audio {
+            audio.wrap(offset);
+        }
+        self.rewind()
+    }
+
     /// Back to the first frame for the player's seek `epoch`: audio decoded before it is dropped.
     pub fn seek(&mut self, epoch: u64) -> anyhow::Result<()> {
         if let Some(audio) = &mut self.audio {
@@ -288,11 +358,45 @@ impl Decoder {
     fn convert(&mut self, decoded: ff::frame::Video, pts: Duration) -> anyhow::Result<Frame> {
         // SAFETY: plain field reads/writes on live frames; `map_hw` only runs on hardware frames.
         unsafe {
-            let hardware = HW.is_some_and(|(_, f)| (*decoded.as_ptr()).format == f as i32);
+            use ffi::AVPixelFormat::*;
+            let format = (*decoded.as_ptr()).format;
+            let hardware = is_hw(format);
+            let zero_copy_kind = |f: i32| match f {
+                f if f == AV_PIX_FMT_NV12 as i32 => Some(PixelFormatKind::Nv12),
+                f if f == AV_PIX_FMT_P010LE as i32 => Some(PixelFormatKind::P010),
+                f if f == AV_PIX_FMT_P210LE as i32 => Some(PixelFormatKind::P210),
+                f if f == AV_PIX_FMT_AYUV64LE as i32 => Some(PixelFormatKind::Ayuv64),
+                _ => None,
+            };
+            // VideoToolbox frames, and D3D12VA ones (made on the engine's own device): kept as they
+            // are for `zero_copy::import`. D3D11VA frames are always mapped.
+            if self.zero_copy && (format == AV_PIX_FMT_VIDEOTOOLBOX as i32 || format == AV_PIX_FMT_D3D12 as i32) {
+                let p = decoded.as_ptr();
+                let frames = (*p).hw_frames_ctx;
+                if let Some(kind) = (!frames.is_null()).then(|| zero_copy_kind((*((*frames).data as *const ffi::AVHWFramesContext)).sw_format as i32)).flatten() {
+                    let full_range = (*p).color_range == ffi::AVColorRange::AVCOL_RANGE_JPEG;
+                    return Ok(Frame { pts, kind, hardware, full_range, planar: None, frame: decoded });
+                }
+            }
             let mut frame = if hardware { map_hw(&decoded)? } else { decoded };
             let p = frame.as_ptr();
-            let full_range = (*p).color_range == ffi::AVColorRange::AVCOL_RANGE_JPEG;
-            use ffi::AVPixelFormat::*;
+            let mut full_range = (*p).color_range == ffi::AVColorRange::AVCOL_RANGE_JPEG;
+            // Software planar YUV: uploaded as the YUV shader's planes (U and V interleaved by
+            // staging, on the decode thread) instead of an RGBA conversion here.
+            let planar = match (*p).format {
+                f if f == AV_PIX_FMT_YUV420P as i32 || f == AV_PIX_FMT_YUVJ420P as i32 => Some((PixelFormatKind::Nv12, 0)),
+                f if f == AV_PIX_FMT_YUV422P as i32 || f == AV_PIX_FMT_YUVJ422P as i32 => Some((PixelFormatKind::Nv16, 0)),
+                f if f == AV_PIX_FMT_YUV444P as i32 || f == AV_PIX_FMT_YUVJ444P as i32 => Some((PixelFormatKind::Nv24, 0)),
+                f if f == AV_PIX_FMT_YUV420P10LE as i32 => Some((PixelFormatKind::P010, 6)),
+                f if f == AV_PIX_FMT_YUV422P10LE as i32 => Some((PixelFormatKind::P210, 6)),
+                f if f == AV_PIX_FMT_YUV444P10LE as i32 => Some((PixelFormatKind::P410, 6)),
+                _ => None,
+            };
+            if let Some((kind, shift)) = planar {
+                let jpeg = [AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ444P].iter().any(|j| *j as i32 == (*p).format);
+                full_range |= jpeg; // the deprecated "j" formats are full range by definition
+                return Ok(Frame { pts, kind, hardware, full_range, planar: Some(shift), frame });
+            }
             let kind = match (*p).format {
                 f if f == AV_PIX_FMT_NV12 as i32 => PixelFormatKind::Nv12,
                 f if f == AV_PIX_FMT_P010LE as i32 => PixelFormatKind::P010,
@@ -303,7 +407,7 @@ impl Decoder {
                     PixelFormatKind::Rgba
                 }
             };
-            Ok(Frame { pts, kind, hardware, full_range, frame })
+            Ok(Frame { pts, kind, hardware, full_range, planar: None, frame })
         }
     }
 }
@@ -366,42 +470,58 @@ pub(crate) fn init() {
     });
 }
 
+/// The platform's hardware decoders, preferred first: device type, and the pixel format of its
+/// frames.
 #[cfg(target_os = "macos")]
-const HW: Option<(ffi::AVHWDeviceType, ffi::AVPixelFormat)> =
-    Some((ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX, ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX));
+const HW: &[(ffi::AVHWDeviceType, ffi::AVPixelFormat)] =
+    &[(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX, ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX)];
+// D3D12VA only on the engine's own DX12 device (`attach_hw`); D3D11VA frames are mapped to the CPU.
 // ponytail: untested on Windows (no machine here); map falls back to transfer if D3D11 can't map.
 #[cfg(target_os = "windows")]
-const HW: Option<(ffi::AVHWDeviceType, ffi::AVPixelFormat)> =
-    Some((ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA, ffi::AVPixelFormat::AV_PIX_FMT_D3D11));
+const HW: &[(ffi::AVHWDeviceType, ffi::AVPixelFormat)] = &[
+    (ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D12VA, ffi::AVPixelFormat::AV_PIX_FMT_D3D12),
+    (ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA, ffi::AVPixelFormat::AV_PIX_FMT_D3D11),
+];
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-const HW: Option<(ffi::AVHWDeviceType, ffi::AVPixelFormat)> = None;
+const HW: &[(ffi::AVHWDeviceType, ffi::AVPixelFormat)] = &[];
 
-/// Gives the decoder the platform's hardware device if its codec has a hardware decoder; it is used
-/// only for sizes and profiles the hardware supports, else the stream decodes in software. Returns
-/// whether the codec has one (false: software for sure).
+/// `format` is a hardware decoder's (`HW`): the frame's planes are on the GPU.
+fn is_hw(format: i32) -> bool {
+    HW.iter().any(|(_, f)| *f as i32 == format)
+}
+
+/// Gives the decoder the first of the platform's hardware devices its codec has a decoder for; it
+/// is used only for sizes and profiles the hardware supports, else the stream decodes in software.
+/// D3D12VA only on `gpu`'s own device (so its frames are textures the engine draws directly), else
+/// the next. Returns whether a device was attached (false: software for sure).
 // ponytail: a hardware-capable codec the hardware refuses at runtime decodes single-threaded;
 // threads can't be added once the decoder is open.
-fn attach_hw(ctx: &mut ff::codec::Context) -> bool {
-    let Some((device, _)) = HW else { return false };
+fn attach_hw(ctx: &mut ff::codec::Context, gpu: Option<&Gpu>) -> bool {
     // SAFETY: the codec context is not opened yet; it takes ownership of the device reference.
     // avcodec_get_hw_config returns static configs, null past the last.
     unsafe {
         let c = ctx.as_mut_ptr();
         let codec = ffi::avcodec_find_decoder((*c).codec_id);
-        let has_hw = !codec.is_null()
-            && (0..).map(|i| ffi::avcodec_get_hw_config(codec, i)).take_while(|cfg| !cfg.is_null()).any(|cfg| {
-                (*cfg).device_type == device && (*cfg).methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32 != 0
-            });
-        if !has_hw {
-            return false;
+        let has_hw = |device| {
+            !codec.is_null()
+                && (0..).map(|i| ffi::avcodec_get_hw_config(codec, i)).take_while(|cfg| !cfg.is_null()).any(|cfg| {
+                    (*cfg).device_type == device && (*cfg).methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32 != 0
+                })
+        };
+        for &(device, _) in HW.iter().filter(|(d, _)| has_hw(*d)) {
+            let mut dev = ptr::null_mut();
+            if device == ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D12VA {
+                dev = gpu.filter(|_| crate::zero_copy::enabled()).map_or(ptr::null_mut(), crate::zero_copy::d3d12_device);
+            } else if ffi::av_hwdevice_ctx_create(&mut dev, device, ptr::null(), ptr::null_mut(), 0) < 0 {
+                dev = ptr::null_mut();
+            }
+            if !dev.is_null() {
+                (*c).hw_device_ctx = dev;
+                (*c).get_format = Some(pick_hw);
+                return true;
+            }
         }
-        let mut dev = ptr::null_mut();
-        if ffi::av_hwdevice_ctx_create(&mut dev, device, ptr::null(), ptr::null_mut(), 0) < 0 {
-            return false;
-        }
-        (*c).hw_device_ctx = dev;
-        (*c).get_format = Some(pick_hw);
-        true
+        false
     }
 }
 
@@ -411,12 +531,16 @@ pub(crate) fn pix_fmt(f: i32) -> Option<ffi::AVPixelFormat> {
     (-1..=ffi::AVPixelFormat::AV_PIX_FMT_NB as i32).contains(&f).then(|| unsafe { std::mem::transmute::<i32, ffi::AVPixelFormat>(f) })
 }
 
+/// The pixel format of the device `attach_hw` gave the decoder.
 unsafe extern "C" fn pick_hw(c: *mut ffi::AVCodecContext, formats: *const ffi::AVPixelFormat) -> ffi::AVPixelFormat {
-    // SAFETY: FFmpeg passes a list terminated by AV_PIX_FMT_NONE.
+    // SAFETY: FFmpeg passes a list terminated by AV_PIX_FMT_NONE; `pick_hw` is only set together
+    // with `hw_device_ctx`, a live device context.
     unsafe {
+        let device = (*((*(*c).hw_device_ctx).data as *const ffi::AVHWDeviceContext)).type_;
+        let hw = HW.iter().find(|(d, _)| *d == device).map(|(_, f)| *f);
         let mut f = formats;
         while *f != ffi::AVPixelFormat::AV_PIX_FMT_NONE {
-            if HW.is_some_and(|(_, hw)| *f == hw) {
+            if Some(*f) == hw {
                 return *f;
             }
             f = f.add(1);
@@ -467,7 +591,7 @@ mod tests {
     /// rewind starts at the in point again.
     #[test]
     fn trim_plays_only_the_window() {
-        let mut d = Decoder::open(&fixture("h264_64.mp4"), None).unwrap().trimmed(300, Some(700)).unwrap();
+        let mut d = Decoder::open(&fixture("h264_64.mp4"), None, None).unwrap().trimmed(300, Some(700)).unwrap();
         assert_eq!(d.length, Duration::from_millis(400));
         let first = pts_ms(&mut d);
         assert_eq!(first.len(), 12, "{first:?}");
@@ -475,10 +599,10 @@ mod tests {
         d.rewind().unwrap();
         assert_eq!(pts_ms(&mut d), first, "the next pass is the same window");
         // No out point: to the file's end.
-        let mut tail = Decoder::open(&fixture("h264_64.mp4"), None).unwrap().trimmed(900, None).unwrap();
+        let mut tail = Decoder::open(&fixture("h264_64.mp4"), None, None).unwrap().trimmed(900, None).unwrap();
         assert_eq!((tail.length, pts_ms(&mut tail).len()), (Duration::from_millis(100), 3));
         for (a, b) in [(700, Some(300)), (1000, None), (0, Some(0))] {
-            assert!(Decoder::open(&fixture("h264_64.mp4"), None).unwrap().trimmed(a, b).is_err(), "{a} {b:?}");
+            assert!(Decoder::open(&fixture("h264_64.mp4"), None, None).unwrap().trimmed(a, b).is_err(), "{a} {b:?}");
         }
     }
 
@@ -486,7 +610,7 @@ mod tests {
     #[test]
     fn trim_cuts_audio_to_the_window() {
         let tap = AudioTap::new((48_000, 2));
-        let mut d = Decoder::open(&fixture("h264_64.mp4"), Some(tap.clone())).unwrap().trimmed(300, Some(700)).unwrap();
+        let mut d = Decoder::open(&fixture("h264_64.mp4"), Some(tap.clone()), None).unwrap().trimmed(300, Some(700)).unwrap();
         while d.next().unwrap().is_some() {}
         let seconds = tap.buffered() as f64 / (48_000. * 2.);
         assert!((seconds - 0.4).abs() < 0.05, "{seconds} s of audio for a 0.4 s window");

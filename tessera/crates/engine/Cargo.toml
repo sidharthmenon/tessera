@@ -25,7 +25,18 @@ libloading = "0.8"
 objc2-app-kit = { version = "0.2.2", features = ["NSResponder", "NSView", "NSWindow"] }
 # Listing capture devices (FFmpeg's avfoundation can't): the versions objc2-app-kit already uses.
 objc2 = "0.5"
-objc2-foundation = { version = "0.2", features = ["NSArray", "NSBundle", "NSDictionary", "NSEnumerator", "NSString"] }
+objc2-foundation = { version = "0.2", features = ["NSArray", "NSBundle", "NSDictionary", "NSEnumerator", "NSProcessInfo", "NSString"] }
+# Thread QoS classes.
+libc = "0.2"
+# Zero-copy VideoToolbox frames: IOSurface planes as Metal textures (the versions wgpu-hal uses).
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLAllocation", "MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture", "objc2-io-surface"] }
+objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "objc2"] }
+
+[target.'cfg(windows)'.dependencies]
+# Keep displays awake, opt out of EcoQoS, thread priorities.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Power", "Win32_System_Threading"] }
+# Zero-copy D3D12VA frames: the decoder's textures drawn by wgpu's DX12 device (the version wgpu-hal uses).
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi_Common"] }
 
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }

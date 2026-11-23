@@ -162,7 +162,7 @@ fn rgba_texture_straight_and_premultiplied() {
     let s = screen(8, 4);
     let tex = |rgba: [u8; 4], premultiplied| {
         let t = gpu.upload(4, 4, TextureFormat::Rgba8Unorm, &rgba.repeat(16));
-        LayerTexture { planes: Planes::Rgba(t.create_view(&Default::default())), premultiplied, full_range: true }
+        LayerTexture { planes: Planes::Rgba(t.create_view(&Default::default())), premultiplied, full_range: true, uv_scale: [1., 1.] }
     };
     let media = |rect, t| (Layer::new(Source::Media { media_id: Uuid::new_v4() }, rect), Some(t));
     let data = render(&gpu, &mut c, &s, &[
@@ -183,7 +183,7 @@ fn nv12_solid_converts() {
         let uv = gpu.upload(4, 4, TextureFormat::Rg8Unorm, &[128; 32]);
         let planes = Planes::Nv12 { y: y.create_view(&Default::default()), uv: uv.create_view(&Default::default()) };
         let layer = Layer::new(Source::Media { media_id: Uuid::new_v4() }, r(0., 0., 8., 8.));
-        (layer, Some(LayerTexture { planes, premultiplied: false, full_range: false }))
+        (layer, Some(LayerTexture { planes, premultiplied: false, full_range: false, uv_scale: [1., 1.] }))
     };
     let data = render(&gpu, &mut c, &s, &[nv12(235)]);
     assert_near(px(&data, 8, 4, 4), [255, 255, 255, 255], 3);
@@ -203,7 +203,7 @@ fn p010_solid_converts() {
         let uv = gpu.upload(4, 4, TextureFormat::Rg16Unorm, &plane(512, 32));
         let planes = Planes::P010 { y: y.create_view(&Default::default()), uv: uv.create_view(&Default::default()) };
         let layer = Layer::new(Source::Media { media_id: Uuid::new_v4() }, r(0., 0., 8., 8.));
-        (layer, Some(LayerTexture { planes, premultiplied: false, full_range: false }))
+        (layer, Some(LayerTexture { planes, premultiplied: false, full_range: false, uv_scale: [1., 1.] }))
     };
     let data = render(&gpu, &mut c, &s, &[p010(940)]);
     assert_near(px(&data, 8, 4, 4), [255, 255, 255, 255], 3);

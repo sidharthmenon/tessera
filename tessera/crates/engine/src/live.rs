@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::compositor::LayerTexture;
 use crate::gpu::Gpu;
 use crate::player::{GpuFrame, upload_into};
+use crate::staging::{Pool, Staged};
 use crate::video_decode::Frame;
 
 /// No frame for this long: the input is lost (its layers go transparent, one error is reported)
@@ -16,6 +17,9 @@ use crate::video_decode::Frame;
 const LOST_AFTER: Duration = Duration::from_secs(1);
 /// Waits between reopen attempts, growing to the last.
 const BACKOFF: [Duration; 3] = [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(5)];
+/// Staging buffers per input: the newest frame and the few the GPU is still copying from (every
+/// layer showing the input uploads from the same one).
+const STAGING: usize = 6;
 
 /// Something that delivers frames in real time. Made and used on the input's producer thread only.
 pub(crate) trait LiveSource {
@@ -30,7 +34,8 @@ pub(crate) type Connect = Box<dyn FnMut() -> anyhow::Result<Box<dyn LiveSource>>
 struct Latest {
     /// Bumped by every new frame.
     seq: u64,
-    frame: Option<Arc<Frame>>,
+    /// Already in a staging buffer (copied on the producer thread).
+    frame: Option<Arc<Staged>>,
     lost: bool,
     /// The last problem, numbered so each layer reports it once.
     error: Option<(u64, String)>,
@@ -45,10 +50,14 @@ pub struct Feed {
 
 impl Feed {
     /// Starts the producer thread for the input `connect` opens.
-    pub(crate) fn spawn(name: &str, connect: Connect) -> anyhow::Result<Arc<Feed>> {
+    pub(crate) fn spawn(gpu: &Gpu, name: &str, connect: Connect) -> anyhow::Result<Arc<Feed>> {
         let feed = Arc::new(Feed { latest: Mutex::new(Latest::default()), running: AtomicBool::new(true) });
         let weak = Arc::downgrade(&feed);
-        std::thread::Builder::new().name(format!("live {}", name.replace('\0', ""))).spawn(move || produce(weak, connect))?;
+        let pool = Pool::new(gpu, STAGING);
+        std::thread::Builder::new().name(format!("live {}", name.replace('\0', ""))).spawn(move || {
+            crate::os::set_priority(crate::os::Priority::Decode);
+            produce(weak, connect, pool)
+        })?;
         Ok(feed)
     }
 
@@ -64,7 +73,7 @@ impl Feed {
 /// The producer: opens the input, publishes each frame as the newest, and on an error or
 /// `LOST_AFTER` without a frame marks the input lost and reopens it after a backoff. Returns once
 /// no layer holds the feed.
-fn produce(weak: Weak<Feed>, mut connect: Connect) {
+fn produce(weak: Weak<Feed>, mut connect: Connect, mut pool: Pool) {
     struct Stopped(Weak<Feed>);
     impl Drop for Stopped {
         fn drop(&mut self) {
@@ -94,6 +103,11 @@ fn produce(weak: Weak<Feed>, mut connect: Connect) {
                 loop {
                     match source.next(Duration::from_millis(100)) {
                         Ok(Some(frame)) => {
+                            let frame = match pool.stage(&frame, false) {
+                                Ok(Some(staged)) => staged,
+                                Ok(None) => continue, // every buffer still in use: skip it, the next is newer
+                                Err(e) => break format!("{e:#}"),
+                            };
                             let Some(feed) = weak.upgrade() else { return };
                             let old = {
                                 let mut l = feed.latest();
@@ -140,7 +154,7 @@ pub struct LiveMedia {
     seen_error: u64,
     frozen: bool,
     lost: bool,
-    due: Option<Arc<Frame>>,
+    due: Option<Arc<Staged>>,
     gpu: Option<GpuFrame>,
     error: Option<String>,
     failed: bool,
@@ -174,11 +188,12 @@ impl LiveMedia {
         if self.failed || self.lost {
             return None;
         }
-        if let Some(frame) = self.due.take()
-            && let Err(e) = upload_into(&mut self.gpu, gpu, &frame)
-        {
-            (self.failed, self.error) = (true, Some(format!("{e:#}")));
-            return None;
+        if let Some(frame) = self.due.take() {
+            if let Err(e) = upload_into(&mut self.gpu, gpu, &frame) {
+                (self.failed, self.error) = (true, Some(format!("{e:#}")));
+                return None;
+            }
+            gpu.retire(frame); // its buffer goes back once every layer's copy is done
         }
         self.gpu.as_ref().map(|g| g.layer.clone())
     }
@@ -222,7 +237,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut rx = Some(rx);
         let connect: Connect = Box::new(move || Ok(Box::new(Fake(rx.take().ok_or_else(|| anyhow::anyhow!("gone"))?)) as Box<dyn LiveSource>));
-        (Feed::spawn("test", connect).unwrap(), tx)
+        (Feed::spawn(&Gpu::new_headless().expect("these tests need a GPU"), "test", connect).unwrap(), tx)
     }
 
     /// Waits for the producer to publish `seq`.

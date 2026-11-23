@@ -59,6 +59,8 @@ fn default_cache_dir() -> PathBuf {
 
 fn main() -> anyhow::Result<()> {
     let args = args()?;
+    let cache = args.cache_dir.clone().unwrap_or_else(default_cache_dir);
+    tessera_engine::logger::init(&cache.join("logs"));
     let demo_mode = args.demo || args.demo_4k.is_some();
     let token = match std::env::var("TESSERA_TOKEN") {
         Ok(token) if !token.is_empty() => token,
@@ -91,7 +93,6 @@ fn main() -> anyhow::Result<()> {
         }
     });
     let previews = Previews::new();
-    let cache = args.cache_dir.unwrap_or_else(default_cache_dir);
     let listen = SocketAddr::from((Ipv4Addr::LOCALHOST, args.port));
     let addr = net::serve(listen, token.clone(), handle.clone(), clients, previews.clone(), cache.join("thumbs"))?;
     // The controller reads the port from this line.

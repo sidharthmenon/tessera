@@ -18,7 +18,7 @@ struct U {
 @group(0) @binding(0) var t0: texture_2d<f32>;
 @group(0) @binding(1) var t1: texture_2d<f32>;
 @group(0) @binding(2) var s: sampler;
-@group(0) @binding(3) var<uniform> u: U;
+var<immediate> u: U;
 
 struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 

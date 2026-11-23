@@ -603,9 +603,9 @@ impl FileOpener {
         self.feeds.retain(|_, f| f.strong_count() > 0);
         let id = item.path.clone();
         let feed = if item.kind == MediaKind::Ndi {
-            Feed::spawn(&item.name, Box::new(move || crate::ndi::open(&id)))?
+            Feed::spawn(&self.gpu, &item.name, Box::new(move || crate::ndi::open(&id)))?
         } else {
-            Feed::spawn(&item.name, Box::new(move || crate::capture::open(&id)))?
+            Feed::spawn(&self.gpu, &item.name, Box::new(move || crate::capture::open(&id)))?
         };
         self.feeds.insert(key, Arc::downgrade(&feed));
         Ok(feed)
@@ -620,7 +620,7 @@ impl Opener for FileOpener {
         let item = item.ok_or_else(|| format!("layer {}: media {media_id} is not in the config", layer.id))?;
         let path = Path::new(&item.path);
         let media = match item.kind {
-            MediaKind::Video => Player::open_trimmed(path, layer.playback.clone(), self.audio, layer.trim_in_ms, layer.trim_out_ms)
+            MediaKind::Video => Player::open_trimmed(&self.gpu, path, layer.playback.clone(), self.audio, layer.trim_in_ms, layer.trim_out_ms)
                 .map(|player| FileMedia::Video { player: Box::new(player), gpu: self.gpu.clone() }),
             MediaKind::Image => ImageSource::open(&self.gpu, path).map(|image| FileMedia::Image(Box::new(image))),
             MediaKind::Capture | MediaKind::Ndi => self.feed(&item).map(|feed| FileMedia::Live { live: Box::new(LiveMedia::new(feed)), gpu: self.gpu.clone() }),
