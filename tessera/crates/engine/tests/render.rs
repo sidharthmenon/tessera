@@ -6,9 +6,8 @@ use tessera_show::{Layer, Mapping, Output, OutputTarget, Pattern, Rect, Screen, 
 use uuid::Uuid;
 use wgpu::TextureFormat;
 
-fn gpu() -> Gpu {
-    Gpu::new_headless().expect("no GPU adapter: these tests need a real GPU (headless Metal on macOS)")
-}
+mod common;
+use common::gpu;
 
 fn r(x: f32, y: f32, w: f32, h: f32) -> Rect {
     Rect { x, y, w, h }

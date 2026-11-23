@@ -1,6 +1,4 @@
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use tessera_engine::audio::AudioTap;
@@ -11,28 +9,14 @@ use tessera_engine::video_decode::{PixelFormatKind, decode_all_frames};
 use tessera_show::{Layer, Playback, Rect, Screen, Source};
 use uuid::Uuid;
 
+mod common;
+use common::gpu;
+
 const PERIOD: Duration = Duration::from_micros(16_667);
 const MISSING: &str = "/nonexistent/clip.mp4";
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
-}
-
-/// A device for the calling test, which from here on has the GPU to itself until its thread ends:
-/// each device reserves its own blocks of GPU memory (hundreds of MB once it uploads frames), and a
-/// dozen side by side ran a 1 GB integrated GPU out of memory. Not one device for all: the engine
-/// records and submits from one thread, and tests running at once would interleave their submits.
-fn gpu() -> Gpu {
-    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-    thread_local! {
-        static TURN: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
-    }
-    TURN.with_borrow_mut(|turn| {
-        if turn.is_none() {
-            *turn = Some(ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner));
-        }
-    });
-    Gpu::new_headless().expect("no GPU adapter: these tests need a real GPU (headless Metal on macOS)")
 }
 
 fn ms(ms: u64) -> Duration {
