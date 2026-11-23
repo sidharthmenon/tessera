@@ -43,8 +43,10 @@ export function variableDefinitions(state: Snapshot | null): VariableDefinition[
 	return [...FIXED, ...cues]
 }
 
-export function variableValues(state: Snapshot): Record<string, string | number | undefined> {
-	const values: Record<string, string | number | undefined> = {
+export type Values = Record<string, string | number | undefined>
+
+export function variableValues(state: Snapshot): Values {
+	const values: Values = {
 		show: state.show,
 		engine: state.engine,
 		volume: state.volume,
@@ -60,6 +62,17 @@ export function variableValues(state: Snapshot): Record<string, string | number 
 	}
 	for (const g of state.groups) for (const c of g.cues) values[cueVariable(g.number, c.number)] = c.name
 	return values
+}
+
+/** The values that differ from what Companion was last given (all of them after `{}`). */
+export function changedValues(sent: Values, next: Values): Values {
+	return Object.fromEntries(Object.entries(next).filter(([id, v]) => !(id in sent) || sent[id] !== v))
+}
+
+/** Everything the feedbacks read: they need checking again only when this changes. */
+export function tallyKey(state: Snapshot): string {
+	const { preview: p, program: g } = state
+	return JSON.stringify([p.group, p.cue, g.group, g.cue, p.edited, state.engine])
 }
 
 /** A change in the groups/cues (not just which is live) needs new variable and preset definitions. */

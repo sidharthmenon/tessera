@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { apiUrl, eventsUrl } from './api.js'
-import { clock, cueShape, cueVariable, engineConnected, inPreview, onProgram, previewEdited, variableDefinitions, variableValues } from './state.js'
+import { changedValues, clock, cueShape, cueVariable, engineConnected, inPreview, onProgram, previewEdited, tallyKey, variableDefinitions, variableValues } from './state.js'
 import type { Snapshot } from './types.js'
 
 const state: Snapshot = {
@@ -43,6 +43,27 @@ test('feedbacks', () => {
 	assert.ok(onProgram(state, 1, 1) && !onProgram(state, 2, 1))
 	assert.ok(previewEdited(state) && engineConnected(state))
 	assert.ok(!inPreview(null, 1, 1) && !engineConnected({ ...state, engine: 'stopped' }))
+})
+
+test('only changed variables go to Companion', () => {
+	const first = variableValues(state)
+	assert.deepEqual(changedValues({}, first), first, 'everything the first time')
+	const ticked = variableValues({ ...state, time: { ...state.time!, elapsedMs: 66_400, remainingMs: 3_724_000 } })
+	assert.deepEqual(changedValues(first, ticked), { pgm_elapsed: '1:06', pgm_remaining: '1:02:04' })
+	assert.deepEqual(changedValues(ticked, ticked), {})
+	assert.deepEqual(changedValues({ show: 'gala.tshow' }, { show: 'gala.tshow', pvw_cue: '' }), { pvw_cue: '' }, 'a value never sent')
+})
+
+test('feedbacks are checked again only when the tally changes', () => {
+	const ticking = { ...state, volume: 10, time: null }
+	assert.equal(tallyKey(state), tallyKey(ticking), 'clip time and volume: no check')
+	for (const changed of [
+		{ ...state, preview: { ...state.preview, cue: 1 } },
+		{ ...state, program: { ...state.program, group: 2 } },
+		{ ...state, preview: { ...state.preview, edited: false } },
+		{ ...state, engine: 'connecting' },
+	])
+		assert.notEqual(tallyKey(state), tallyKey(changed))
 })
 
 test('cue shape changes only with the cue list', () => {

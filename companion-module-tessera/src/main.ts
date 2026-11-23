@@ -3,7 +3,7 @@ import { actions } from './actions.js'
 import { TesseraClient, type Status } from './api.js'
 import { feedbacks } from './feedbacks.js'
 import { presets } from './presets.js'
-import { cueShape, variableDefinitions, variableValues } from './state.js'
+import { changedValues, cueShape, tallyKey, variableDefinitions, variableValues, type Values } from './state.js'
 import { DEFAULT_PORT, type Config, type Snapshot } from './types.js'
 
 export class TesseraInstance extends InstanceBase<Config> {
@@ -12,6 +12,12 @@ export class TesseraInstance extends InstanceBase<Config> {
 	state: Snapshot | null = null
 	/** The groups/cues the variable and preset definitions were made for. */
 	private shape = ''
+	/** The variable values Companion has. */
+	private sent: Values = {}
+	/** What the feedbacks were last checked for (`tallyKey`). */
+	private tally = ''
+	/** The status Companion shows. */
+	private status = ''
 
 	async init(config: Config): Promise<void> {
 		this.config = config
@@ -50,7 +56,7 @@ export class TesseraInstance extends InstanceBase<Config> {
 
 	private start(): void {
 		if (!this.config.host || !this.config.key) {
-			this.updateStatus(InstanceStatus.BadConfig, 'Set the host and the access key')
+			this.report(InstanceStatus.BadConfig, 'Set the host and the access key')
 			return
 		}
 		this.client = new TesseraClient(this.config, {
@@ -62,7 +68,15 @@ export class TesseraInstance extends InstanceBase<Config> {
 
 	private onStatus(status: Status, message?: string): void {
 		const map = { connecting: InstanceStatus.Connecting, ok: InstanceStatus.Ok, auth: InstanceStatus.AuthenticationFailure, failed: InstanceStatus.ConnectionFailure }
-		this.updateStatus(map[status], message ?? null)
+		this.report(map[status], message ?? null)
+	}
+
+	/** Only a change goes to Companion: retries repeat the same status. */
+	private report(status: InstanceStatus, message: string | null): void {
+		const key = `${status}:${message ?? ''}`
+		if (key === this.status) return
+		this.status = key
+		this.updateStatus(status, message)
 	}
 
 	private onState(state: Snapshot): void {
@@ -72,9 +86,18 @@ export class TesseraInstance extends InstanceBase<Config> {
 			this.shape = shape
 			this.setVariableDefinitions(variableDefinitions(state))
 			this.setPresetDefinitions(presets(state))
+			this.sent = {}
 		}
-		this.setVariableValues(variableValues(state))
-		this.checkFeedbacks()
+		// Tessera sends the state every second while a clip plays: only what changed goes on.
+		const values = variableValues(state)
+		const changed = changedValues(this.sent, values)
+		if (Object.keys(changed).length > 0) this.setVariableValues(changed)
+		this.sent = values
+		const tally = tallyKey(state)
+		if (tally !== this.tally) {
+			this.tally = tally
+			this.checkFeedbacks()
+		}
 	}
 }
 

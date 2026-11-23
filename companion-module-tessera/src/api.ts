@@ -22,10 +22,15 @@ export function eventsUrl(c: Config): string {
 
 /** Waits between reconnects, growing to the last. */
 const BACKOFF_MS = [1000, 2000, 5000]
+/** A request Tessera hasn't answered by then has failed (a dead link would otherwise hang it). */
+const REQUEST_TIMEOUT_MS = 2000
+/** Tessera sends the state at least every 5 s: this long without a message is a dead link. */
+const SILENCE_MS = 15_000
 
 export class TesseraClient {
 	private socket: WebSocket | null = null
 	private timer: NodeJS.Timeout | null = null
+	private silence: NodeJS.Timeout | null = null
 	private attempt = 0
 	private closed = false
 
@@ -42,13 +47,18 @@ export class TesseraClient {
 	destroy(): void {
 		this.closed = true
 		if (this.timer) clearTimeout(this.timer)
+		if (this.silence) clearTimeout(this.silence)
 		this.socket?.close()
 		this.socket = null
 	}
 
 	/** Runs a command (`path` after `/api/v1`, e.g. `/go`); throws with Tessera's message if refused. */
 	async post(path: string): Promise<Snapshot> {
-		const res = await fetch(`${apiUrl(this.config)}${path}`, { method: 'POST', headers: { 'X-Tessera-Key': this.config.key } })
+		const res = await fetch(`${apiUrl(this.config)}${path}`, {
+			method: 'POST',
+			headers: { 'X-Tessera-Key': this.config.key },
+			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+		})
 		const body = (await res.json().catch(() => ({}))) as { error?: string } & Partial<Snapshot>
 		if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`)
 		return body as Snapshot
@@ -56,10 +66,14 @@ export class TesseraClient {
 
 	private async open(): Promise<void> {
 		if (this.closed) return
-		this.handlers.status('connecting')
+		// Retries keep showing why the last attempt failed.
+		if (this.attempt === 0) this.handlers.status('connecting')
 		// A plain request first: a WebSocket refused for a wrong key only says "closed".
 		try {
-			const res = await fetch(`${apiUrl(this.config)}/state`, { headers: { 'X-Tessera-Key': this.config.key } })
+			const res = await fetch(`${apiUrl(this.config)}/state`, {
+				headers: { 'X-Tessera-Key': this.config.key },
+				signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+			})
 			if (res.status === 401) {
 				this.handlers.status('auth', 'Wrong access key (Tessera: status bar → Remote)')
 				return this.retry()
@@ -76,8 +90,10 @@ export class TesseraClient {
 		socket.addEventListener('open', () => {
 			this.attempt = 0
 			this.handlers.status('ok')
+			this.heard(socket)
 		})
 		socket.addEventListener('message', (event) => {
+			this.heard(socket)
 			try {
 				const msg = JSON.parse(String(event.data)) as { type?: string; state?: Snapshot }
 				if (msg.type === 'state' && msg.state) this.handlers.state(msg.state)
@@ -85,15 +101,25 @@ export class TesseraClient {
 				// not ours; ignore
 			}
 		})
-		socket.addEventListener('close', () => {
-			if (this.socket !== socket) return
-			this.socket = null
-			if (!this.closed) {
-				this.handlers.status('failed', 'Connection to Tessera lost; reconnecting')
-				this.retry()
-			}
-		})
+		socket.addEventListener('close', () => this.lost(socket, 'Connection to Tessera lost; reconnecting'))
 		socket.addEventListener('error', () => socket.close())
+	}
+
+	/** A message (or the open): the link is alive for another `SILENCE_MS`. */
+	private heard(socket: WebSocket): void {
+		if (this.silence) clearTimeout(this.silence)
+		this.silence = setTimeout(() => this.lost(socket, `No word from Tessera for ${SILENCE_MS / 1000} s; reconnecting`), SILENCE_MS)
+	}
+
+	/** Gives up on `socket` (closed, or silent: a dead link may never say "closed") and reconnects. */
+	private lost(socket: WebSocket, message: string): void {
+		if (this.socket !== socket) return
+		this.socket = null
+		if (this.silence) clearTimeout(this.silence)
+		socket.close()
+		if (this.closed) return
+		this.handlers.status('failed', message)
+		this.retry()
 	}
 
 	private retry(): void {

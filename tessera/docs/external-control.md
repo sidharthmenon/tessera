@@ -132,7 +132,9 @@ Errors come back as `{ "error": "…" }` with a status:
 
 Connect a WebSocket to `ws://<host>:<port>/api/v1/events?key=<key>`. Tessera sends the state at
 once, then again whenever it changes (a cue loaded, a GO, a volume change, the engine restarting, a
-cue renamed, …) and each second while `time` counts. Every message is:
+cue renamed, …), each second while `time` counts, and at least every 5 s even when nothing changed:
+a client that hears nothing for much longer (the Companion module waits 15 s) can take the
+connection as dead and reconnect. Every message is:
 
 ```json
 { "type": "state", "state": { …the state above… } }
