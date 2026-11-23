@@ -42,6 +42,36 @@ pub fn init(dir: &Path) {
     }
 }
 
+/// wgpu's warnings and errors into `log!`. It reports through the `log` crate, which drops what no
+/// installed logger takes: with `WGPU_VALIDATION=1` that is the D3D12 debug layer's output.
+struct Wgpu;
+
+impl log::Log for Wgpu {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        forwarded(metadata.target(), metadata.level())
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            write(format_args!("gpu {}: {}", record.level(), record.args()));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn forwarded(target: &str, level: log::Level) -> bool {
+    target.starts_with("wgpu") && level <= log::Level::Warn
+}
+
+/// Installs `Wgpu` as the process's `log` logger; again (or with another logger set), nothing.
+pub fn forward_wgpu() {
+    static WGPU: Wgpu = Wgpu;
+    if log::set_logger(&WGPU).is_ok() {
+        log::set_max_level(log::LevelFilter::Warn);
+    }
+}
+
 /// The two writer threads; returns the queue into the first.
 fn spawn(path: Option<PathBuf>, stderr: impl Write + Send + 'static) -> std::io::Result<SyncSender<String>> {
     let (tx, lines) = sync_channel::<String>(QUEUE);
@@ -159,6 +189,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wgpu_warnings_and_errors_are_forwarded() {
+        // D3D12 debug-layer messages come from wgpu-hal's exception handler.
+        assert!(forwarded("wgpu_hal::auxil::dxgi::exception", log::Level::Error));
+        assert!(forwarded("wgpu_core::device", log::Level::Warn));
+        assert!(!forwarded("wgpu_hal::dx12", log::Level::Info), "chatter");
+        assert!(!forwarded("naga::front", log::Level::Warn), "not wgpu");
+        forward_wgpu();
+        assert!(log::log_enabled!(target: "wgpu_hal::dx12", log::Level::Warn), "installed");
     }
 
     #[test]

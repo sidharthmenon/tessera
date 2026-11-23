@@ -33,6 +33,7 @@ impl Gpu {
     /// Device with no window; backend overridable via `WGPU_BACKEND`. Windows: DX12 by default,
     /// whose decoder frames are drawn without a copy (`zero_copy`); any backend if it has no device.
     pub fn new_headless() -> anyhow::Result<Gpu> {
+        crate::logger::forward_wgpu(); // before the instance: it warns too (no debug layer, …)
         let desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env;
         #[cfg(windows)]
         if std::env::var_os("WGPU_BACKEND").is_none() {
@@ -47,6 +48,7 @@ impl Gpu {
     }
 
     pub fn new_for_surface(instance: wgpu::Instance, surface: &wgpu::Surface<'_>) -> anyhow::Result<Gpu> {
+        crate::logger::forward_wgpu();
         Self::new(instance, Some(surface))
     }
 
