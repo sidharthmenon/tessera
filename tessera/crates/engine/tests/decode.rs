@@ -102,11 +102,11 @@ fn prores4444_has_alpha() {
 }
 
 /// A hardware-decoded frame is drawn from the decoder's buffer (`zero_copy`: macOS IOSurface,
-/// Windows D3D12 texture on DX12), unless the kill switch is set: a silent fallback to copying
-/// mustn't pass the format tests.
+/// Windows D3D12 texture where `zero_copy::d3d12va`), unless the kill switch is set: a silent
+/// fallback to copying mustn't pass the format tests.
 #[track_caller]
 fn assert_zero_copy(gpu: &Gpu, player: &Player, hardware: bool) {
-    let platform = cfg!(target_os = "macos") || gpu.adapter.get_info().backend == wgpu::Backend::Dx12;
+    let platform = cfg!(target_os = "macos") || tessera_engine::zero_copy::d3d12va(gpu);
     let want = hardware && platform && tessera_engine::zero_copy::enabled();
     assert_eq!(player.imported(), want, "zero-copy import (hardware decode: {hardware})");
 }
@@ -125,14 +125,15 @@ fn padded_frame_draws_only_its_rows() {
 }
 
 /// Windows on DX12: D3D12VA frames, NV12 and P010, are drawn from the decoder's own textures, not
-/// copied (the engine log says why if they are). Skipped on other backends (`WGPU_BACKEND`).
+/// copied (the engine log says why if they are). Skipped where decoders don't use D3D12VA: other
+/// backends (`WGPU_BACKEND`), zero-copy off, Intel's legacy driver line (`zero_copy::d3d12va`).
 #[test]
 #[cfg(windows)]
 fn d3d12_frames_are_imported() {
     let gpu = gpu();
-    let backend = gpu.adapter.get_info().backend;
-    if backend != wgpu::Backend::Dx12 || !tessera_engine::zero_copy::enabled() {
-        eprintln!("skipped: {backend:?} backend (zero-copy enabled: {})", tessera_engine::zero_copy::enabled());
+    if !tessera_engine::zero_copy::d3d12va(&gpu) {
+        let info = gpu.adapter.get_info();
+        eprintln!("skipped: no D3D12VA ({:?}, driver {}, zero-copy enabled: {})", info.backend, info.driver, tessera_engine::zero_copy::enabled());
         return;
     }
     for name in ["h264_64.mp4", "h264_64x40.mp4", "hevc10_64.mp4"] {

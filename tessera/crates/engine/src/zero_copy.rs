@@ -17,6 +17,41 @@ pub fn enabled() -> bool {
     cfg!(any(target_os = "macos", windows)) && std::env::var_os("TESSERA_ZERO_COPY").is_none_or(|v| v != "0")
 }
 
+/// Decoders on `gpu` use D3D12VA on its own device, so their frames are drawn without a copy:
+/// Windows on DX12 with zero-copy enabled, except on Intel's legacy driver line unless
+/// `TESSERA_ZERO_COPY=1` (then D3D11VA, and frames are copied).
+pub fn d3d12va(gpu: &Gpu) -> bool {
+    let info = gpu.adapter.get_info();
+    if !cfg!(windows) || info.backend != wgpu::Backend::Dx12 || !enabled() {
+        return false;
+    }
+    let forced = std::env::var_os("TESSERA_ZERO_COPY").is_some_and(|v| v == "1");
+    if legacy_intel_driver(info.vendor, &info.driver) && !forced {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            log!(
+                "zero-copy off: Intel driver {} (the line for 6th-10th gen GPUs) crashes a D3D12 video decoder once \
+                 others on the device are freed; decoding with D3D11VA and copying (TESSERA_ZERO_COPY=1 forces zero-copy)",
+                info.driver
+            )
+        });
+        return false;
+    }
+    true
+}
+
+/// Intel's Windows drivers for 6th-10th gen GPUs (build 101.2xxx, `31.0.101.2114`) and older: after a
+/// second D3D12 video decoder on a device is freed while another lives, the next decode on that one
+/// reads null inside the driver (the debug layer sees nothing wrong before). Xe and later drivers
+/// are 101.4000 and up. An unreadable version counts as legacy.
+fn legacy_intel_driver(vendor: u32, driver: &str) -> bool {
+    let build = || -> Option<(u32, u32)> {
+        let mut parts = driver.split('.').skip(2).map(|p| p.parse().ok());
+        Some((parts.next()??, parts.next()??))
+    };
+    vendor == 0x8086 && build().is_none_or(|build| build < (101, 3000))
+}
+
 /// A D3D12VA device context on `gpu`'s own ID3D12Device, so the decoder's frames are textures
 /// that device can draw; null if it isn't a DX12 device (or not Windows) or FFmpeg refuses it.
 pub(crate) fn d3d12_device(gpu: &Gpu) -> *mut ffmpeg_next::ffi::AVBufferRef {
@@ -275,5 +310,23 @@ mod win {
             )
         };
         Ok(texture)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::legacy_intel_driver;
+
+    const INTEL: u32 = 0x8086;
+
+    #[test]
+    fn intel_legacy_driver_line_is_recognised() {
+        assert!(legacy_intel_driver(INTEL, "31.0.101.2114"), "UHD 630, Aug 2022");
+        assert!(legacy_intel_driver(INTEL, "31.0.101.2135"), "the line's later builds");
+        assert!(legacy_intel_driver(INTEL, "30.0.100.9805"), "older still");
+        assert!(legacy_intel_driver(INTEL, "0.0.0.0"), "unknown: assume the worst");
+        assert!(!legacy_intel_driver(INTEL, "31.0.101.4502"), "Xe driver line");
+        assert!(!legacy_intel_driver(INTEL, "32.0.101.6979"), "a later Xe/Arc driver");
+        assert!(!legacy_intel_driver(0x10DE, "31.0.15.5222"), "not Intel");
     }
 }

@@ -492,8 +492,9 @@ fn is_hw(format: i32) -> bool {
 
 /// Gives the decoder the first of the platform's hardware devices its codec has a decoder for; it
 /// is used only for sizes and profiles the hardware supports, else the stream decodes in software.
-/// D3D12VA only on `gpu`'s own device (so its frames are textures the engine draws directly), else
-/// the next. Returns whether a device was attached (false: software for sure).
+/// D3D12VA only on `gpu`'s own device, where `zero_copy::d3d12va` allows (its frames are textures
+/// the engine draws directly), else the next. Returns whether a device was attached (false:
+/// software for sure).
 // ponytail: a hardware-capable codec the hardware refuses at runtime decodes single-threaded;
 // threads can't be added once the decoder is open.
 fn attach_hw(ctx: &mut ff::codec::Context, gpu: Option<&Gpu>) -> bool {
@@ -511,7 +512,7 @@ fn attach_hw(ctx: &mut ff::codec::Context, gpu: Option<&Gpu>) -> bool {
         for &(device, _) in HW.iter().filter(|(d, _)| has_hw(*d)) {
             let mut dev = ptr::null_mut();
             if device == ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D12VA {
-                dev = gpu.filter(|_| crate::zero_copy::enabled()).map_or(ptr::null_mut(), crate::zero_copy::d3d12_device);
+                dev = gpu.filter(|g| crate::zero_copy::d3d12va(g)).map_or(ptr::null_mut(), crate::zero_copy::d3d12_device);
             } else if ffi::av_hwdevice_ctx_create(&mut dev, device, ptr::null(), ptr::null_mut(), 0) < 0 {
                 dev = ptr::null_mut();
             }
