@@ -72,6 +72,21 @@ To see the controller and `[engine]` logs, start the app from a terminal:
 `Tessera.app/Contents/MacOS/tessera-app`. If macOS blocks a copied app, run
 `xattr -dr com.apple.quarantine Tessera.app`.
 
+The engine also keeps its own log, which survives a UI quit (an adopted engine has no terminal):
+`logs/engine.log` in its cache folder. Started by the app, that is
+`~/Library/Caches/dev.tessera.controller/logs/engine.log` (Windows:
+`%LOCALAPPDATA%\dev.tessera.controller\logs\engine.log`); run on its own, `tessera` instead of
+`dev.tessera.controller`. It is moved to `engine.log.1` past 8 MB. Every 10 s it logs a `perf:`
+line (render-loop time per frame without the vsync wait, dropped frames), and each output's state changes (`hidden (occluded)`,
+`stuck (no drawable)`, `showing`).
+
+While it runs, the engine keeps the displays and the machine awake and opts out of App Nap and
+Windows power throttling, so a show run only from Companion doesn't go black. Hardware-decoded
+video is drawn straight from the decoder's buffers (macOS: VideoToolbox; Windows: D3D12VA on the
+engine's DX12 device, the default backend there unless `WGPU_BACKEND` says otherwise);
+`TESSERA_ZERO_COPY=0` in the engine's environment switches back to copying each frame (Windows:
+D3D11VA), should a GPU or OS version draw it wrong.
+
 ## Shows, autosave, crash recovery
 
 - **Show files.** A show is a `.tshow` file (JSON) saved wherever you choose. Media inside the
@@ -148,6 +163,7 @@ Run this in the release app or in `npm run tauri dev`:
 12. Save, reopen: the show is identical.
 
 On Windows, run the same checklist before the first show there.
+[docs/windows-testing.md](docs/windows-testing.md) has the setup and the Windows-only checks.
 
 ## Not yet verified on real hardware
 
@@ -163,6 +179,10 @@ On Windows, run the same checklist before the first show there.
       outputs covered or none). The status bar must never show *engine restarting*: the engine
       has to keep sending its 1 s stats.
 - [ ] Windows: D3D11VA decode and surface sizing
+- [ ] Windows zero-copy, on NVIDIA, AMD and Intel: `cargo test -p tessera-engine` (runs
+      `d3d12_frames_are_imported`), then a 4K H.264 and a 4K HEVC Main10 clip playing with no
+      `zero-copy off` line in the engine log; once more with the D3D12 debug layer on (Graphics
+      Tools optional feature, `WGPU_VALIDATION=1`): no resource-state or fence errors
 - [ ] A USB capture device (Magewell/Elgato) as a live input: add, show, unplug and replug
 - [ ] Windows: DirectShow capture listing and opening
 - [ ] An NDI source (NDI Tools' Test Patterns) as a live input, with and without alpha
@@ -226,10 +246,10 @@ Keys work when no field or button has focus (Esc leaves a field).
 
 ## Known limits
 
-- **Zero-copy decode.** Decoded frames are copied to the GPU. The spike
-  (`spike/engine-spike/FINDINGS.md`) found that this holds 4×4K60. Zero-copy
-  (CVMetalTextureCache) becomes necessary at 3 or more concurrent 4K ProRes 4444 alpha layers,
-  where 4 layers ran at 39 fps, or at more than 8 4K layers.
+- **Zero-copy decode.** Only hardware-decoded frames are drawn in place (macOS VideoToolbox,
+  Windows D3D12VA on DX12). Software-decoded clips (FFV1, DNxHR; ProRes on Windows) and frames
+  the import can't take (e.g. a driver that decodes into texture arrays) are copied to the GPU,
+  on their decode thread.
 - **Frame pacing.** A single render loop drives all outputs, so they are all paced at the rate
   of the slowest display.
 - **Audio drift.** Audio isn't slaved to the video clock, so long clips can drift.
