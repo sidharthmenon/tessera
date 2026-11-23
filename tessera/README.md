@@ -167,10 +167,12 @@ On Windows, run the same checklist before the first show there.
 
 ## Not yet verified on real hardware
 
-- [ ] Unplugging and replugging a real monitor
-- [ ] A Display output on a second monitor, checked visually
-- [ ] Output windows actually presenting their halves, and Identify
-- [ ] 4×4K at 60 fps in the release build with both previews watched
+- [x] Unplugging and replugging a real monitor (Windows: the output closes once Windows drops
+      the monitor, and reopens on replug)
+- [x] A Display output on a second monitor, checked visually
+- [x] Output windows actually presenting their halves, and Identify
+- [ ] 4×4K at 60 fps in the release build with both previews watched. Windows, Intel UHD 630:
+      one 4K60 layer runs at about 20 fps on the copy path, 60 fps with zero-copy
 - [ ] A 4K ProRes 422 HQ clip at 60 fps. Make one with
       `ffmpeg -f lavfi -i testsrc2=s=3840x2160:r=60:d=10 -c:v prores_ks -profile:v 3 -pix_fmt yuv422p10le -color_range tv -colorspace bt709 -color_primaries bt709 -color_trc bt709 prores422hq.mov`
       (~650 MB, don't commit it). Import it, or put it in the spike clip folder and run
@@ -178,14 +180,18 @@ On Windows, run the same checklist before the first show there.
 - [ ] App Nap: leave the engine with no output window visible for 10 minutes (UI in front,
       outputs covered or none). The status bar must never show *engine restarting*: the engine
       has to keep sending its 1 s stats.
-- [ ] Windows: D3D11VA decode and surface sizing
+- [x] Windows: D3D11VA decode and surface sizing
 - [ ] Windows zero-copy, on NVIDIA, AMD and Intel: `cargo test -p tessera-engine` (runs
       `d3d12_frames_are_imported`), then a 4K H.264 and a 4K HEVC Main10 clip playing with no
       `zero-copy off` line in the engine log; once more with the D3D12 debug layer on (Graphics
-      Tools optional feature, `WGPU_VALIDATION=1`): no resource-state or fence errors
+      Tools optional feature; `d3d12_debug_layer_finds_no_errors`): no resource-state or fence
+      errors. Intel UHD 630 on the legacy driver line: imports work and the debug layer finds
+      nothing, but the driver crashes on decoder teardown, so it gets the copy path
+      ([docs/windows-testing.md](docs/windows-testing.md)). NVIDIA and AMD not yet
 - [ ] A USB capture device (Magewell/Elgato) as a live input: add, show, unplug and replug
-- [ ] Windows: DirectShow capture listing and opening
-- [ ] An NDI source (NDI Tools' Test Patterns) as a live input, with and without alpha
+- [x] Windows: DirectShow capture listing and opening
+- [x] An NDI source (NDI Tools' Test Patterns) as a live input, with and without alpha (checked
+      on Windows with another NDI sender)
 - [ ] Menu bar and Dock behaviour while an output is in simple fullscreen
 
 ## Displays and audio
@@ -249,8 +255,11 @@ Keys work when no field or button has focus (Esc leaves a field).
 - **Zero-copy decode.** Only hardware-decoded frames are drawn in place (macOS VideoToolbox,
   Windows D3D12VA on DX12). Software-decoded clips (FFV1, DNxHR; ProRes on Windows) and frames
   the import can't take (e.g. a driver that decodes into texture arrays) are copied to the GPU,
-  on their decode thread.
+  on their decode thread. Intel's legacy Windows driver line (6th–10th gen GPUs) always gets the
+  copy path: its D3D12 video driver crashes ([docs/windows-testing.md](docs/windows-testing.md)).
 - **Frame pacing.** A single render loop drives all outputs, so they are all paced at the rate
   of the slowest display.
 - **Audio drift.** Audio isn't slaved to the video clock, so long clips can drift.
-- **Windows.** CI builds the installer, FFmpeg DLLs included, but it hasn't run on a PC yet.
+- **Windows.** CI builds the installer, FFmpeg DLLs included. It has run on one Windows 10 PC
+  with an Intel UHD 630, not yet on NVIDIA or AMD GPUs or on Windows 11. On that GPU the copy
+  path keeps up with about 20 fps of 4K60 video.
