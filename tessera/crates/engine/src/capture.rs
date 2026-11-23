@@ -237,8 +237,7 @@ mod dshow {
             ensure!(r >= 0 && !list.is_null(), "DirectShow devices: {}", ff::Error::from(r));
             for i in 0..(*list).nb_devices.max(0) as usize {
                 let d = *(*list).devices.add(i);
-                let types = std::slice::from_raw_parts((*d).media_types, (*d).nb_media_types.max(0) as usize);
-                if (*d).device_name.is_null() || !types.contains(&ffi::AVMediaType::AVMEDIA_TYPE_VIDEO) {
+                if (*d).device_name.is_null() || !media_types(&*d).contains(&ffi::AVMediaType::AVMEDIA_TYPE_VIDEO) {
                     continue;
                 }
                 let text = |p: *const std::ffi::c_char| if p.is_null() { String::new() } else { CStr::from_ptr(p).to_string_lossy().into_owned() };
@@ -249,6 +248,16 @@ mod dshow {
             ffi::avdevice_free_list_devices(&mut list);
         }
         Ok(out)
+    }
+
+    /// What `d` offers. A device with none (some virtual cameras) has a null array, which
+    /// `slice::from_raw_parts` must not get even for 0 items.
+    fn media_types(d: &ffi::AVDeviceInfo) -> &[ffi::AVMediaType] {
+        if d.media_types.is_null() || d.nb_media_types <= 0 {
+            return &[];
+        }
+        // SAFETY: FFmpeg's array of `nb_media_types` entries, alive as long as the device list.
+        unsafe { std::slice::from_raw_parts(d.media_types, d.nb_media_types as usize) }
     }
 
     /// The options to try, in order: NV12 (uploads as is), then the device's default format
@@ -267,6 +276,18 @@ mod dshow {
 
     #[cfg(test)]
     mod tests {
+        use super::ffi;
+
+        #[test]
+        fn a_device_without_media_types_is_not_video() {
+            // SAFETY: AVDeviceInfo is pointers and integers, all valid as zero.
+            let mut d: ffi::AVDeviceInfo = unsafe { std::mem::zeroed() };
+            assert!(super::media_types(&d).is_empty(), "null array, 0 types");
+            let mut types = [ffi::AVMediaType::AVMEDIA_TYPE_AUDIO, ffi::AVMediaType::AVMEDIA_TYPE_VIDEO];
+            (d.media_types, d.nb_media_types) = (types.as_mut_ptr(), 2);
+            assert_eq!(super::media_types(&d), types);
+        }
+
         #[test]
         fn nv12_first_then_the_device_default() {
             let [first, then] = super::attempts();
