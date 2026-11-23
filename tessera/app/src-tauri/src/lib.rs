@@ -666,24 +666,28 @@ fn stay_responsive() {
         std::mem::forget(NSProcessInfo::processInfo().beginActivityWithOptions_reason(options, &reason));
     }
     #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::Threading::{
-            GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-            PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling,
-            SetProcessInformation,
-        };
-        // Both controlled (mask) and off (state 0): full speed and timer resolution in the background too.
-        let state = PROCESS_POWER_THROTTLING_STATE {
-            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
-            StateMask: 0,
-        };
-        // SAFETY: the pointer and size describe `state`, which outlives the call.
-        let ok = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, (&raw const state).cast(), size_of_val(&state) as u32) };
-        if ok == 0 {
-            log!("power: could not opt out of EcoQoS");
-        }
+    if !opt_out_of_ecoqos() {
+        log!("power: could not opt out of EcoQoS");
     }
+}
+
+/// EcoQoS off for this process: full speed (and timer resolution) in the background too. Windows 10
+/// refuses the timer-resolution flag (Windows 11 added that throttling) and with it the whole
+/// call, so it is asked for execution speed alone.
+#[cfg(windows)]
+fn opt_out_of_ecoqos() -> bool {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling,
+        SetProcessInformation,
+    };
+    let off = |mask| {
+        // Both controlled (mask) and off (state 0).
+        let state = PROCESS_POWER_THROTTLING_STATE { Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION, ControlMask: mask, StateMask: 0 };
+        // SAFETY: the pointer and size describe `state`, which outlives the call.
+        unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, (&raw const state).cast(), size_of_val(&state) as u32) != 0 }
+    };
+    off(PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION) || off(PROCESS_POWER_THROTTLING_EXECUTION_SPEED)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -772,6 +776,12 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn ecoqos_opt_out_is_accepted() {
+        assert!(opt_out_of_ecoqos(), "SetProcessInformation(ProcessPowerThrottling) refused");
+    }
 
     /// A show with a file autosaves into that file; an untitled one into the data dir; a file that
     /// can't be written keeps the work in its `.autosave` and says so.

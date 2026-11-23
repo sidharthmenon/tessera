@@ -19,26 +19,39 @@ pub fn keep_awake() {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Power::{ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState};
-        use windows_sys::Win32::System::Threading::{
-            GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-            PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetProcessInformation,
-        };
-        // SAFETY: plain Win32 calls on this process/thread with a correctly sized struct.
-        unsafe {
-            if SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED) == 0 {
-                log!("power: SetThreadExecutionState failed; displays may sleep");
-            }
-            // ControlMask set, StateMask clear: throttling of these is explicitly off.
-            let state = PROCESS_POWER_THROTTLING_STATE {
-                Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-                ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
-                StateMask: 0,
-            };
-            let size = size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32;
-            if SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, (&raw const state).cast(), size) == 0 {
-                log!("power: EcoQoS opt-out failed");
-            }
+        // SAFETY: a plain Win32 call on the calling thread.
+        if unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED) } == 0 {
+            log!("power: SetThreadExecutionState failed; displays may sleep");
         }
+        if !opt_out_of_ecoqos() {
+            log!("power: EcoQoS opt-out failed");
+        }
+    }
+}
+
+/// Turns EcoQoS off for this process: full speed (and timer resolution) in the background too.
+/// Windows 10 refuses the timer-resolution flag (Windows 11 added that throttling) and with it the
+/// whole call, so it is asked for execution speed alone.
+#[cfg(windows)]
+fn opt_out_of_ecoqos() -> bool {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetProcessInformation,
+    };
+    let off = |mask| {
+        // ControlMask set, StateMask clear: throttling of these is explicitly off.
+        let state = PROCESS_POWER_THROTTLING_STATE { Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION, ControlMask: mask, StateMask: 0 };
+        // SAFETY: the pointer and size describe `state`, which outlives the call.
+        unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, (&raw const state).cast(), size_of_val(&state) as u32) != 0 }
+    };
+    off(PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION) || off(PROCESS_POWER_THROTTLING_EXECUTION_SPEED)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    #[test]
+    fn ecoqos_opt_out_is_accepted() {
+        assert!(super::opt_out_of_ecoqos(), "SetProcessInformation(ProcessPowerThrottling) refused");
     }
 }
 
