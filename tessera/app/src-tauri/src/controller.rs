@@ -566,9 +566,15 @@ mod tests {
     use super::*;
     use tessera_show::{Layer, MediaKind, Pattern, Rect, Screen, Source, Transition, TransitionKind, Cue};
 
+    /// `unix`, an absolute Unix path, as an absolute path here: Windows needs a drive ("/x" alone is
+    /// relative to the current drive, which `apply` rejects and `import_media` resolves).
+    fn abs(unix: &str) -> String {
+        if cfg!(windows) { format!("C:{}", unix.replace('/', "\\")) } else { unix.into() }
+    }
+
     fn item(duration_ms: Option<u64>) -> MediaItem {
         let id = Uuid::new_v4();
-        MediaItem { id, name: "m".into(), path: format!("/media/{id}.mp4"), kind: MediaKind::Video, width: 10, height: 10,
+        MediaItem { id, name: "m".into(), path: abs(&format!("/media/{id}.mp4")), kind: MediaKind::Video, width: 10, height: 10,
             duration_ms, has_audio: false, has_alpha: false, thumb: None }
     }
     fn clip(media: &MediaItem, playback: Playback) -> Layer {
@@ -917,7 +923,7 @@ mod tests {
             has_alpha: false, thumb: None };
         c.probed(Uuid::new_v4(), info());
         assert!(!c.dirty, "a probe of media the show doesn't have");
-        c.import_media(&[PathBuf::from("/shows/a.mov")]).unwrap();
+        c.import_media(&[PathBuf::from(abs("/shows/a.mov"))]).unwrap();
         assert!(c.dirty);
         let id = c.show.media[0].id;
         c.dirty = false;
@@ -1040,15 +1046,15 @@ mod tests {
     #[test]
     fn import_then_probe_updates_media() {
         let mut c = Controller::new();
-        let paths = [PathBuf::from("/shows/a.PNG"), PathBuf::from("/shows/b.mov")];
+        let paths = [PathBuf::from(abs("/shows/a.PNG")), PathBuf::from(abs("/shows/b.mov"))];
         let msgs = c.import_media(&paths).unwrap();
         let (img, vid) = (c.show.media[0].clone(), c.show.media[1].clone());
         assert_eq!((img.kind, vid.kind.clone()), (MediaKind::Image, MediaKind::Video));
         assert_eq!(img.name, "a.PNG");
         assert_eq!(msgs, vec![
             ToEngine::SetConfig { config: c.engine_config() },
-            ToEngine::Probe { media_id: img.id, path: "/shows/a.PNG".into() },
-            ToEngine::Probe { media_id: vid.id, path: "/shows/b.mov".into() },
+            ToEngine::Probe { media_id: img.id, path: abs("/shows/a.PNG") },
+            ToEngine::Probe { media_id: vid.id, path: abs("/shows/b.mov") },
         ]);
         c.apply(ShowOp::SetMasterVolume { volume: 0.5 }).unwrap();
         let info = ProbeInfo { kind: MediaKind::Video, width: 64, height: 32, duration_ms: Some(1000), has_audio: true,
@@ -1069,8 +1075,8 @@ mod tests {
         c.apply(ShowOp::AddMedia { items: vec![camera] }).expect("a device id is not a relative path");
         let msgs = c.open(c.show.clone(), None);
         assert_eq!(msgs[3..], [
-            ToEngine::Probe { media_id: img.id, path: "/shows/a.PNG".into() },
-            ToEngine::Probe { media_id: vid.id, path: "/shows/b.mov".into() },
+            ToEngine::Probe { media_id: img.id, path: abs("/shows/a.PNG") },
+            ToEngine::Probe { media_id: vid.id, path: abs("/shows/b.mov") },
         ]);
     }
 
@@ -1080,10 +1086,11 @@ mod tests {
     fn import_skips_folders_and_duplicates() {
         let mut c = Controller::new();
         let dir = std::env::temp_dir();
-        c.import_media(&[PathBuf::from("/shows/a.mov"), dir.clone(), PathBuf::from("/shows/a.mov")]).unwrap();
-        assert_eq!(c.show.media.iter().map(|m| m.path.as_str()).collect::<Vec<_>>(), ["/shows/a.mov"]);
+        let a = PathBuf::from(abs("/shows/a.mov"));
+        c.import_media(&[a.clone(), dir.clone(), a.clone()]).unwrap();
+        assert_eq!(c.show.media.iter().map(|m| m.path.clone()).collect::<Vec<_>>(), [abs("/shows/a.mov")]);
         let steps = c.undo.len();
-        assert!(c.import_media(&[PathBuf::from("/shows/a.mov"), dir]).unwrap().is_empty());
+        assert!(c.import_media(&[a, dir]).unwrap().is_empty());
         assert_eq!((c.show.media.len(), c.undo.len()), (1, steps));
     }
 
@@ -1091,13 +1098,16 @@ mod tests {
     fn relative_media_paths_rejected() {
         let item = |path: &str| tessera_show::MediaItem { id: Uuid::new_v4(), name: "m".into(), path: path.into(),
             kind: MediaKind::Video, width: 1, height: 1, duration_ms: None, has_audio: false, has_alpha: false, thumb: None };
-        for titled in [None, Some(PathBuf::from("/shows/s.tshow"))] {
+        for titled in [None, Some(PathBuf::from(abs("/shows/s.tshow")))] {
             let mut c = Controller::new();
             c.path = titled;
             let before = c.show.clone();
             assert!(c.apply(ShowOp::AddMedia { items: vec![item("clips/m.mp4")] }).is_err());
+            // Windows: no drive, so relative to whichever drive is current.
+            #[cfg(windows)]
+            assert!(c.apply(ShowOp::AddMedia { items: vec![item(r"\shows\clips\m.mp4")] }).is_err());
             assert_eq!(c.show, before);
-            let good = item("/shows/clips/m.mp4");
+            let good = item(&abs("/shows/clips/m.mp4"));
             c.apply(ShowOp::AddMedia { items: vec![good.clone()] }).unwrap();
             assert!(c.apply(ShowOp::UpdateMedia { item: tessera_show::MediaItem { path: "m.mp4".into(), ..good.clone() } }).is_err());
             assert_eq!(c.engine_config().media, vec![good]);
@@ -1107,8 +1117,8 @@ mod tests {
     #[test]
     fn import_normalizes_paths() {
         let mut c = Controller::new();
-        c.import_media(&[PathBuf::from("/shows/a/../b.mov"), PathBuf::from("/shows/./c.png")]).unwrap();
-        let paths: Vec<_> = c.show.media.iter().map(|m| m.path.as_str()).collect();
-        assert_eq!(paths, ["/shows/b.mov", "/shows/c.png"]);
+        c.import_media(&[PathBuf::from(abs("/shows/a/../b.mov")), PathBuf::from(abs("/shows/./c.png"))]).unwrap();
+        let paths: Vec<_> = c.show.media.iter().map(|m| m.path.clone()).collect();
+        assert_eq!(paths, [abs("/shows/b.mov"), abs("/shows/c.png")]);
     }
 }

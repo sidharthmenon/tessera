@@ -272,7 +272,8 @@ mod tests {
         let stored: Vec<_> = raw.media.iter().map(|m| m.path.clone()).collect();
         assert_eq!(stored, ["b/x.mp4".to_string(), "z.png".into(), elsewhere.join("y.mp4").to_string_lossy().into()]);
         let opened: Vec<_> = open(&path).unwrap().media.into_iter().map(|m| m.path).collect();
-        assert_eq!(opened, [dir.join("b/x.mp4"), dir.join("z.png"), elsewhere.join("y.mp4")]
+        // Opened with the platform's separator, wherever the file was saved.
+        assert_eq!(opened, [dir.join("b").join("x.mp4"), dir.join("z.png"), elsewhere.join("y.mp4")]
             .map(|p| p.to_string_lossy().into_owned()));
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::remove_dir_all(elsewhere).unwrap();

@@ -26,7 +26,7 @@ async fn real_engine_answers_list_monitors() {
     let target = option_env!("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"));
-    let exe = target.join("debug/tessera-engine");
+    let exe = target.join("debug").join(format!("tessera-engine{}", std::env::consts::EXE_SUFFIX));
     assert!(exe.exists(), "{} missing: cargo build -p tessera-engine", exe.display());
     let cache = std::env::temp_dir().join(format!("tessera-app-engine-test-{}", std::process::id()));
     let token = new_token();
