@@ -12,6 +12,13 @@ check the Windows-only paths below, and fix what breaks.
   textures. Before a frame is used, the decode thread waits for the decoder's fence. Texture
   arrays, other formats and any import error fall back to copying the frame through staging
   buffers (`staging.rs`).
+- **Intel's legacy driver line** (6th–10th gen GPUs, driver build `101.2xxx` and older, such as
+  `31.0.101.2114` on UHD 630). Its D3D12 video driver crashes: once a second D3D12VA decoder on
+  the device has been freed while another lives, that one's next decode reads null inside the
+  driver. The D3D12 debug layer reports nothing before the crash, and D3D11VA is unaffected. So
+  on that line the engine decodes with D3D11VA and copies, and logs one
+  `zero-copy off: Intel driver …` line saying so (`zero_copy::d3d12va`). `TESSERA_ZERO_COPY=1`
+  forces zero-copy anyway, for checking a newer driver of that line.
 - **Backends.** DX12 is the default (`gpu.rs`) unless `WGPU_BACKEND` is set.
   `TESSERA_ZERO_COPY=0` switches to D3D11VA plus copying.
 - **Power** (`crates/engine/src/os.rs`, and `stay_responsive` in `app/src-tauri/src/lib.rs`).
@@ -54,19 +61,27 @@ cd app; npm install; npm run check; npm test; cd ..
 
 All of it should pass. The engine tests need a GPU. On DX12, the decode tests also check that
 hardware-decoded clips were imported without a copy (`assert_zero_copy`,
-`d3d12_frames_are_imported`).
+`d3d12_frames_are_imported`). On Intel's legacy driver line they expect the copy path instead,
+and `d3d12_frames_are_imported` is skipped. The decode tests that use the GPU run one at a time
+(`gpu()` in `tests/decode.rs`).
 
 If a decode test fails, run it again with `$env:TESSERA_ZERO_COPY = "0"`. If it passes that way,
 the import is at fault, not the decode.
 
-Then run once with the D3D12 debug layer. Add the *Graphics Tools* optional feature in Windows
-Settings, then:
+Then check with the D3D12 debug layer. Add the *Graphics Tools* optional feature in Windows
+Settings and restart. Debug builds then always run with the layer (wgpu turns validation on in
+debug builds; `$env:WGPU_VALIDATION = "1"` does it for a release build). Run the tests again:
 
 ```powershell
-$env:WGPU_VALIDATION = "1"; cargo test -p tessera-engine
+cargo test -p tessera-engine
 ```
 
-There must be no D3D12 errors about resource states or fences.
+`d3d12_debug_layer_finds_no_errors` draws zero-copy NV12 and P010 frames and fails on any error
+the layer recorded, resource states and fences included. It reads them from the device's info
+queue: Windows 10's layer sends its messages to the debug output, where wgpu would pass them to
+`engine.log`, only while a debugger is attached. Without the layer the test says it was skipped.
+On Intel's legacy driver line it draws copied frames; to check zero-copy there, run it with
+`$env:TESSERA_ZERO_COPY = "1"` (it may crash, as described above).
 
 ## Manual checks in the app
 
@@ -75,7 +90,8 @@ Start the app with `cd app; npm run tauri dev`. It finds its engine log at
 with the mean and max render-loop time per frame (vsync wait excluded) and the dropped frames.
 
 1. **Hardware clips.** Play a 4K H.264 clip and a 4K HEVC Main10 clip in PVW and PGM.
-   - The log must have no `zero-copy off` line.
+   - The log must have no `zero-copy off` line, except the single `zero-copy off: Intel driver …`
+     line on Intel's legacy driver line.
    - Expect 0 dropped frames. On macOS a release build spends about 0.3 ms per frame.
    - BtbN's LGPL build has no x264/x265, so use real footage, encode with a hardware encoder if
      present (`h264_nvenc`, `hevc_nvenc`, `h264_amf`, `h264_qsv`), or make the clips elsewhere.

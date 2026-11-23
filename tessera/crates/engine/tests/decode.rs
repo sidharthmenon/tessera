@@ -158,6 +158,70 @@ fn d3d12_frames_are_imported() {
     }
 }
 
+/// Windows on DX12: the D3D12 debug layer (on in debug builds once the Graphics Tools optional
+/// feature is installed) finds no error in drawing zero-copy NV12 and P010 frames: no resource
+/// state or fence errors. Read from the device's info queue: Windows 10's layer writes to the debug
+/// output, where wgpu listens, only while a debugger is attached. Skipped without the layer.
+#[test]
+#[cfg(windows)]
+fn d3d12_debug_layer_finds_no_errors() {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+    let gpu = gpu();
+    // SAFETY: only the raw device is read; wgpu keeps owning it.
+    let Some(queue) = (unsafe { gpu.device.as_hal::<wgpu::hal::api::Dx12>() }).and_then(|hal| hal.raw_device().cast::<ID3D12InfoQueue>().ok())
+    else {
+        eprintln!("skipped: no D3D12 debug layer (a debug build on DX12 with Graphics Tools installed has one)");
+        return;
+    };
+    // Store only errors: the device (one per process) is shared with the tests running alongside,
+    // whose warnings would otherwise fill the queue.
+    let mut severities = [D3D12_MESSAGE_SEVERITY_CORRUPTION, D3D12_MESSAGE_SEVERITY_ERROR];
+    let filter = D3D12_INFO_QUEUE_FILTER {
+        AllowList: D3D12_INFO_QUEUE_FILTER_DESC { NumSeverities: 2, pSeverityList: severities.as_mut_ptr(), ..Default::default() },
+        ..Default::default()
+    };
+    // SAFETY: `filter` and its list outlive the call, which copies them.
+    unsafe { queue.PushStorageFilter(&filter) }.unwrap();
+    // The device can outlive a test, its queue holding that test's messages: from here on, ours.
+    unsafe { queue.ClearStoredMessages() };
+    let screen = Screen { id: Uuid::new_v4(), name: "S".into(), width: 64, height: 64, layout_x: 0, layout_y: 0 };
+    let mut compositor = Compositor::new(&gpu);
+    // Decoding side by side, as a show's layers do; freed only once the queue is read.
+    let mut players: Vec<Player> =
+        ["h264_64.mp4", "h264_64x40.mp4", "hevc10_64.mp4"].map(|name| Player::open(&gpu, &fixture(name), Playback::Loop, None).unwrap()).into();
+    let t0 = Instant::now();
+    players.iter_mut().for_each(|p| p.play(t0));
+    for t in [0, 100, 200, 300] {
+        for player in &mut players {
+            let tex = frame(player, &gpu, t0 + ms(t)).unwrap();
+            let layer = Layer::new(Source::Media { media_id: Uuid::new_v4() }, Rect { x: 0., y: 0., w: 64., h: 64. });
+            let view = compositor.render_screen(&gpu, ScreenSlot::Pgm, &screen, &[(layer, Some(tex))]);
+            read_rgba(&gpu, view.texture()).unwrap();
+            compositor.end_frame();
+        }
+    }
+    gpu.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    // SAFETY: plain info-queue calls; each message is read into a buffer of the size the queue asks for.
+    let errors: Vec<String> = unsafe {
+        (0..queue.GetNumStoredMessages())
+            .filter_map(|i| {
+                let mut len = 0;
+                queue.GetMessage(i, None, &mut len).ok()?;
+                let mut buf = vec![0u64; len.div_ceil(8)];
+                let message = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                queue.GetMessage(i, Some(message), &mut len).ok()?;
+                Some(std::ffi::CStr::from_ptr((*message).pDescription.cast()).to_string_lossy().into_owned())
+            })
+            .collect()
+    };
+    unsafe {
+        queue.ClearStoredMessages();
+        queue.PopStorageFilter();
+    }
+    assert!(errors.is_empty(), "D3D12 debug layer: {errors:#?}");
+}
+
 #[test]
 fn software_fallback_keeps_alpha() {
     // FFV1 has no hardware decoder: yuva420p → sws_scale → straight-alpha RGBA8.
