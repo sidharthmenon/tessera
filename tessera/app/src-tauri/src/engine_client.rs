@@ -538,16 +538,15 @@ async fn session(
     }
     log!("engine: resync sent ({} messages)", resync.len());
     loop {
-        tokio::select! {
-            _ = gone(exited) => return End::Exited,
-            _ = sleep_until(deadline) => return End::Stale,
-            msg = rx.recv() => match msg {
+        match wake(&mut stream, rx, exited, deadline).await {
+            Wake::Exited => return End::Exited,
+            Wake::Stale => return End::Stale,
+            Wake::Queued(msg) => match msg {
                 Some(msg) if !engine.allowed(&msg) => {}
                 Some(msg) => if let Err(end) = send(&mut sink, &msg, deadline).await { return end },
                 None => return End::Closed("app shutting down".into()),
             },
-            frame = stream.next() => {
-                deadline = Instant::now() + STALE;
+            Wake::Frame(frame) => {
                 match frame {
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<FromEngine>(&text) {
                         Ok(event) => crate::engine_event(app, event),
@@ -557,8 +556,35 @@ async fn session(
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return End::Closed(e.to_string()),
                 }
+                // After handling: time this task spent stuck (a busy lock) isn't the engine's.
+                deadline = Instant::now() + STALE;
             }
         }
+    }
+}
+
+enum Wake<F, M> {
+    Frame(F),
+    Exited,
+    Queued(Option<M>),
+    Stale,
+}
+
+/// What the session handles next. Biased, frames first and the deadline last: after this task
+/// stalled past the deadline (frames buffered meanwhile), a frame that is already there wins,
+/// so a healthy engine is never killed for our own stall.
+async fn wake<S: futures_util::Stream + Unpin, M>(
+    stream: &mut S,
+    rx: &mut mpsc::UnboundedReceiver<M>,
+    exited: &mut watch::Receiver<bool>,
+    deadline: Instant,
+) -> Wake<Option<S::Item>, M> {
+    tokio::select! {
+        biased;
+        frame = stream.next() => Wake::Frame(frame),
+        _ = gone(exited) => Wake::Exited,
+        msg = rx.recv() => Wake::Queued(msg),
+        _ = sleep_until(deadline) => Wake::Stale,
     }
 }
 
@@ -662,6 +688,21 @@ mod tests {
         b.resynced(s(121));
         b.died(s(123));
         assert!(!b.trip(), "a stable minute in between resets the count");
+    }
+
+    /// A deadline long past (this task stalled) with a frame already buffered: the frame, not
+    /// Stale. Unbiased, this is a coin flip that kills a healthy engine.
+    #[tokio::test]
+    async fn buffered_frame_beats_a_passed_deadline() {
+        let (_tx, mut rx) = mpsc::unbounded_channel::<()>();
+        let (_exit, mut exited) = watch::channel(false);
+        let passed = Instant::now() - 2 * STALE;
+        for _ in 0..50 {
+            let mut buffered = futures_util::stream::iter([1]);
+            assert!(matches!(wake(&mut buffered, &mut rx, &mut exited, passed).await, Wake::Frame(Some(1))));
+        }
+        let mut silent = futures_util::stream::pending::<i32>();
+        assert!(matches!(wake(&mut silent, &mut rx, &mut exited, passed).await, Wake::Stale));
     }
 
     #[test]

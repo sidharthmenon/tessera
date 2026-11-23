@@ -42,12 +42,19 @@ use tokio::sync::{Notify, mpsc, watch};
 use uuid::Uuid;
 
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_secs(2);
+/// Probe results that change the engine config within this go out as one `SetConfig`.
+const PROBE_COALESCE: Duration = Duration::from_millis(250);
 
 type Res<T> = Result<T, String>;
 
 pub struct AppState {
     ctl: Mutex<Controller>,
     autosave: Notify,
+    /// Held through every show write (autosave, save, the flush before a show is replaced), so
+    /// writes never overlap; never taken while `ctl` is held.
+    saving: Mutex<()>,
+    /// A `SetConfig` for probe results is on its way (`config_soon`).
+    config_pending: AtomicBool,
     data_dir: PathBuf,
     /// Unsaved work from an earlier session, moved aside (`files::take_recovery`).
     recovery: Mutex<Option<PathBuf>>,
@@ -82,10 +89,18 @@ enum Change {
 }
 
 impl AppState {
-    /// A panic elsewhere must not lock the operator out of the show.
     fn ctl(&self) -> MutexGuard<'_, Controller> {
-        self.ctl.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.ctl)
     }
+
+    fn saving(&self) -> MutexGuard<'_, ()> {
+        lock(&self.saving)
+    }
+}
+
+/// A panic elsewhere must not lock the operator out of the show.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Run `f` on the controller and queue its engine messages under the lock (keeps them in
@@ -220,7 +235,7 @@ fn remote_status(state: State<AppState>) -> Res<RemoteStatus> {
 }
 
 /// Turn remote control on or off, on `port`.
-#[tauri::command]
+#[tauri::command(async)]
 fn remote_set(app: AppHandle, enabled: bool, port: u16) -> Res<RemoteStatus> {
     {
         let state = app.state::<AppState>();
@@ -232,7 +247,7 @@ fn remote_set(app: AppHandle, enabled: bool, port: u16) -> Res<RemoteStatus> {
 }
 
 /// A new access key: the old one stops working at once.
-#[tauri::command]
+#[tauri::command(async)]
 fn remote_new_key(app: AppHandle) -> Res<RemoteStatus> {
     {
         let state = app.state::<AppState>();
@@ -270,12 +285,16 @@ pub(crate) fn resync(app: &AppHandle, rx: &mut mpsc::UnboundedReceiver<ToEngine>
     ctl.resync_messages().into_iter().chain(queued).collect()
 }
 
-/// Every engine event goes to the UI; probe results also update the show, positions the
-/// controller's PGM state (I4).
+/// Every engine event goes to the UI; probe results also update the show (when they change it),
+/// positions the controller's PGM state (I4).
 pub(crate) fn engine_event(app: &AppHandle, event: FromEngine) {
     match &event {
         FromEngine::Probed { media_id, info: Some(info), .. } => {
-            let _ = dispatch(app, Change::Edit, |c| Ok(c.probed(*media_id, info.clone())));
+            let changed = app.state::<AppState>().ctl().probed(*media_id, info.clone());
+            if changed {
+                let _ = dispatch(app, Change::Edit, |_| Ok(vec![]));
+                config_soon(app);
+            }
         }
         FromEngine::Positions { positions } => app.state::<AppState>().ctl().positions(positions),
         _ => {}
@@ -283,34 +302,52 @@ pub(crate) fn engine_event(app: &AppHandle, event: FromEngine) {
     let _ = app.emit("engine-event", event);
 }
 
-/// Writes the show if it changed since the last write: a show with a file to that file itself (so
-/// the file always has the latest changes), an untitled one to the data dir's autosave. If the
-/// show's file can't be written, the work goes to `<show>.autosave` (offered back when the show is
-/// opened), else to the data dir's autosave (offered at startup), and the error says where.
-/// Called with the controller locked, so a save can't race it.
-// ponytail: the write (with fsync) holds the controller lock for a few ms; move it off the lock
-// with a generation counter if that ever delays a GO.
-fn write_autosave(ctl: &mut Controller, data_dir: &Path) -> Res<bool> {
-    if !ctl.dirty {
-        return Ok(false);
+/// The show's latest engine config within `PROBE_COALESCE`: opening a show probes every item, and
+/// the engine gets a few `SetConfig`s for that, not one per item.
+fn config_soon(app: &AppHandle) {
+    if app.state::<AppState>().config_pending.swap(true, Ordering::SeqCst) {
+        return; // the one on its way reads the config when it goes
     }
-    let autosave = files::autosave_path(ctl.path.as_deref(), data_dir);
-    match ctl.path.clone() {
-        Some(path) => match files::save_atomic(&path, &ctl.show) {
-            // An older fallback would come back next launch as "unsaved work" (M1).
-            Ok(()) => _ = std::fs::remove_file(&autosave),
-            Err(e) => {
-                let untitled = files::autosave_path(None, data_dir);
-                let kept = [autosave, untitled].into_iter().find(|p| files::save_atomic(p, &ctl.show).is_ok());
-                let kept = kept.ok_or_else(|| format!("{e}; and no autosave could be written either"))?;
-                ctl.dirty = false;
-                return Err(format!("{e}; the changes are kept in {}", kept.display()));
-            }
-        },
-        None => files::save_atomic(&autosave, &ctl.show)?,
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(PROBE_COALESCE).await;
+        let state = app.state::<AppState>();
+        state.config_pending.store(false, Ordering::SeqCst);
+        let ctl = state.ctl();
+        app.state::<Engine>().send(vec![ToEngine::SetConfig { config: ctl.engine_config() }]);
+    });
+}
+
+/// Writes `show` where its autosave goes: a show with a file to that file itself (so the file
+/// always has the latest changes), an untitled one to the data dir's autosave. If the show's file
+/// can't be written, the work goes to `<show>.autosave` (offered back when the show is opened),
+/// else to the data dir's autosave (offered at startup). Err: the message (it says where the work
+/// went), and whether a fallback holds it.
+fn write_show(show: &Show, path: Option<&Path>, data_dir: &Path) -> Result<(), (String, bool)> {
+    let autosave = files::autosave_path(path, data_dir);
+    let Some(path) = path else { return files::save_atomic(&autosave, show).map_err(|e| (e, false)) };
+    let Err(e) = files::save_atomic(path, show) else {
+        // An older fallback would come back next launch as "unsaved work" (M1).
+        let _ = std::fs::remove_file(&autosave);
+        return Ok(());
+    };
+    let untitled = files::autosave_path(None, data_dir);
+    match [autosave, untitled].into_iter().find(|p| files::save_atomic(p, show).is_ok()) {
+        Some(kept) => Err((format!("{e}; the changes are kept in {}", kept.display()), true)),
+        None => Err((format!("{e}; and no autosave could be written either"), false)),
     }
-    ctl.dirty = false;
-    Ok(true)
+}
+
+/// Writes the show if it changed since the last write (`write_show`). The show is copied under the
+/// controller lock and written without it, so a slow disk never holds up a GO; an edit made during
+/// the write stays unsaved. Callers hold `AppState::saving`.
+fn write_autosave(ctl: &Mutex<Controller>, data_dir: &Path) -> Res<bool> {
+    let Some((show, path, edit_gen)) = lock(ctl).unsaved() else { return Ok(false) };
+    let written = write_show(&show, path.as_deref(), data_dir);
+    if written.as_ref().map_or_else(|(_, kept)| *kept, |()| true) {
+        lock(ctl).written(edit_gen);
+    }
+    written.map(|()| true).map_err(|(e, _)| e)
 }
 
 async fn autosave(app: AppHandle) {
@@ -318,7 +355,13 @@ async fn autosave(app: AppHandle) {
     loop {
         state.autosave.notified().await;
         while tokio::time::timeout(AUTOSAVE_DEBOUNCE, state.autosave.notified()).await.is_ok() {}
-        if let Err(e) = write_autosave(&mut state.ctl(), &state.data_dir) {
+        let handle = app.clone();
+        let written = tauri::async_runtime::spawn_blocking(move || {
+            let state = handle.state::<AppState>();
+            let _saving = state.saving();
+            write_autosave(&state.ctl, &state.data_dir)
+        });
+        if let Err(e) = written.await.map_err(|e| e.to_string()).and_then(|w| w) {
             log!("autosave: {e}");
             let _ = app.emit("engine-event", FromEngine::Error { message: format!("autosave: {e}") });
         }
@@ -326,11 +369,13 @@ async fn autosave(app: AppHandle) {
 }
 
 /// Before another show replaces this one: its last edits (within the 2 s debounce) are written.
-fn flush_autosave(app: &AppHandle) {
-    let state = app.state::<AppState>();
-    if let Err(e) = write_autosave(&mut state.ctl(), &state.data_dir) {
+/// Hold the returned lock until the show is replaced, so no write of the old show lands on the new.
+fn flush_autosave(state: &AppState) -> MutexGuard<'_, ()> {
+    let saving = state.saving();
+    if let Err(e) = write_autosave(&state.ctl, &state.data_dir) {
         log!("autosave before switching shows: {e}");
     }
+    saving
 }
 
 #[tauri::command]
@@ -401,11 +446,11 @@ fn list_monitors(app: AppHandle) -> Res<()> {
     dispatch(&app, Change::Live, |_| Ok(vec![ToEngine::ListMonitors]))
 }
 
-/// Operator: stop the engine (outputs black) until `engine_start`.
+/// Operator: stop the engine (outputs black) until `engine_start`. Waiting for it to exit (up to
+/// 2 s) runs off the main thread.
 #[tauri::command]
-fn engine_stop(app: AppHandle) -> Res<()> {
-    app.state::<Engine>().stop(&app);
-    Ok(())
+async fn engine_stop(app: AppHandle) -> Res<()> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<Engine>().stop(&app)).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -416,9 +461,8 @@ fn engine_start(app: AppHandle) -> Res<()> {
 
 /// Operator: replace the engine; the new one gets everything back on connect.
 #[tauri::command]
-fn engine_restart(engine: State<Engine>) -> Res<()> {
-    engine.restart();
-    Ok(())
+async fn engine_restart(app: AppHandle) -> Res<()> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<Engine>().restart()).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -445,13 +489,13 @@ fn import_media(app: AppHandle, paths: Vec<PathBuf>) -> Res<()> {
 /// Opening an `.autosave` / `.autosave.prev` recovers it as an untitled show (save it
 /// somewhere to keep it). Opening a show whose autosave is newer moves that aside first and
 /// emits `recovery-available`.
-#[tauri::command]
+#[tauri::command(async)]
 fn open_show(app: AppHandle, path: PathBuf) -> Res<()> {
     let show = files::open(&path)?;
-    flush_autosave(&app);
+    let state = app.state::<AppState>();
+    let _saving = flush_autosave(&state);
     release_hold(&app);
     let titled = !files::is_autosave(&path);
-    let state = app.state::<AppState>();
     let recovery = if titled { files::take_recovery(Some(&path), &state.data_dir) } else { None };
     *state.recovery.lock().unwrap_or_else(|e| e.into_inner()) = recovery.clone();
     dispatch(&app, Change::Load, |c| Ok(c.open(show, titled.then_some(path))))?;
@@ -462,9 +506,10 @@ fn open_show(app: AppHandle, path: PathBuf) -> Res<()> {
 }
 
 /// A fresh untitled show. Like `open_show`: history and PVW clear, PGM keeps running.
-#[tauri::command]
+#[tauri::command(async)]
 fn new_show(app: AppHandle) -> Res<()> {
-    flush_autosave(&app);
+    let state = app.state::<AppState>();
+    let _saving = flush_autosave(&state);
     release_hold(&app);
     dispatch(&app, Change::Load, |c| Ok(c.open(Show::new(), None)))
 }
@@ -482,16 +527,22 @@ fn get_recovery(state: State<AppState>) -> Res<Option<PathBuf>> {
     Ok(state.recovery.lock().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
-/// `path: None` saves to the show's current file.
-#[tauri::command]
+/// `path: None` saves to the show's current file. Written without the controller lock held (as
+/// the autosave); an edit made meanwhile stays unsaved.
+#[tauri::command(async)]
 fn save_show(state: State<AppState>, path: Option<PathBuf>) -> Res<()> {
-    let mut ctl = state.ctl();
-    let path = path.or_else(|| ctl.path.clone()).ok_or("the show has no file yet: choose where to save it")?;
-    files::save_atomic(&path, &ctl.show)?;
+    let _saving = state.saving();
+    let (show, old, edit_gen) = {
+        let ctl = state.ctl();
+        (ctl.show.clone(), ctl.path.clone(), ctl.edit_gen)
+    };
+    let path = path.or_else(|| old.clone()).ok_or("the show has no file yet: choose where to save it")?;
+    files::save_atomic(&path, &show)?;
     // The work is in a file now: its autosave would only come back as "unsaved work" next launch (M1).
-    let _ = std::fs::remove_file(files::autosave_path(ctl.path.as_deref(), &state.data_dir));
+    let _ = std::fs::remove_file(files::autosave_path(old.as_deref(), &state.data_dir));
+    let mut ctl = state.ctl();
     ctl.path = Some(path);
-    ctl.dirty = false;
+    ctl.written(edit_gen);
     Ok(())
 }
 
@@ -571,9 +622,11 @@ fn quit(app: &AppHandle, choice: QuitChoice) {
 /// The event loop is ending: save unsaved edits, then stop or leave the engine.
 fn exiting(app: &AppHandle) {
     let state = app.state::<AppState>();
-    if let Err(e) = write_autosave(&mut state.ctl(), &state.data_dir) {
+    let saving = state.saving();
+    if let Err(e) = write_autosave(&state.ctl, &state.data_dir) {
         log!("autosave on quit: {e}");
     }
+    drop(saving);
     let chosen = *state.quit.lock().unwrap_or_else(|e| e.into_inner());
     let engine = app.state::<Engine>();
     match exit_choice(chosen, on_air(app)) {
@@ -601,6 +654,38 @@ fn menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     Ok(menu)
 }
 
+/// The OS must not throttle the controller on a show machine nobody touches: App Nap (macOS) or
+/// EcoQoS (Windows) would delay Companion's GO and the engine watchdog's timers. For the process's
+/// lifetime.
+fn stay_responsive() {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+        let options = NSActivityOptions::UserInitiated | NSActivityOptions::LatencyCritical;
+        let reason = NSString::from_str("Controlling a live show");
+        std::mem::forget(NSProcessInfo::processInfo().beginActivityWithOptions_reason(options, &reason));
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling,
+            SetProcessInformation,
+        };
+        // Both controlled (mask) and off (state 0): full speed and timer resolution in the background too.
+        let state = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+            StateMask: 0,
+        };
+        // SAFETY: the pointer and size describe `state`, which outlives the call.
+        let ok = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, (&raw const state).cast(), size_of_val(&state) as u32) };
+        if ok == 0 {
+            log!("power: could not opt out of EcoQoS");
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -622,6 +707,7 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            stay_responsive();
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let (engine, rx) = Engine::new(data_dir.join("engine.json"));
@@ -640,7 +726,18 @@ pub fn run() {
                 clients: Arc::new(AtomicUsize::new(0)),
             });
             let changes = watch::Sender::new(0);
-            app.manage(AppState { ctl, autosave: Notify::new(), data_dir, recovery, quit: Mutex::new(None), asking: AtomicBool::new(false), changes, remote });
+            app.manage(AppState {
+                ctl,
+                autosave: Notify::new(),
+                saving: Mutex::new(()),
+                config_pending: AtomicBool::new(false),
+                data_dir,
+                recovery,
+                quit: Mutex::new(None),
+                asking: AtomicBool::new(false),
+                changes,
+                remote,
+            });
             app.manage(engine);
             let enabled = app.state::<AppState>().remote.lock().unwrap_or_else(|e| e.into_inner()).settings.enabled;
             if enabled {
@@ -682,26 +779,53 @@ mod tests {
     fn autosave_writes_the_show_file() {
         let dir = std::env::temp_dir().join(format!("tessera-autosave-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut ctl = Controller::new();
-        ctl.apply(tessera_show::ShowOp::SetMasterVolume { volume: 0.5 }).unwrap();
-        assert!(write_autosave(&mut ctl, &dir).unwrap(), "untitled");
+        let ctl = Mutex::new(Controller::new());
+        let edit = |volume| lock(&ctl).apply(ShowOp::SetMasterVolume { volume }).unwrap();
+        edit(0.5);
+        assert!(write_autosave(&ctl, &dir).unwrap(), "untitled");
         assert!(dir.join("untitled.tshow.autosave").exists());
         let show = dir.join("show.tshow");
-        ctl.path = Some(show.clone());
+        lock(&ctl).path = Some(show.clone());
         std::fs::write(dir.join("show.tshow.autosave"), b"older fallback").unwrap();
-        ctl.apply(tessera_show::ShowOp::SetMasterVolume { volume: 0.25 }).unwrap();
-        assert!(write_autosave(&mut ctl, &dir).unwrap());
+        edit(0.25);
+        assert!(write_autosave(&ctl, &dir).unwrap());
         assert_eq!(files::open(&show).unwrap().master_volume, 0.25, "the show file has the latest change");
         assert!(!dir.join("show.tshow.autosave").exists(), "no stale fallback left");
-        assert!(!write_autosave(&mut ctl, &dir).unwrap(), "nothing new: no write");
+        assert!(!write_autosave(&ctl, &dir).unwrap(), "nothing new: no write");
         // The file can't be written (its folder is gone, so its .autosave can't be either): the
         // work goes to the data dir, which startup offers back.
         let gone = dir.join("missing").join("show.tshow");
-        ctl.path = Some(gone.clone());
-        ctl.apply(tessera_show::ShowOp::SetMasterVolume { volume: 0.75 }).unwrap();
-        let err = write_autosave(&mut ctl, &dir).unwrap_err();
+        lock(&ctl).path = Some(gone.clone());
+        edit(0.75);
+        let err = write_autosave(&ctl, &dir).unwrap_err();
         assert!(err.contains("untitled.tshow.autosave"), "{err}");
         assert_eq!(files::open(&dir.join("untitled.tshow.autosave")).unwrap().master_volume, 0.75);
+        assert!(!lock(&ctl).dirty, "the work is kept in the fallback");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The write runs without the controller lock: an edit made meanwhile isn't counted as written,
+    /// and the next autosave writes it.
+    #[test]
+    fn edit_during_the_write_stays_unsaved() {
+        let dir = std::env::temp_dir().join(format!("tessera-autosave-race-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctl = Mutex::new(Controller::new());
+        lock(&ctl).apply(ShowOp::SetMasterVolume { volume: 0.5 }).unwrap();
+        let (show, path, edit_gen) = lock(&ctl).unsaved().unwrap();
+        lock(&ctl).apply(ShowOp::SetMasterVolume { volume: 0.25 }).unwrap(); // while the copy is written
+        write_show(&show, path.as_deref(), &dir).unwrap();
+        lock(&ctl).written(edit_gen);
+        assert!(lock(&ctl).dirty, "the later edit is still unsaved");
+        assert_eq!(write_autosave(&ctl, &dir), Ok(true));
+        assert_eq!(files::open(&files::autosave_path(None, &dir)).unwrap().master_volume, 0.25);
+        assert!(!lock(&ctl).dirty);
+        // A write of the old show finishing after another show was opened doesn't count for it.
+        let (_, _, old) = { lock(&ctl).apply(ShowOp::SetMasterVolume { volume: 0.1 }).unwrap(); lock(&ctl).unsaved().unwrap() };
+        lock(&ctl).open(Show::new(), None);
+        lock(&ctl).apply(ShowOp::SetMasterVolume { volume: 0.9 }).unwrap();
+        lock(&ctl).written(old);
+        assert!(lock(&ctl).dirty);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -729,14 +853,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tessera-autosave-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let auto = files::autosave_path(None, &dir);
-        let mut c = Controller::new();
-        assert_eq!(write_autosave(&mut c, &dir), Ok(false), "nothing to save");
+        let c = Mutex::new(Controller::new());
+        assert_eq!(write_autosave(&c, &dir), Ok(false), "nothing to save");
         assert!(!auto.exists());
-        c.apply(ShowOp::SetMasterVolume { volume: 0.4 }).unwrap();
-        assert_eq!(write_autosave(&mut c, &dir), Ok(true), "an edit younger than the debounce");
+        lock(&c).apply(ShowOp::SetMasterVolume { volume: 0.4 }).unwrap();
+        assert_eq!(write_autosave(&c, &dir), Ok(true), "an edit younger than the debounce");
         assert_eq!(files::open(&auto).unwrap().master_volume, 0.4);
         std::fs::remove_file(&auto).unwrap();
-        assert_eq!(write_autosave(&mut c, &dir), Ok(false), "already written");
+        assert_eq!(write_autosave(&c, &dir), Ok(false), "already written");
         assert!(!auto.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }

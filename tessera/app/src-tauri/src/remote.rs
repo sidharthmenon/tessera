@@ -156,7 +156,6 @@ impl Refused {
 /// Runs `command` on the controller, as the UI would; the engine messages to send. Checks first:
 /// the cue exists (1-based numbers), GO has something in Preview, transport has an engine.
 pub fn apply(c: &mut Controller, command: &Command, engine_connected: bool) -> Result<Vec<tessera_show::ToEngine>, Refused> {
-    use tessera_show::ShowOp;
     let cue = |c: &Controller, group: usize, cue: u32| -> Result<crate::controller::CueRef, Refused> {
         let g = c.show.groups.get(group - 1).ok_or_else(|| Refused::BadRequest(format!("there is no group {group}")))?;
         if !g.cues.iter().any(|x| x.slot == cue - 1) {
@@ -164,7 +163,7 @@ pub fn apply(c: &mut Controller, command: &Command, engine_connected: bool) -> R
         }
         Ok(crate::controller::CueRef { group_id: g.id, slot: cue - 1 })
     };
-    let volume = |c: &mut Controller, v: f32| c.apply(ShowOp::SetMasterVolume { volume: v.clamp(0., 1.) }).map_err(Refused::BadRequest);
+    let volume = |c: &mut Controller, v: f32| c.volume_step(v.clamp(0., 1.)).map_err(Refused::BadRequest);
     match *command {
         Command::Go if c.pvw.scene.is_empty() => Err(Refused::Conflict("Preview is empty: load a cue first".into())),
         Command::Go => Ok(c.take()),
@@ -347,22 +346,31 @@ struct Event<'a> {
     state: &'a Snapshot,
 }
 
+/// A client that hears nothing for longer may take the connection as dead. Checked each second,
+/// so the state goes out at least every 5 s.
+const HEARTBEAT: Duration = Duration::from_secs(4);
+/// A client that stops reading (a dead link fills the socket buffer) is dropped after this.
+const SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// One WebSocket client: the state on connect, then whenever it changes (checked on every change
-/// and once a second, for the clip time). Messages from the client are ignored.
+/// and once a second, for the clip time), and unchanged as a heartbeat. Messages from the client
+/// are ignored.
 async fn client(s: Shared, mut socket: WebSocket) {
     s.clients.fetch_add(1, Ordering::SeqCst);
     (s.on_clients)();
     let mut changes = s.control.changes();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut last = String::new();
+    let mut sent = tokio::time::Instant::now();
     loop {
         let state = s.control.state();
         let json = serde_json::to_string(&Event { kind: "state", state: &state }).unwrap_or_default();
-        if json != last {
-            if socket.send(Message::Text(json.clone().into())).await.is_err() {
+        if json != last || sent.elapsed() >= HEARTBEAT {
+            let send = socket.send(Message::Text(json.clone().into()));
+            if !matches!(tokio::time::timeout(SEND_TIMEOUT, send).await, Ok(Ok(()))) {
                 break;
             }
-            last = json;
+            (last, sent) = (json, tokio::time::Instant::now());
         }
         tokio::select! {
             changed = changes.changed() => if changed.is_err() { break },

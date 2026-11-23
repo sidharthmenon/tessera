@@ -30,6 +30,14 @@ tauri-plugin-single-instance = "2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Process-lifetime "no App Nap" activity (stay_responsive in lib.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSProcessInfo", "NSString"] }
+
+# EcoQoS opt-out (stay_responsive in lib.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
 tower = { version = "0.5", features = ["util"] }

@@ -53,19 +53,28 @@ impl Default for Preview {
     }
 }
 
+/// An undo step: PVW before it, and the show too when the step changed the show (a PVW-only step
+/// doesn't copy the show).
+type Step = (Option<Show>, Preview);
+
 #[derive(Default)]
 pub struct Controller {
     pub show: Show,
     pub path: Option<PathBuf>,
-    /// Each step is the show and PVW before it (PGM is never undone: R32, R36).
-    undo: Vec<(Show, Preview)>,
-    redo: Vec<(Show, Preview)>,
+    /// PGM is never undone (R32, R36).
+    undo: Vec<Step>,
+    redo: Vec<Step>,
+    /// The last undo step is a run of remote volume steps (`volume_step`).
+    volume_run: bool,
     pub pvw: Preview,
     pub pgm: Scene,
     /// The cue PVW came from at the last Take (none for a Take of an unstored PVW).
     pub last_taken: Option<CueRef>,
     /// The show changed since it was last written (autosave or save).
     pub dirty: bool,
+    /// Bumped with every show change (never reset, not even by `open`): a write of a copy clears
+    /// `dirty` only if nothing changed since the copy (`written`).
+    pub edit_gen: u64,
     /// The last Pause or Stop of each PGM media layer still on air (I4): a restarted engine plays
     /// every clip, so the resync repeats them.
     held: HashMap<Uuid, TransportAction>,
@@ -118,12 +127,31 @@ impl Controller {
         }
     }
 
-    fn push_undo(&mut self, step: (Show, Preview)) {
+    fn push_undo(&mut self, step: Step) {
         self.undo.push(step);
         if self.undo.len() > UNDO_CAP {
             self.undo.remove(0);
         }
         self.redo.clear();
+        self.volume_run = false;
+    }
+
+    /// The show changed: unsaved work.
+    fn edited(&mut self) {
+        self.dirty = true;
+        self.edit_gen += 1;
+    }
+
+    /// Unsaved work to write without the lock held: the show, its file, its generation.
+    pub fn unsaved(&self) -> Option<(Show, Option<PathBuf>, u64)> {
+        self.dirty.then(|| (self.show.clone(), self.path.clone(), self.edit_gen))
+    }
+
+    /// The show as of `edit_gen` was written: no unsaved work, unless it changed since.
+    pub fn written(&mut self, edit_gen: u64) {
+        if self.edit_gen == edit_gen {
+            self.dirty = false;
+        }
     }
 
     /// Something is on the outputs: a cue was taken, or PGM shows a layer.
@@ -150,16 +178,17 @@ impl Controller {
         } {
             return Err("media paths must be absolute".into());
         }
-        let config = self.engine_config();
-        let volume = self.show.master_volume;
         let moved = match op {
             ShowOp::MoveCue { group_id, from, to } => Some((group_id, from, to)),
             _ => None,
         };
-        let before = (self.show.clone(), self.pvw.clone());
+        let before = self.show.clone();
         self.show.apply(op.clone())?;
-        self.dirty = true;
-        self.push_undo(before);
+        let (s, b) = (&self.show, &before);
+        let config = s.outputs != b.outputs || s.screens != b.screens || s.mappings != b.mappings || s.media != b.media;
+        let volume = s.master_volume != b.master_volume;
+        self.edited();
+        self.push_undo((Some(before), self.pvw.clone()));
         if let Some((group_id, from, to)) = moved {
             // Bus refs follow their cue (move_cue swaps from and to).
             for r in [&mut self.pvw.cue, &mut self.last_taken].into_iter().flatten() {
@@ -169,7 +198,7 @@ impl Controller {
             }
         }
         let mut out = vec![];
-        if self.engine_config() != config {
+        if config {
             out.push(ToEngine::SetConfig { config: self.engine_config() });
         }
         self.forget_gone_cues();
@@ -180,9 +209,20 @@ impl Controller {
         if prune(&mut self.pvw.scene, &op) {
             out.push(ToEngine::SetPreview { scene: self.pvw.scene.clone() });
         }
-        if self.show.master_volume != volume {
+        if volume {
             out.push(ToEngine::SetMasterVolume { volume: self.show.master_volume });
         }
+        Ok(out)
+    }
+
+    /// A remote master-volume step (Companion's volume up/down): a run of them is one undo step.
+    pub fn volume_step(&mut self, volume: f32) -> Result<Vec<ToEngine>, String> {
+        let run = self.volume_run;
+        let out = self.apply(ShowOp::SetMasterVolume { volume })?;
+        if run {
+            self.undo.pop(); // the run's first step holds the show from before the run
+        }
+        self.volume_run = true;
         Ok(out)
     }
 
@@ -197,26 +237,42 @@ impl Controller {
 
     pub fn undo(&mut self) -> Vec<ToEngine> {
         let Some(prev) = self.undo.pop() else { return vec![] };
-        let cur = (std::mem::replace(&mut self.show, prev.0), std::mem::replace(&mut self.pvw, prev.1));
-        self.dirty |= cur.0 != self.show;
+        let cur = self.restore(prev);
+        let show = cur.0.is_some();
         self.redo.push(cur);
-        self.history_moved()
+        self.history_moved(show)
     }
 
     pub fn redo(&mut self) -> Vec<ToEngine> {
         let Some(next) = self.redo.pop() else { return vec![] };
-        let cur = (std::mem::replace(&mut self.show, next.0), std::mem::replace(&mut self.pvw, next.1));
-        self.dirty |= cur.0 != self.show;
+        let cur = self.restore(next);
+        let show = cur.0.is_some();
         self.undo.push(cur);
-        self.history_moved()
+        self.history_moved(show)
     }
 
-    /// After undo/redo: config, PVW and volume; PGM never changes (R32, R36).
-    fn history_moved(&mut self) -> Vec<ToEngine> {
+    /// Puts `step` in place; returns its inverse, of the same shape (the show only if it has one).
+    fn restore(&mut self, (show, pvw): Step) -> Step {
+        self.volume_run = false;
+        let pvw = std::mem::replace(&mut self.pvw, pvw);
+        let show = show.map(|s| std::mem::replace(&mut self.show, s));
+        if show.as_ref().is_some_and(|s| *s != self.show) {
+            self.edited();
+        }
+        (show, pvw)
+    }
+
+    /// After undo/redo: PVW, and config and volume when the show moved; PGM never changes (R32,
+    /// R36).
+    fn history_moved(&mut self, show: bool) -> Vec<ToEngine> {
         self.forget_gone_cues();
+        let preview = ToEngine::SetPreview { scene: self.pvw.scene.clone() };
+        if !show {
+            return vec![preview];
+        }
         vec![
             ToEngine::SetConfig { config: self.engine_config() },
-            ToEngine::SetPreview { scene: self.pvw.scene.clone() },
+            preview,
             ToEngine::SetMasterVolume { volume: self.show.master_volume },
         ]
     }
@@ -228,7 +284,7 @@ impl Controller {
         }
         let send = next.scene != self.pvw.scene;
         let before = std::mem::replace(&mut self.pvw, next);
-        self.push_undo((self.show.clone(), before));
+        self.push_undo((None, before));
         if send { vec![ToEngine::SetPreview { scene: self.pvw.scene.clone() }] } else { vec![] }
     }
 
@@ -460,12 +516,12 @@ impl Controller {
     }
 
     /// A probe result: an `UpdateMedia` that is not an undo step. Patched into the undo/redo
-    /// snapshots too, so undoing an unrelated edit doesn't forget it.
-    pub fn probed(&mut self, media_id: Uuid, info: ProbeInfo) -> Vec<ToEngine> {
-        let config = self.engine_config();
+    /// snapshots too, so undoing an unrelated edit doesn't forget it. Whether the show changed
+    /// (then its engine config did too: the item is in it).
+    pub fn probed(&mut self, media_id: Uuid, info: ProbeInfo) -> bool {
         // Only a change to the show itself is unsaved work (M1): not one to an undo snapshot.
         let before = self.show.media.iter().find(|m| m.id == media_id).cloned();
-        let steps = self.undo.iter_mut().chain(&mut self.redo).map(|(show, _)| show);
+        let steps = self.undo.iter_mut().chain(&mut self.redo).filter_map(|(show, _)| show.as_mut());
         for show in std::iter::once(&mut self.show).chain(steps) {
             if let Some(m) = show.media.iter_mut().find(|m| m.id == media_id) {
                 m.kind = info.kind.clone();
@@ -477,8 +533,11 @@ impl Controller {
                 m.thumb = info.thumb.clone();
             }
         }
-        self.dirty |= before.as_ref() != self.show.media.iter().find(|m| m.id == media_id);
-        if self.engine_config() == config { vec![] } else { vec![ToEngine::SetConfig { config: self.engine_config() }] }
+        let changed = before.as_ref() != self.show.media.iter().find(|m| m.id == media_id);
+        if changed {
+            self.edited();
+        }
+        changed
     }
 
     /// Replace the show (opened from disk). History and PVW clear; PGM keeps running, and so does
@@ -486,7 +545,9 @@ impl Controller {
     /// thumbnails from an older engine (or a cleared thumbnail cache) catch up.
     pub fn open(&mut self, show: Show, path: Option<PathBuf>) -> Vec<ToEngine> {
         let (pgm, held, positions) = (std::mem::take(&mut self.pgm), std::mem::take(&mut self.held), std::mem::take(&mut self.positions));
-        *self = Controller { show, path, pgm, held, positions, ..Controller::default() };
+        // A write of the old show still under way must not count for this one (`written`).
+        let edit_gen = self.edit_gen + 1;
+        *self = Controller { show, path, pgm, held, positions, edit_gen, ..Controller::default() };
         let files = self.show.media.iter().filter(|m| !m.kind.is_live());
         let probes = files.map(|m| ToEngine::Probe { media_id: m.id, path: m.path.clone() });
         [
@@ -879,6 +940,55 @@ mod tests {
         assert!(!c.dirty);
     }
 
+    /// Loading cues (PVW-only steps) copies no show; undo/redo walk PVW and show steps in order,
+    /// and only show steps reconfigure the engine.
+    #[test]
+    fn preview_steps_undo_without_the_show() {
+        let mut c = Controller::new();
+        let s = screen().id;
+        let (one, two) = (Scene::from([(s, vec![layer()])]), Scene::from([(s, vec![layer(), layer()])]));
+        set_cue(&mut c, 1, one.clone());
+        set_cue(&mut c, 2, two.clone());
+        c.load_cue(at(&c, 1)).unwrap();
+        assert!(c.undo.last().unwrap().0.is_none(), "a load copies no show");
+        c.apply(ShowOp::SetMasterVolume { volume: 0.5 }).unwrap();
+        c.load_cue(at(&c, 2)).unwrap();
+        let end = (c.show.clone(), c.pvw.clone());
+        c.dirty = false;
+        assert_eq!(c.undo(), vec![ToEngine::SetPreview { scene: one.clone() }], "PVW only: no SetConfig");
+        assert!(c.redo.last().unwrap().0.is_none() && !c.dirty, "its inverse copies no show either");
+        let msgs = c.undo();
+        assert!(has(&msgs, |m| matches!(m, ToEngine::SetConfig { .. })) && c.show.master_volume == 1.0 && c.dirty);
+        assert_eq!(c.undo(), vec![ToEngine::SetPreview { scene: Scene::new() }]);
+        assert_eq!((c.pvw.clone(), c.show.groups[0].cues.len()), (Preview::default(), 2), "the cues stay");
+        assert_eq!(c.redo(), vec![ToEngine::SetPreview { scene: one }]);
+        assert!(has(&c.redo(), |m| *m == ToEngine::SetMasterVolume { volume: 0.5 }));
+        assert_eq!(c.redo(), vec![ToEngine::SetPreview { scene: two }]);
+        assert_eq!((c.show.clone(), c.pvw.clone()), end);
+    }
+
+    /// Companion's volume up/down: a run of steps is one undo step (and still unsaved work).
+    #[test]
+    fn volume_steps_merge_into_one_undo_step() {
+        let mut c = Controller::new();
+        for v in [0.9, 0.8, 0.7] {
+            assert_eq!(c.volume_step(v).unwrap(), vec![ToEngine::SetMasterVolume { volume: v }]);
+        }
+        assert_eq!((c.undo.len(), c.dirty), (1, true));
+        c.undo();
+        assert_eq!(c.show.master_volume, 1.0, "one undo: back to before the run");
+        c.redo();
+        assert_eq!(c.show.master_volume, 0.7);
+        // Anything else that is a step ends the run: undo/redo, an edit.
+        c.volume_step(0.6).unwrap();
+        c.apply(ShowOp::SetMasterVolume { volume: 0.5 }).unwrap();
+        c.volume_step(0.4).unwrap();
+        c.volume_step(0.3).unwrap();
+        assert_eq!(c.undo.len(), 4);
+        c.undo();
+        assert_eq!(c.show.master_volume, 0.5);
+    }
+
     #[test]
     fn load_prev_walks_back() {
         let mut c = Controller::new();
@@ -943,8 +1053,8 @@ mod tests {
         c.apply(ShowOp::SetMasterVolume { volume: 0.5 }).unwrap();
         let info = ProbeInfo { kind: MediaKind::Video, width: 64, height: 32, duration_ms: Some(1000), has_audio: true,
             has_alpha: false, thumb: Some(format!("{}.jpg", vid.id)) };
-        let msgs = c.probed(vid.id, info);
-        assert_eq!(msgs, vec![ToEngine::SetConfig { config: c.engine_config() }]);
+        assert!(c.probed(vid.id, info.clone()), "the show changed");
+        assert!(!c.probed(vid.id, info), "the same result again changes nothing");
         let m = &c.show.media[1];
         assert_eq!((m.width, m.height, m.duration_ms, m.has_audio), (64, 32, Some(1000), true));
         assert_eq!(m.thumb, Some(format!("{}.jpg", vid.id)));
