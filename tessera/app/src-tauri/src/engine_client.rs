@@ -128,9 +128,66 @@ fn alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn alive(pid: u32) -> bool {
+    win::alive(pid)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn alive(_pid: u32) -> bool {
     true
+}
+
+/// An adopted engine, by pid: only a process whose executable is a Tessera engine counts, since
+/// the pid in `engine.json` may since have been given to another program.
+#[cfg(windows)]
+mod win {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW,
+        TerminateProcess, WaitForSingleObject,
+    };
+
+    struct Process(HANDLE);
+
+    impl Drop for Process {
+        fn drop(&mut self) {
+            // SAFETY: a handle OpenProcess gave, closed once.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// `pid` opened with `access`, if it is a Tessera engine.
+    fn engine(pid: u32, access: u32) -> Option<Process> {
+        // SAFETY: plain Win32 calls; the buffer and its length describe `path`.
+        unsafe {
+            let handle = OpenProcess(access | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return None;
+            }
+            let process = Process(handle);
+            let mut path = [0u16; 1024];
+            let mut len = path.len() as u32;
+            if QueryFullProcessImageNameW(process.0, PROCESS_NAME_WIN32, path.as_mut_ptr(), &mut len) == 0 {
+                return None;
+            }
+            let path = String::from_utf16_lossy(&path[..len as usize]).to_ascii_lowercase();
+            let name = path.rsplit(['\\', '/']).next().unwrap_or_default();
+            (name.starts_with("tessera-render") || name.starts_with("tessera-engine")).then_some(process)
+        }
+    }
+
+    pub fn alive(pid: u32) -> bool {
+        // SAFETY: a zero-timeout wait on a live handle.
+        engine(pid, PROCESS_SYNCHRONIZE).is_some_and(|p| unsafe { WaitForSingleObject(p.0, 0) } == WAIT_TIMEOUT)
+    }
+
+    pub fn terminate(pid: u32) {
+        if let Some(p) = engine(pid, PROCESS_TERMINATE) {
+            // SAFETY: a live handle opened for termination.
+            unsafe { TerminateProcess(p.0, 1) };
+        }
+    }
 }
 
 /// Tauri managed state: the queue to the engine and the current process.
@@ -208,8 +265,9 @@ impl Engine {
     /// its lock in a blocking waitpid, so `CommandChild::kill` (and `pid`) would wait for the
     /// child to exit by itself, forever for a hung engine. Pass true only while the process
     /// can't have been reaped, so its pid can't have been reused. An adopted engine isn't our
-    /// child: the pid signal is the only kill, and launchd reaps it.
-    #[cfg_attr(not(unix), allow(unused_variables))]
+    /// child: the pid signal is the only kill, and launchd reaps it (Windows: TerminateProcess,
+    /// if that pid is still an engine).
+    #[cfg_attr(not(any(unix, windows)), allow(unused_variables))]
     pub fn kill(&self, unreaped: bool) {
         let Some((pid, child)) = self.proc.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
         #[cfg(unix)]
@@ -223,13 +281,21 @@ impl Engine {
                 Err(e) => log!("engine: killing pid {pid}: {e}"),
             },
             None => {
+                #[cfg(windows)]
+                if unreaped {
+                    win::terminate(pid);
+                }
                 for _ in 0..40 {
                     if !alive(pid) {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                log!("engine: stopped adopted pid {pid}");
+                if alive(pid) {
+                    log!("engine: adopted pid {pid} is still running");
+                } else {
+                    log!("engine: stopped adopted pid {pid}");
+                }
             }
         }
     }
@@ -591,6 +657,57 @@ async fn wake<S: futures_util::Stream + Unpin, M>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine binary `cargo test --workspace` builds (as `tests/engine.rs` finds it).
+    #[cfg(windows)]
+    fn engine_exe() -> PathBuf {
+        let target = option_env!("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"));
+        let exe = target.join("debug").join(format!("tessera-engine{}", std::env::consts::EXE_SUFFIX));
+        assert!(exe.exists(), "{} missing: cargo build -p tessera-engine", exe.display());
+        exe
+    }
+
+    /// Windows: an adopted engine (not our child: only its pid is known) is really stopped, as
+    /// Restart engine, Stop engine and "Stop outputs and quit" expect.
+    #[test]
+    #[cfg(windows)]
+    fn adopted_engine_is_stopped() {
+        let cache = std::env::temp_dir().join(format!("tessera-adopt-kill-{}", std::process::id()));
+        let mut child = std::process::Command::new(engine_exe())
+            .args(["--port".as_ref(), "0".as_ref(), "--cache-dir".as_ref(), cache.as_os_str()])
+            .env("TESSERA_TOKEN", new_token())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let (engine, _rx) = Engine::new(PathBuf::from("/nonexistent/engine.json"));
+        assert!(engine.set_proc(child.id(), None), "adopted");
+        engine.kill(true);
+        let stopped = child.try_wait().unwrap().is_some();
+        if !stopped {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(cache);
+        assert!(stopped, "the adopted engine is still running after kill");
+    }
+
+    /// Windows: a pid that no longer belongs to an engine is left alone (the number may have been
+    /// reused by another program since `engine.json` was written).
+    #[test]
+    #[cfg(windows)]
+    fn a_pid_that_is_not_an_engine_is_left_alone() {
+        let mut other = std::process::Command::new("ping").args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        let (engine, _rx) = Engine::new(PathBuf::from("/nonexistent/engine.json"));
+        assert!(engine.set_proc(other.id(), None));
+        engine.kill(true);
+        let running = other.try_wait().unwrap().is_none();
+        let _ = other.kill();
+        let _ = other.wait();
+        assert!(running, "killed a process that isn't an engine");
+    }
 
     #[test]
     fn parse_port_line() {

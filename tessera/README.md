@@ -120,8 +120,8 @@ D3D11VA), should a GPU or OS version draw it wrong.
     black, and no engine runs until you choose **Start engine**. Neither counts as a crash.
 - **UI force-quit.** The engine survives a force-quit or crash of the UI, and its outputs keep
   playing. On relaunch the controller adopts the engine through
-  `~/Library/Application Support/dev.tessera.controller/engine.json` (pid, port and token), so
-  there is no blackout:
+  `~/Library/Application Support/dev.tessera.controller/engine.json` (Windows:
+  `%APPDATA%\dev.tessera.controller\engine.json`; pid, port and token), so there is no blackout:
   - The status bar shows *engine held*, and the outputs stay untouched until you open or create
     a show.
   - After that, edits on the Program tab reach air on the next GO.
@@ -254,4 +254,3 @@ Keys work when no field or button has focus (Esc leaves a field).
   of the slowest display.
 - **Audio drift.** Audio isn't slaved to the video clock, so long clips can drift.
 - **Windows.** CI builds the installer, FFmpeg DLLs included, but it hasn't run on a PC yet.
-- **Engine adoption** after a UI crash works only on macOS and other unix systems.
