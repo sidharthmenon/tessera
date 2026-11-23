@@ -241,10 +241,10 @@ export function mediaUses(show: Show | null, live: Live): Map<string, MediaUse> 
   return uses;
 }
 
-/** The media item a layer plays, if it plays one. */
-export function mediaOf(show: Show | null, layer: Layer | undefined): MediaItem | undefined {
+/** The media item a layer plays, if it plays one (`media`: the show's, by id). */
+export function mediaOf(media: Map<string, MediaItem>, layer: Layer | undefined): MediaItem | undefined {
   const src = layer?.source;
-  return src?.type === 'Media' ? show?.media.find((m) => m.id === src.mediaId) : undefined;
+  return src?.type === 'Media' ? media.get(src.mediaId) : undefined;
 }
 
 /** Whether `after` shows less than `before`: a layer that was showing is removed, hidden or at
@@ -326,6 +326,26 @@ export function ownsKeys(el: Focusable | null): boolean {
   if (!el) return false;
   if (['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName ?? '') || el.isContentEditable) return true;
   return ['button', 'slider'].includes(el.getAttribute?.('role') ?? '');
+}
+
+/** `send` for a held key, whose repeats come faster than sends finish: a value given while a send
+ *  runs waits, merged into the last waiting one (`merge` returns null when the two can't be: it
+ *  then waits behind it), and goes when that send is done. One send at a time, in order. */
+export function coalesce<T>(send: (v: T) => Promise<unknown>, merge: (a: T, b: T) => T | null): (v: T) => Promise<void> {
+  const waiting: T[] = [];
+  let running = false;
+  return async (v) => {
+    const merged = waiting.length ? merge(waiting[waiting.length - 1], v) : null;
+    if (merged === null) waiting.push(v);
+    else waiting[waiting.length - 1] = merged;
+    if (running) return;
+    running = true;
+    try {
+      while (waiting.length) await send(waiting.shift()!);
+    } finally {
+      running = false;
+    }
+  };
 }
 
 /** "#ff8000" → opaque [1, 0.5, 0, 1] (a `Solid` pattern's rgba), and back. */

@@ -125,7 +125,7 @@
       <svg x={s.layoutX} y={s.layoutY} width={s.width} height={s.height} viewBox="0 0 {s.width} {s.height}">
         {#if layers}<rect width={s.width} height={s.height} fill="#000" />{/if}
         {#each layers?.filter((l) => l.visible) ?? [] as l (l.id)}
-          {@const m = mediaOf(ui.show, l)}
+          {@const m = mediaOf(ui.mediaById, l)}
           {@const href = m?.thumb ? engineUrl(ui.engine, `/thumb/${encodeURIComponent(m.thumb)}`) : null}
           {#if href}
             {@const [cx, cy, cw, ch] = cropBox(l.crop)}

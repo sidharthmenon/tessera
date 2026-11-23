@@ -2,7 +2,9 @@
   import { engineUrl, layoutBounds } from '$lib/logic';
   import { ui } from '$lib/store.svelte';
 
-  const url = $derived(engineUrl(ui.engine, '/preview/pgm.mjpg'));
+  // While the canvas shows Program it is the same stream, and the engine serves one viewer per bus.
+  const onCanvas = $derived(ui.canvasTab === 'pgm');
+  const url = $derived(onCanvas ? null : engineUrl(ui.engine, '/preview/pgm.mjpg'));
   const b = $derived(layoutBounds(ui.show?.screens ?? []));
   const bound = (id: string) => ui.outputs.find((o) => o.outputId === id);
 </script>
@@ -12,6 +14,8 @@
   <div class="frame" style:aspect-ratio="{b.w} / {b.h}">
     {#if url && ui.show?.screens.length}
       {#key url}<img src={url} alt="Program output" />{/key}
+    {:else if onCanvas}
+      <span class="muted">on the canvas</span>
     {/if}
   </div>
   {#if ui.show?.outputs.length}
@@ -36,6 +40,9 @@
     max-height: 190px;
     background: #000;
     border: 1px solid var(--border);
+    display: grid;
+    place-items: center;
+    font-size: 11px;
   }
   .frame img {
     width: 100%;

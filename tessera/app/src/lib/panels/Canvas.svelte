@@ -34,7 +34,7 @@
     ),
   );
 
-  const label = (l: Layer) => l.name || (l.source.type === 'Media' ? (mediaOf(ui.show, l)?.name ?? 'media') : l.source.pattern.type);
+  const label = (l: Layer) => l.name || (l.source.type === 'Media' ? (mediaOf(ui.mediaById, l)?.name ?? 'media') : l.source.pattern.type);
 
   function down(e: PointerEvent, s: Screen, l: Layer, mode: DragMode | CropSide) {
     if (e.button !== 0) return;
@@ -172,7 +172,7 @@
       >
         {#if url}
           {#key url}<img src={url} alt="" draggable="false" />{/key}
-        {:else}
+        {:else if !ui.engine}
           <div class="offline">engine offline</div>
         {/if}
         {#each screens as s (s.id)}
@@ -197,7 +197,7 @@
           >
             <span class="tag">{label(l)}</span>
             {#if l.source.type === 'Media'}
-              {@const m = mediaOf(ui.show, l)}
+              {@const m = mediaOf(ui.mediaById, l)}
               {@const t = clipTime(m, l, ui.positions[l.id])}
               <span class="flags">{m?.kind === 'Capture' || m?.kind === 'Ndi' ? 'LIVE' : ''}{l.muted ? '🔇 ' : ''}{t ? { Loop: '⟲', Once: '→', HoldLast: '⇥' }[l.playback] : ''}</span>
               {#if t && box.h > 28}

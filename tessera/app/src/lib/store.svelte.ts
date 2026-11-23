@@ -61,6 +61,8 @@ class Store {
   /** Set by the canvas: drops a Resources item at a window point (no-op off the canvas). */
   canvasDrop: ((x: number, y: number, item: { source: Source; name: string }) => void) | null = null;
 
+  /** The show's media by id (`mediaOf`). */
+  mediaById = $derived(new Map(this.show?.media.map((m) => [m.id, m] as const)));
   group = $derived(this.show?.groups.find((g) => g.id === this.activeGroupId) ?? this.show?.groups[0]);
   /** Where "+ PVW" adds: the selected layer's screen, else the one clicked, else the first. */
   targetScreen = $derived(this.show?.screens.find((s) => s.id === (this.selected?.screenId ?? this.screenId)) ?? this.show?.screens[0]);
@@ -101,15 +103,18 @@ export function toast(message: string) {
 async function sync() {
   [ui.show, ui.live] = await Promise.all([api.getShow(), api.getLive()]);
 }
+/** `sync` for the controller's Live commands (load, take, transport, PVW/PGM edits): they never
+ *  change the show, which is the costly read. */
+const syncLive = async () => void (ui.live = await api.getLive());
 
 let queue: Promise<void> = Promise.resolve();
 
-/** Actions run one at a time, each followed by a `sync`, so a second quick edit never rebuilds a
- *  cue from the show as it was before the first. Errors (a command's `Err`, a dialog failure) go
- *  to the status bar and the UI carries on. Never call an action from inside another (it would
- *  wait for itself). */
-function action<A extends unknown[]>(f: (...a: A) => Promise<unknown>) {
-  return (...a: A): Promise<void> => (queue = queue.then(() => f(...a)).catch(fail).then(sync).catch(fail));
+/** Actions run one at a time, each followed by `after` (a `sync`), so a second quick edit never
+ *  rebuilds a cue from the show as it was before the first. Errors (a command's `Err`, a dialog
+ *  failure) go to the status bar and the UI carries on. Never call an action from inside another
+ *  (it would wait for itself). */
+function action<A extends unknown[]>(f: (...a: A) => Promise<unknown>, after: () => Promise<void> = sync) {
+  return (...a: A): Promise<void> => (queue = queue.then(() => f(...a)).catch(fail).then(after).catch(fail));
 }
 
 function engineEvent(ev: FromEngine) {
@@ -118,7 +123,7 @@ function engineEvent(ev: FromEngine) {
       ui.stats = { fps: ev.fps, dropped: ev.dropped };
       break;
     case 'Positions':
-      ui.positions = ev.positions;
+      if (!same(ui.positions, ev.positions)) ui.positions = ev.positions; // paused or stills: no redraw
       break;
     case 'OutputStatus':
       ui.outputs = ev.outputs;
@@ -248,7 +253,7 @@ export const importDropped = action(async (paths: string[]) => {
   const before = ui.show?.media.length ?? 0;
   if (media.length) {
     await api.importMedia(media);
-    await sync();
+    ui.show = await api.getShow(); // to count what was added (the action syncs after)
   }
   const added = (ui.show?.media.length ?? 0) - before;
   const notes = [
@@ -266,8 +271,8 @@ export const importMedia = action(async () => {
 
 export const undo = action(api.undo);
 export const redo = action(api.redo);
-export const take = action(api.take);
-export const loadNext = action(api.loadNext);
+export const take = action(api.take, syncLive);
+export const loadNext = action(api.loadNext, syncLive);
 export const op = action((o: ShowOp) => api.applyOp(o));
 export const listInputs = action(api.listInputs);
 
@@ -319,15 +324,15 @@ export const addToPvw = action(async (source: Source, name: string, screen?: Scr
   await api.setPreview(withScreen(scene, screen.id, [...(scene[screen.id] ?? []), layer]), ui.live.transition);
   ui.canvasTab = 'pvw';
   ui.selected = { screenId: screen.id, layerId: layer.id };
-});
+}, syncLive);
 
 /** Change (or with null, remove) a layer on the canvas bus: Preview (no cue changes), or Program,
  *  which goes to air at once, so taking picture away (or restarting a clip) asks first. */
-export const editLayer = action((sel: LayerRef, f: (l: Layer) => Layer | null) => editBus((sc) => withLayer(sc, sel.screenId, sel.layerId, f)));
+export const editLayer = action((sel: LayerRef, f: (l: Layer) => Layer | null) => editBus((sc) => withLayer(sc, sel.screenId, sel.layerId, f)), syncLive);
 
 /** Move a layer `by` places up (towards the top) or down its screen's stack (±Infinity: to the
  *  top or bottom), as `editLayer` edits. */
-export const moveLayer = action((sel: LayerRef, by: number) => editBus((sc) => shiftLayer(sc, sel.screenId, sel.layerId, by)));
+export const moveLayer = action((sel: LayerRef, by: number) => editBus((sc) => shiftLayer(sc, sel.screenId, sel.layerId, by)), syncLive);
 
 async function editBus(f: (sc: Scene) => Scene) {
   const scene = ui.busScene;
@@ -343,15 +348,20 @@ async function editBus(f: (sc: Scene) => Scene) {
 }
 
 /** Preview's transition (what GO uses). */
-export const setTransition = action((t: Transition) => api.setPreview(ui.live.preview, t));
+export const setTransition = action((t: Transition) => api.setPreview(ui.live.preview, t), syncLive);
 
 export const editCue = action(async (ref: CueRef, f: (c: Cue) => Cue) => {
   const cue = cueAt(ui.show, ref);
   if (cue) await setCue(ref, f(cue));
 });
 
-/** Click on a slot: load its cue into Preview, or store Preview into the empty slot. */
-export const clickSlot = action((ref: CueRef) => (cueAt(ui.show, ref) ? api.loadCue(ref.groupId, ref.slot) : api.storePreview(ref.groupId, ref.slot)));
+/** Click on a slot: load its cue into Preview, or store Preview into the empty slot (an edit:
+ *  the show is read back too). */
+export const clickSlot = action(async (ref: CueRef) => {
+  if (cueAt(ui.show, ref)) return api.loadCue(ref.groupId, ref.slot);
+  await api.storePreview(ref.groupId, ref.slot);
+  ui.show = await api.getShow();
+}, syncLive);
 
 /** Overwrite the cue at `ref` with Preview (its layers and transition). */
 export const updateCue = action((ref: CueRef) => api.storePreview(ref.groupId, ref.slot));
@@ -359,7 +369,7 @@ export const updateCue = action((ref: CueRef) => api.storePreview(ref.groupId, r
 export const fire = action(async (ref: CueRef) => {
   await api.loadCue(ref.groupId, ref.slot);
   await api.take();
-});
+}, syncLive);
 
 export const transport = action(async (bus: Bus, layer: string | null, act: TransportAction) => {
   if (bus === 'pgm' && (act === 'Stop' || act === 'Restart')) {
@@ -370,7 +380,7 @@ export const transport = action(async (bus: Bus, layer: string | null, act: Tran
     if (!yes) return;
   }
   await api.transport(bus === 'pgm' ? 'Pgm' : 'Pvw', layer, act);
-});
+}, syncLive);
 
 /** A text prompt in the window (the dialog plugin has none). Resolves null on cancel. */
 export function promptText(title: string, value = ''): Promise<string | null> {
@@ -384,6 +394,6 @@ export const confirmAsk = (message: string, okLabel: string) => ask(message, { t
 
 export const addGroup = action(async (name: string) => {
   await api.applyOp({ op: 'AddGroup', name });
-  await sync();
+  ui.show = await api.getShow(); // for the new group's id (the action syncs after)
   ui.activeGroupId = ui.show?.groups.at(-1)?.id ?? null;
 });

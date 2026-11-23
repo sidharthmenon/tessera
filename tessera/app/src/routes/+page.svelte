@@ -1,8 +1,8 @@
 <script lang="ts">
   import '../app.css';
   import { onMount } from 'svelte';
-  import { cueKey, hotkey, layerKey, ownsKeys, type Hotkey } from '$lib/logic';
-  import { clickSlot, editLayer, init, loadNext, moveLayer, redo, saveShow, take, ui, undo } from '$lib/store.svelte';
+  import { coalesce, cueKey, hotkey, layerKey, ownsKeys, type Hotkey } from '$lib/logic';
+  import { clickSlot, editLayer, init, loadNext, moveLayer, redo, saveShow, take, ui, undo, type LayerRef } from '$lib/store.svelte';
   import Prompt from '$lib/Prompt.svelte';
   import Canvas from '$lib/panels/Canvas.svelte';
   import CueGrid from '$lib/panels/CueGrid.svelte';
@@ -53,12 +53,20 @@
     e.preventDefault();
     if ('nudge' in k) {
       const [dx, dy] = k.nudge;
-      editLayer(sel, (l) => ({ ...l, rect: { ...l.rect, x: l.rect.x + dx, y: l.rect.y + dy } })); // held: repeats
+      nudge({ sel, dx, dy }); // held: repeats
     } else if (!e.repeat) {
       moveLayer(sel, k.order);
     }
     return true;
   }
+
+  /** A held arrow adds up while a nudge is on its way, then goes as one edit: the action queue
+   *  never backs up behind it. */
+  type Nudge = { sel: LayerRef; dx: number; dy: number };
+  const nudge = coalesce(
+    ({ sel, dx, dy }: Nudge) => editLayer(sel, (l) => ({ ...l, rect: { ...l.rect, x: l.rect.x + dx, y: l.rect.y + dy } })),
+    (a, b) => (a.sel.screenId === b.sel.screenId && a.sel.layerId === b.sel.layerId ? { sel: a.sel, dx: a.dx + b.dx, dy: a.dy + b.dy } : null),
+  );
 
   /** A cue's shortcut (active group) loads it into Preview, as a click on its tile does. */
   function cueShortcut(e: KeyboardEvent) {

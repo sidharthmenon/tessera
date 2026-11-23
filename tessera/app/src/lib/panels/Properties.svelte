@@ -23,7 +23,7 @@
   const t = $derived(ui.live.transition);
   const layer = $derived(ui.layer);
   const screens = $derived((ui.show?.screens ?? []).filter((s) => s.id in scene));
-  const media = $derived(mediaOf(ui.show, layer));
+  const media = $derived(mediaOf(ui.mediaById, layer));
   const screen = $derived(ui.show?.screens.find((s) => s.id === ui.selected?.screenId));
 
   /** Number from an input, or null for empty/garbage (the field then snaps back on the next update). */
@@ -104,7 +104,7 @@
               <!-- Listed top first: the first row is the top layer. -->
               <button class="icon" title="Move up (in front)" disabled={i === 0} onclick={() => moveLayer({ screenId: s.id, layerId: l.id }, 1)}>▲</button>
               <button class="icon" title="Move down (behind)" disabled={i === scene[s.id].length - 1} onclick={() => moveLayer({ screenId: s.id, layerId: l.id }, -1)}>▼</button>
-              {#if mediaOf(ui.show, l)?.kind === 'Video'}
+              {#if mediaOf(ui.mediaById, l)?.kind === 'Video'}
                 <button class="icon" title={l.muted ? 'Unmute' : 'Mute'} onclick={() => editLayer({ screenId: s.id, layerId: l.id }, (x) => ({ ...x, muted: !x.muted }))}>{l.muted ? '🔇' : '🔈'}</button>
               {/if}
               <button

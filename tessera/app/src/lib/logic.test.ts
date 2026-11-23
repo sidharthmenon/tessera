@@ -1,7 +1,9 @@
 // `npm test`: plain Node (type stripping), no test framework. Throws on the first failure.
 import type { Cue } from './bindings/Cue';
 import type { Group } from './bindings/Group';
+import type { MediaItem } from './bindings/MediaItem';
 import type { Screen } from './bindings/Screen';
+import type { Source } from './bindings/Source';
 import * as L from './logic.ts';
 
 function eq(got: unknown, want: unknown, what: string) {
@@ -249,5 +251,33 @@ eq([L.cropBox({ left: 0.6, top: 0, right: 0.6, bottom: 0 }), L.cropBox({ left: N
 }
 eq(['/a/b.tshow', '/a/b.TSHOW', '/a/b.tshow.autosave', '/a/clip.mp4', '/a/still.png'].map(L.isShowFile), [true, true, true, false, false], 'show files are not media');
 eq(L.patternFill({ type: 'Bars' }), 'url(#cue-bars)', 'bars fill');
+{
+  const byId = new Map([['m1', { id: 'm1', name: 'one' } as MediaItem]]);
+  const lay = (source: Source) => L.newLayer(source, b, '');
+  eq(
+    [L.mediaOf(byId, lay({ type: 'Media', mediaId: 'm1' }))?.name, L.mediaOf(byId, lay({ type: 'Media', mediaId: 'gone' })), L.mediaOf(byId, lay({ type: 'Pattern', pattern: { type: 'Bars' } })), L.mediaOf(byId, undefined)],
+    ['one', undefined, undefined, undefined], 'media of a layer: by id, missing, pattern, none',
+  );
+}
+{
+  // A held arrow: the first nudge goes at once, the ones meanwhile go as one sum when it is done.
+  const sent: number[] = [];
+  const done: (() => void)[] = [];
+  const nudge = L.coalesce((v: number) => (sent.push(v), new Promise<void>((r) => done.push(r))), (a, b) => (Math.sign(a) === Math.sign(b) ? a + b : null));
+  const next = () => (done.shift()!(), new Promise((r) => setTimeout(r)));
+  const first = nudge(1);
+  void nudge(1);
+  void nudge(2);
+  void nudge(-5);
+  eq(sent, [1], 'held key: one send at a time');
+  await next();
+  eq(sent, [1, 3], 'what waited goes as one');
+  await next();
+  eq(sent, [1, 3, -5], 'one that cannot merge waits behind, in order');
+  await next();
+  await first;
+  void nudge(4);
+  eq(sent, [1, 3, -5, 4], 'idle again: sends at once');
+}
 
 console.log('logic: all checks passed');

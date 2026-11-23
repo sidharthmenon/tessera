@@ -6,7 +6,7 @@
   const bus = $derived(ui.canvasTab);
   /** As the bus has it: on PGM this reaches layers earlier takes left on air too (R41). */
   const layer = $derived(ui.layer);
-  const media = $derived(mediaOf(ui.show, layer));
+  const media = $derived(mediaOf(ui.mediaById, layer));
   /** A pattern has no player to drive; with nothing selected, transport drives the whole bus. */
   const usable = $derived(!!ui.engine && (!layer || layer.source.type === 'Media'));
   const pos = $derived(layer ? ui.positions[layer.id] : undefined);
