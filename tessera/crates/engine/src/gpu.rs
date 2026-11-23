@@ -6,6 +6,9 @@ use wgpu::util::DeviceExt;
 
 use crate::audio::lock;
 
+/// Texture and buffer bindings live at once on a device (see `Gpu::new`).
+const MAX_NON_SAMPLER_BINDINGS: u32 = 65_536;
+
 /// Cheap to clone (wgpu handles are refcounted), e.g. to upload from a loader thread. Clones share
 /// one per-frame command encoder (`record` / `submit`), so a frame's passes go to the GPU in a
 /// couple of submits instead of one per draw.
@@ -58,9 +61,15 @@ impl Gpu {
         // parameters (no uniform buffer per draw); adapter limits so wide screens (> 8192 px) fit.
         // NV12/P010 textures where the adapter has them: DX12 decoder frames, drawn in place.
         let video = adapter.features() & (wgpu::Features::TEXTURE_FORMAT_NV12 | wgpu::Features::TEXTURE_FORMAT_P010);
+        // DX12 sizes the device's shader-visible descriptor heap from max_non_sampler_bindings (a
+        // million by default: tens of MB per device, enough to run a 1 GB integrated GPU out of
+        // memory with a few devices). The compositor's bind groups (2 views each, dropped 2 frames
+        // after last use) need a few hundred.
+        let max = adapter.limits();
+        let limits = wgpu::Limits { max_non_sampler_bindings: max.max_non_sampler_bindings.min(MAX_NON_SAMPLER_BINDINGS), ..max };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             required_features: wgpu::Features::TEXTURE_FORMAT_16BIT_NORM | wgpu::Features::IMMEDIATES | video,
-            required_limits: adapter.limits(),
+            required_limits: limits,
             ..Default::default()
         }))
         .context("GPU device lacks 16-bit normalized textures (needed for P010) or immediates")?;

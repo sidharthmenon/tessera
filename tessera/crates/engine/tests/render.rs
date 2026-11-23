@@ -62,6 +62,13 @@ fn render(gpu: &Gpu, c: &mut Compositor, s: &Screen, layers: &[(Layer, Option<La
 const RED: [f32; 4] = [1., 0., 0., 1.];
 const BLUE: [f32; 4] = [0., 0., 1., 1.];
 
+/// DX12 makes each device's shader-visible descriptor heap as large as this limit. At the default
+/// (a million) a dozen devices, these tests side by side, ran a 1 GB integrated GPU out of memory.
+#[test]
+fn descriptor_heap_stays_small() {
+    assert!(gpu().device.limits().max_non_sampler_bindings <= 65_536);
+}
+
 #[test]
 fn solid_layer_fills_rect() {
     let gpu = gpu();
