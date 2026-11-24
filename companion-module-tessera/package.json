@@ -1,6 +1,6 @@
 {
   "name": "tessera",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Bitfocus Companion connection for the Tessera media server",
   "main": "dist/main.js",
   "license": "MIT",
