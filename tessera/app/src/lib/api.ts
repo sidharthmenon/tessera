@@ -58,6 +58,8 @@ export const engineStopped = () => invoke<boolean>('engine_stopped');
 
 /** Remote control (Companion, scripts): see docs/external-control.md. */
 export type RemoteStatus = { enabled: boolean; running: boolean; port: number; key: string; address: string | null; clients: number; error: string | null };
+export type ProcessUsage = { cpu: number; ram: number };
+export type Usage = { engine: ProcessUsage | null; app: ProcessUsage; machineCpu: number; ramUsed: number; ramTotal: number };
 export const remoteStatus = () => invoke<RemoteStatus>('remote_status');
 export const remoteSet = (enabled: boolean, port: number) => invoke<RemoteStatus>('remote_set', { enabled, port });
 export const remoteNewKey = () => invoke<RemoteStatus>('remote_new_key');
@@ -74,6 +76,7 @@ type Events = {
   /** The operator stopped (true) or started (false) the engine. */
   'engine-stopped': boolean;
   'remote-changed': RemoteStatus;
+  usage: Usage;
 };
 
 export const on = <K extends keyof Events>(event: K, f: (payload: Events[K]) => void): Promise<UnlistenFn> =>

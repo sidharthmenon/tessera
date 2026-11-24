@@ -8,6 +8,8 @@
 //! - `engine-info`: `EngineInfo { port, token, adopted, held }` on connect and when a show is
 //!   loaded (which releases the hold), `null` on disconnect
 //! - `engine-stopped`: `true` when the operator stops the engine, `false` when they start it
+//! - `usage`: `Usage { engine, app, machineCpu, ramUsed, ramTotal }` once a second (CPU % of the
+//!   machine, RAM bytes; `engine` null while no engine runs)
 //! - `recovery-available`: path of unsaved work from an earlier session (also `get_recovery`)
 //!
 //! Quitting (⌘Q, closing the window) asks first while something is on air (C1).
@@ -25,6 +27,7 @@ pub mod controller;
 pub mod engine_client;
 pub mod files;
 pub mod remote;
+pub mod usage;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -743,6 +746,7 @@ pub fn run() {
                 remote,
             });
             app.manage(engine);
+            usage::spawn(app.handle().clone());
             let enabled = app.state::<AppState>().remote.lock().unwrap_or_else(|e| e.into_inner()).settings.enabled;
             if enabled {
                 apply_remote(app.handle());

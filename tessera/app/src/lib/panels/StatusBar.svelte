@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatUsage } from '$lib/logic';
   import { newRemoteKey, restartEngine, setRemote, startEngine, stopEngine, toast, ui } from '$lib/store.svelte';
 
   let menu = $state<{ x: number; y: number } | null>(null);
@@ -46,6 +47,11 @@
   {#if ui.stats}
     <span>{ui.stats.fps.toFixed(1)} fps</span>
     <span class:bad={ui.stats.dropped > 0}>{ui.stats.dropped} dropped</span>
+  {/if}
+  {#if ui.usage}
+    {@const u = formatUsage(ui.usage)}
+    <span class="usage" title={u.detail}>{u.tessera}</span>
+    <span class="usage" class:bad={u.tight}>{u.machine}</span>
   {/if}
   {#if ui.outputs.length}<span>outputs {bound}/{ui.outputs.length} bound</span>{/if}
   {#if ui.notice}<span class="notice">{ui.notice}</span>{/if}
@@ -190,6 +196,13 @@
   }
   .bad {
     color: var(--warn);
+  }
+  .usage {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex-shrink: 100;
+    font-variant-numeric: tabular-nums;
   }
   .notice {
     color: var(--accent-2);

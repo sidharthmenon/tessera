@@ -260,6 +260,11 @@ impl Engine {
         Some(EngineInfo { adopted: self.adopted.load(Ordering::SeqCst), held: self.hold.load(Ordering::SeqCst), ..info })
     }
 
+    /// The engine process's pid, adopted or our own child.
+    pub fn pid(&self) -> Option<u32> {
+        self.proc.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(pid, _)| *pid)
+    }
+
     /// Kill the engine process (if any) and wait for it. `unreaped`: also SIGKILL it by pid
     /// first. On macOS waitid() returns for a *stopped* child, after which shared_child holds
     /// its lock in a blocking waitpid, so `CommandChild::kill` (and `pid`) would wait for the

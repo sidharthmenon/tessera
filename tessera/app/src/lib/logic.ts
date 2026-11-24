@@ -1,4 +1,5 @@
 // Pure helpers for the UI: no runes, no Tauri, so `npm test` runs them in plain Node.
+import type { Usage } from './api';
 import type { Cue } from './bindings/Cue';
 import type { Group } from './bindings/Group';
 import type { Layer } from './bindings/Layer';
@@ -430,4 +431,19 @@ export function setupOps(before: Setup, after: Setup): ShowOp[] {
     ...s.changed.map((screen): ShowOp => ({ op: 'UpdateScreen', screen })),
     ...[...m.added, ...m.changed].map((mapping): ShowOp => ({ op: 'SetMapping', mapping })),
   ];
+}
+
+const gbNum = (bytes: number) => (bytes / 1024 ** 3).toFixed(1).replace(/\.0$/, '');
+const gb = (bytes: number) => `${gbNum(bytes)} GB`;
+const pct = (n: number) => `${Math.round(n)}%`;
+
+/** The status bar's resource figures. `tight`: the machine is near its limit (CPU >= 85% or < 10% RAM free). */
+export function formatUsage(u: Usage): { tessera: string; machine: string; detail: string; tight: boolean } {
+  const app = `app ${pct(u.app.cpu)} · ${gb(u.app.ram)}`;
+  return {
+    tessera: `Tessera CPU ${pct(u.app.cpu + (u.engine?.cpu ?? 0))} · ${gb(u.app.ram + (u.engine?.ram ?? 0))}`,
+    machine: `Machine CPU ${pct(u.machineCpu)} · RAM ${gbNum(u.ramUsed)} / ${gb(u.ramTotal)}`,
+    detail: u.engine ? `engine ${pct(u.engine.cpu)} · ${gb(u.engine.ram)}, ${app}` : `engine not running, ${app}`,
+    tight: u.machineCpu >= 85 || u.ramTotal - u.ramUsed < 0.1 * u.ramTotal,
+  };
 }

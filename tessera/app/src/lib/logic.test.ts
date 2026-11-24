@@ -280,4 +280,15 @@ eq(L.patternFill({ type: 'Bars' }), 'url(#cue-bars)', 'bars fill');
   eq(sent, [1, 3, -5, 4], 'idle again: sends at once');
 }
 
+{
+  const GB = 1024 ** 3;
+  const u = { engine: { cpu: 8.4, ram: 0.5 * GB }, app: { cpu: 1.2, ram: 0.1 * GB }, machineCpu: 23.4, ramUsed: 9.8 * GB, ramTotal: 18 * GB };
+  eq(L.formatUsage(u), { tessera: 'Tessera CPU 10% · 0.6 GB', machine: 'Machine CPU 23% · RAM 9.8 / 18 GB', detail: 'engine 8% · 0.5 GB, app 1% · 0.1 GB', tight: false }, 'usage');
+  eq(L.formatUsage({ ...u, engine: null }).tessera, 'Tessera CPU 1% · 0.1 GB', 'engine down: app alone');
+  eq(L.formatUsage({ ...u, engine: null }).detail, 'engine not running, app 1% · 0.1 GB', 'engine down');
+  eq(L.formatUsage({ ...u, machineCpu: 85 }).tight, true, 'cpu at the limit');
+  eq(L.formatUsage({ ...u, ramUsed: 16.3 * GB }).tight, true, 'under 10% RAM available');
+  eq(L.formatUsage({ ...u, ramUsed: 16.1 * GB }).tight, false, 'just over 10% RAM available');
+}
+
 console.log('logic: all checks passed');

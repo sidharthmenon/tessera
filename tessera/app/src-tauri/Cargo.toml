@@ -26,6 +26,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tauri-plugin-single-instance = "2"
+sysinfo = { version = "0.40.4", default-features = false, features = ["system"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -27,6 +27,8 @@ class Store {
   engine = $state.raw<EngineInfo | null>(null);
   /** Remote control's settings and state (null until read). */
   remote = $state.raw<api.RemoteStatus | null>(null);
+  /** CPU and RAM figures, once a second (null until the first). */
+  usage = $state.raw<api.Usage | null>(null);
   /** The operator stopped the engine (outputs black) until they start it. */
   engineStopped = $state(false);
   /** The last "engine restarting: …" message, until the engine is back. */
@@ -175,6 +177,7 @@ export async function init(): Promise<() => void> {
         api.on('engine-info', setEngine),
         api.on('engine-stopped', (stopped) => (ui.engineStopped = stopped)),
         api.on('remote-changed', (r) => (ui.remote = r)),
+        api.on('usage', (u) => (ui.usage = u)),
         getCurrentWebview().onDragDropEvent(({ payload }) => {
           ui.fileDrag = payload.type === 'enter' || payload.type === 'over';
           if (payload.type === 'drop') importDropped(payload.paths);
