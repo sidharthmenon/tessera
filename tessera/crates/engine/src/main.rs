@@ -80,13 +80,14 @@ fn main() -> anyhow::Result<()> {
         (vec![], vec![])
     };
     let (event_loop, handle) = event_loop()?;
-    // The app's replies, to every WebSocket client (and the log).
+    // The app's replies, to every WebSocket client (and the log, but for the ones sent every
+    // frame or second: the `perf:` line covers those).
     let (events, replies) = mpsc::channel();
     let (clients, _) = broadcast::channel(256);
     let to_clients = clients.clone();
     std::thread::spawn(move || {
         for event in replies {
-            if !matches!(event, FromEngine::Positions { .. }) {
+            if !matches!(event, FromEngine::Positions { .. } | FromEngine::Stats { .. }) {
                 log!("engine -> {event:?}");
             }
             let _ = to_clients.send(event); // no clients connected: dropped
