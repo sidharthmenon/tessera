@@ -341,6 +341,23 @@ fn write_show(show: &Show, path: Option<&Path>, data_dir: &Path) -> Result<(), (
     }
 }
 
+/// The last screen setup, restored at launch (`<data_dir>/screens.tshow`).
+const SCREENS_FILE: &str = "screens.tshow";
+
+/// Only `show`'s screen setup (outputs, screens, mappings), as an otherwise empty show.
+fn screens_of(show: &Show) -> Show {
+    Show { outputs: show.outputs.clone(), screens: show.screens.clone(), mappings: show.mappings.clone(), ..Show::new() }
+}
+
+/// Writes the show's screen setup to `SCREENS_FILE`, which the next launch starts with. The copy
+/// is taken under the controller lock and written without it.
+fn remember_screens(ctl: &Mutex<Controller>, data_dir: &Path) {
+    let screens = screens_of(&lock(ctl).show);
+    if let Err(e) = files::save_atomic(&data_dir.join(SCREENS_FILE), &screens) {
+        log!("screens: {e}");
+    }
+}
+
 /// Writes the show if it changed since the last write (`write_show`). The show is copied under the
 /// controller lock and written without it, so a slow disk never holds up a GO; an edit made during
 /// the write stays unsaved. Callers hold `AppState::saving`.
@@ -362,7 +379,9 @@ async fn autosave(app: AppHandle) {
         let written = tauri::async_runtime::spawn_blocking(move || {
             let state = handle.state::<AppState>();
             let _saving = state.saving();
-            write_autosave(&state.ctl, &state.data_dir)
+            let written = write_autosave(&state.ctl, &state.data_dir);
+            remember_screens(&state.ctl, &state.data_dir);
+            written
         });
         if let Err(e) = written.await.map_err(|e| e.to_string()).and_then(|w| w) {
             log!("autosave: {e}");
@@ -502,19 +521,22 @@ fn open_show(app: AppHandle, path: PathBuf) -> Res<()> {
     let recovery = if titled { files::take_recovery(Some(&path), &state.data_dir) } else { None };
     *state.recovery.lock().unwrap_or_else(|e| e.into_inner()) = recovery.clone();
     dispatch(&app, Change::Load, |c| Ok(c.open(show, titled.then_some(path))))?;
+    // The opened show's screen setup is the one the next launch starts with.
+    remember_screens(&state.ctl, &state.data_dir);
     if let Some(prev) = recovery {
         let _ = app.emit("recovery-available", prev);
     }
     Ok(())
 }
 
-/// A fresh untitled show. Like `open_show`: history and PVW clear, PGM keeps running.
+/// A fresh untitled show with this show's screen setup. Like `open_show`: history and PVW clear,
+/// PGM keeps running.
 #[tauri::command(async)]
 fn new_show(app: AppHandle) -> Res<()> {
     let state = app.state::<AppState>();
     let _saving = flush_autosave(&state);
     release_hold(&app);
-    dispatch(&app, Change::Load, |c| Ok(c.open(Show::new(), None)))
+    dispatch(&app, Change::Load, |c| Ok(c.open(screens_of(&c.show), None)))
 }
 
 /// The operator loaded a show: an adopted engine may take it now (R35). Tell the UI.
@@ -629,6 +651,7 @@ fn exiting(app: &AppHandle) {
     if let Err(e) = write_autosave(&state.ctl, &state.data_dir) {
         log!("autosave on quit: {e}");
     }
+    remember_screens(&state.ctl, &state.data_dir);
     drop(saving);
     let chosen = *state.quit.lock().unwrap_or_else(|e| e.into_inner());
     let engine = app.state::<Engine>();
@@ -722,7 +745,16 @@ pub fn run() {
             if let Some(prev) = &recovery {
                 log!("autosave: untitled work from an earlier session kept at {}", prev.display());
             }
-            let ctl = Mutex::new(Controller::new());
+            // The last screen setup: a fresh engine opens its outputs on connect (an adopted one is
+            // held until a show is opened or created).
+            let mut controller = Controller::new();
+            let screens = data_dir.join(SCREENS_FILE);
+            match files::open(&screens) {
+                Ok(last) => controller.show = screens_of(&last),
+                Err(e) if screens.exists() => log!("screens: {e}"),
+                Err(_) => {}
+            }
+            let ctl = Mutex::new(controller);
             let recovery = Mutex::new(recovery);
             let settings = remote::Settings::load(&data_dir.join("remote.json"));
             let remote = Mutex::new(RemoteRuntime {
@@ -840,6 +872,30 @@ mod tests {
         lock(&ctl).apply(ShowOp::SetMasterVolume { volume: 0.9 }).unwrap();
         lock(&ctl).written(old);
         assert!(lock(&ctl).dirty);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The screen setup is written alone (no groups' cues, no media, no volume) and reads back the same.
+    #[test]
+    fn remembers_the_screen_setup() {
+        use tessera_show::{Mapping, Output, OutputTarget, Rect, Screen};
+        let dir = std::env::temp_dir().join(format!("tessera-screens-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctl = Mutex::new(Controller::new());
+        let screen = Screen { id: Uuid::new_v4(), name: "S".into(), width: 1920, height: 1080, layout_x: 0, layout_y: 0 };
+        let output = Output { id: Uuid::new_v4(), name: "O".into(), node: "local".into(), target: OutputTarget::Window { x: 0, y: 0 },
+            width: 1920, height: 1080, brightness: 1.0 };
+        let full = Rect { x: 0., y: 0., w: 1920., h: 1080. };
+        let mapping = Mapping { id: Uuid::new_v4(), screen_id: screen.id, src: full.clone(), output_id: output.id, dst: full };
+        for op in [ShowOp::AddScreen { screen }, ShowOp::AddOutput { output }, ShowOp::SetMapping { mapping },
+            ShowOp::AddGroup { name: "G".into() }, ShowOp::SetMasterVolume { volume: 0.5 }] {
+            lock(&ctl).apply(op).unwrap();
+        }
+        remember_screens(&ctl, &dir);
+        let back = files::open(&dir.join(SCREENS_FILE)).unwrap();
+        let show = lock(&ctl).show.clone();
+        assert_eq!((&back.outputs, &back.screens, &back.mappings), (&show.outputs, &show.screens, &show.mappings));
+        assert_eq!((back.groups.len(), back.media.len(), back.master_volume), (1, 0, 1.0), "only the screen setup");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

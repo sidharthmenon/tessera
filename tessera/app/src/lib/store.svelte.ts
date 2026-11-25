@@ -227,7 +227,7 @@ async function openShowAt(path: string) {
 }
 
 export const newShow = action(async () => {
-  const yes = await ask(`Start a new, empty show? Outputs close until screens are set up again${unsavedNote()}.`, {
+  const yes = await ask(`Start a new, empty show? Screens and outputs stay as they are${unsavedNote()}.`, {
     title: 'New show', kind: 'warning', okLabel: 'New show',
   });
   if (!yes) return;

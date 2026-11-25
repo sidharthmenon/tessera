@@ -105,6 +105,9 @@ D3D11VA), should a GPU or OS version draw it wrong.
   it later with Open. An older `.prev` is never overwritten: later ones are kept as
   `….autosave.<time>.prev`, and the newest is the one offered.
 - **Save As** gives the show a file (or a new one); from then on it saves into that file.
+- **Screen setup.** The last outputs, screens and mappings are kept in `screens.tshow` in the
+  same folder as the untitled autosave, and the app starts with them. Opening a show uses that
+  show's setup instead (and keeps it for next time); **New show** keeps the current one.
 - **Engine supervision.** If the engine dies or stops answering for 5 s, the controller kills it,
   starts a new one and re-sends the config, PVW, PGM and the master volume. What a restart
   restores:
