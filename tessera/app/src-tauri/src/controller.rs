@@ -185,7 +185,9 @@ impl Controller {
         let before = self.show.clone();
         self.show.apply(op.clone())?;
         let (s, b) = (&self.show, &before);
-        let config = s.outputs != b.outputs || s.screens != b.screens || s.mappings != b.mappings || s.media != b.media;
+        // The engine finds media by id: a new order alone needs no new config.
+        let media = s.media != b.media && !matches!(op, ShowOp::MoveMedia { .. });
+        let config = s.outputs != b.outputs || s.screens != b.screens || s.mappings != b.mappings || media;
         let volume = s.master_volume != b.master_volume;
         self.edited();
         self.push_undo((Some(before), self.pvw.clone()));
@@ -642,6 +644,18 @@ mod tests {
         assert_eq!(c.show, states[49]);
         assert!(c.undo().is_empty());
         assert_eq!(c.show, states[49]);
+    }
+
+    #[test]
+    fn move_media_is_undoable_without_set_config() {
+        let mut c = Controller::new();
+        c.import_media(&[PathBuf::from(abs("/shows/a.mov")), PathBuf::from(abs("/shows/b.mov"))]).unwrap();
+        let before = c.show.media.clone();
+        assert!(c.apply(ShowOp::MoveMedia { id: before[0].id, to: 1 }).unwrap().is_empty());
+        assert_eq!(c.show.media, [before[1].clone(), before[0].clone()]);
+        assert!(c.dirty);
+        c.undo();
+        assert_eq!(c.show.media, before);
     }
 
     #[test]

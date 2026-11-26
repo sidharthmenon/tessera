@@ -76,22 +76,45 @@
 
   // A pointer drag (HTML drag and drop belongs to the native handler that brings in Finder files):
   // past a few pixels it is a drag, shown by a label under the pointer; released over the canvas,
-  // it drops there.
-  let pressed: { source: Source; name: string; x: number; y: number } | null = null;
-  function press(e: PointerEvent, source: Source, name: string) {
+  // it drops there. A media item released over the media list moves there instead.
+  let pressed: { source: Source; name: string; x: number; y: number; id?: string } | null = null;
+  let list = $state<HTMLUListElement>();
+  /** Where a dragged media item would land in the list: the gap before row `gap` (rows.length:
+   *  after the last). Null off the list, or where it already is. */
+  let gap = $state<number | null>(null);
+  function press(e: PointerEvent, source: Source, name: string, id?: string) {
     if (e.button !== 0 || (e.target as Element).closest('button')) return;
     (e.currentTarget as Element).setPointerCapture(e.pointerId);
-    pressed = { source, name, x: e.clientX, y: e.clientY };
+    pressed = { source, name, x: e.clientX, y: e.clientY, id };
+  }
+  function gapAt(x: number, y: number, id: string): number | null {
+    const r = list?.getBoundingClientRect();
+    if (!list || !r || x < r.left || x > r.right || y < r.top || y > r.bottom) return null;
+    const rows = [...list.querySelectorAll(':scope > li')];
+    const g = rows.findIndex((li) => {
+      const b = li.getBoundingClientRect();
+      return y < b.top + b.height / 2;
+    });
+    const at = g < 0 ? rows.length : g;
+    const from = ui.show?.media.findIndex((m) => m.id === id) ?? -1;
+    return at === from || at === from + 1 ? null : at;
   }
   function drag(e: PointerEvent) {
     if (!pressed || (!ui.dragging && Math.hypot(e.clientX - pressed.x, e.clientY - pressed.y) < 5)) return;
     ui.dragging = { source: pressed.source, name: pressed.name, x: e.clientX, y: e.clientY };
+    gap = pressed.id && tab === 'media' ? gapAt(e.clientX, e.clientY, pressed.id) : null;
   }
   function release(e: PointerEvent) {
-    const item = ui.dragging;
-    pressed = null;
-    ui.dragging = null;
-    if (item) ui.canvasDrop?.(e.clientX, e.clientY, item);
+    const [item, id, at] = [ui.dragging, pressed?.id, gap];
+    cancel();
+    if (!item) return;
+    if (id && at != null) {
+      const from = ui.show?.media.findIndex((m) => m.id === id) ?? -1;
+      if (from >= 0) op({ op: 'MoveMedia', id, to: at > from ? at - 1 : at });
+    } else ui.canvasDrop?.(e.clientX, e.clientY, item);
+  }
+  function cancel() {
+    pressed = ui.dragging = gap = null;
   }
 </script>
 
@@ -102,15 +125,17 @@
   }}
 />
 
-{#snippet row(source: Source, name: string, sub: string, thumb: string | null, icon: string, item?: MediaItem)}
+{#snippet row(source: Source, name: string, sub: string, thumb: string | null, icon: string, item?: MediaItem, i = -1)}
   <li
     class:unused={item && !uses.has(item.id)}
-    onpointerdown={(e) => press(e, source, name)}
+    class:gap-before={gap === i}
+    class:gap-after={gap === i + 1 && gap === ui.show?.media.length}
+    onpointerdown={(e) => press(e, source, name, item?.id)}
     onpointermove={drag}
     onpointerup={release}
-    onpointercancel={() => (pressed = ui.dragging = null)}
+    onpointercancel={cancel}
     oncontextmenu={(e) => item && openMenu(e, item)}
-    title="Drag onto a screen in the canvas to fill it, or onto a layer to replace it{item ? ' · right-click: remove' : ''}"
+    title="Drag onto a screen in the canvas to fill it, or onto a layer to replace it{item ? '; up or down the list to reorder · right-click: remove' : ''}"
   >
     <span class="thumb">
       {#if thumb}<img src={thumb} alt="" draggable="false" />{:else}{icon}{/if}
@@ -142,10 +167,10 @@
       {/if}
     </div>
   {/if}
-  <ul>
+  <ul bind:this={list}>
     {#if tab === 'media'}
-      {#each ui.show?.media ?? [] as m (m.id)}
-        {@render row(media(m), m.name, meta(m), m.thumb ? engineUrl(ui.engine, `/thumb/${encodeURIComponent(m.thumb)}`) : null, { Video: '▶', Image: '▣', Capture: '◉', Ndi: '⦿' }[m.kind], m)}
+      {#each ui.show?.media ?? [] as m, i (m.id)}
+        {@render row(media(m), m.name, meta(m), m.thumb ? engineUrl(ui.engine, `/thumb/${encodeURIComponent(m.thumb)}`) : null, { Video: '▶', Image: '▣', Capture: '◉', Ndi: '⦿' }[m.kind], m, i)}
       {:else}
         <p class="muted empty">No media yet. Import images or videos.</p>
       {/each}
@@ -296,6 +321,13 @@
   }
   li:hover {
     background: var(--panel-2);
+  }
+  /* Where a dragged media item would land. */
+  li.gap-before {
+    box-shadow: 0 -2px 0 var(--accent);
+  }
+  li.gap-after {
+    box-shadow: 0 2px 0 var(--accent);
   }
   .thumb {
     flex: none;

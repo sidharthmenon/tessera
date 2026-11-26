@@ -21,6 +21,8 @@ pub enum ShowOp {
     UpdateMedia { item: MediaItem },
     /// Several at once ("remove unused" is one undo step).
     RemoveMedia { ids: Vec<Uuid> },
+    /// The media list's order (Resources): item `id` ends up at index `to`.
+    MoveMedia { id: Uuid, to: u32 },
     AddGroup { name: String },
     RenameGroup { id: Uuid, name: String },
     RemoveGroup { id: Uuid },
@@ -140,6 +142,15 @@ impl Show {
                 }
                 Ok(())
             }
+            ShowOp::MoveMedia { id, to } => {
+                let i = find(&self.media, id, |m| m.id, "media")?;
+                if to as usize >= self.media.len() {
+                    return Err(format!("media index {to} out of range"));
+                }
+                let m = self.media.remove(i);
+                self.media.insert(to as usize, m);
+                Ok(())
+            }
             ShowOp::AddGroup { name } => {
                 self.groups.push(Group { id: Uuid::new_v4(), name, cues: vec![] });
                 Ok(())
@@ -254,6 +265,24 @@ mod tests {
         show.apply(ShowOp::RemoveMedia { ids: vec![m2] }).unwrap();
         assert!(show.media.is_empty());
         assert_eq!(show.groups[0].cues[0].layers_by_screen[&s], vec![lp]);
+    }
+
+    #[test]
+    fn move_media_reorders() {
+        let mut show = Show::new();
+        let (a, b, c) = (item(), item(), item());
+        show.media = vec![a.clone(), b.clone(), c.clone()];
+        show.apply(ShowOp::MoveMedia { id: a.id, to: 2 }).unwrap();
+        assert_eq!(show.media, [b.clone(), c.clone(), a.clone()]);
+        show.apply(ShowOp::MoveMedia { id: a.id, to: 0 }).unwrap();
+        assert_eq!(show.media, [a.clone(), b.clone(), c.clone()]);
+        show.apply(ShowOp::MoveMedia { id: b.id, to: 1 }).unwrap();
+        assert_eq!(show.media, [a.clone(), b, c]);
+        // Out of range or unknown: unchanged.
+        let before = show.clone();
+        assert!(show.apply(ShowOp::MoveMedia { id: a.id, to: 3 }).is_err());
+        assert!(show.apply(ShowOp::MoveMedia { id: Uuid::new_v4(), to: 0 }).is_err());
+        assert_eq!(show, before);
     }
 
     #[test]
