@@ -351,6 +351,8 @@ pub(crate) struct AudioDecoder {
     /// For error messages: the file.
     name: String,
     reported: bool,
+    /// Where the newest packet read ends, in seconds on the file's clock (not rebased to `start`).
+    read_to: f64,
 }
 
 impl AudioDecoder {
@@ -363,7 +365,8 @@ impl AudioDecoder {
             Ok(decoder) => {
                 let start = if stream.start_time() == ffi::AV_NOPTS_VALUE { 0 } else { stream.start_time() };
                 let time_base = f64::from(stream.time_base());
-                Some(AudioDecoder { decoder, stream: stream.index(), time_base, start, window: None, swr: None, tap, epoch: 0, name, reported: false })
+                let read_to = f64::NEG_INFINITY;
+                Some(AudioDecoder { decoder, stream: stream.index(), time_base, start, window: None, swr: None, tap, epoch: 0, name, reported: false, read_to })
             }
             Err(e) => {
                 tap.fail(format!("{name}: audio: unsupported codec: {e}"));
@@ -375,9 +378,17 @@ impl AudioDecoder {
     /// Decodes `packet` if it belongs to this stream.
     pub fn packet(&mut self, packet: &ff::Packet) {
         if packet.stream() == self.stream {
+            // One without a timestamp counts as caught up: the video doesn't read on for it.
+            self.read_to = packet.pts().or(packet.dts()).map_or(f64::INFINITY, |t| (t + packet.duration()) as f64 * self.time_base);
             let result = self.decoder.send_packet(packet).map_err(Into::into).and_then(|()| self.drain());
             self.report(result);
         }
+    }
+
+    /// Where the audio read so far ends, in seconds on the file's clock (`Decoder::feed` reads on
+    /// until it reaches the next video packet).
+    pub fn read_to(&self) -> f64 {
+        self.read_to
     }
 
     /// End of file: the decoder's last frames.
@@ -389,6 +400,7 @@ impl AudioDecoder {
     /// Back to the start (loop wrap or seek). A loop's next pass follows on without a gap.
     pub fn rewind(&mut self) {
         self.decoder.flush();
+        self.read_to = f64::NEG_INFINITY;
     }
 
     /// Loop wrap: the next pass's samples go at `offset` on the player's timeline.

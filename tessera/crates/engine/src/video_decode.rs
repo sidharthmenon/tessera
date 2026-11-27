@@ -2,6 +2,7 @@
 //! device, else D3D11VA), frames kept on the GPU for `zero_copy` or made CPU-addressable in place
 //! with `av_hwframe_map` (R20) for the player to upload.
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::ptr;
 use std::time::Duration;
@@ -12,6 +13,11 @@ use ff::ffi;
 
 use crate::audio::{AudioDecoder, AudioTap};
 use crate::gpu::Gpu;
+
+/// How far past the next video packet the demuxer reads looking for its audio (`Decoder::feed`),
+/// in the video's time and in bytes of video read meanwhile, whichever comes first.
+const AHEAD_SECONDS: f64 = 3.;
+const AHEAD_BYTES: usize = 32 << 20;
 
 /// How a frame's planes reach the GPU (see `player::layout`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,6 +160,13 @@ pub(crate) struct Decoder {
     flushing: bool,
     sws: Option<Sws>,
     audio: Option<AudioDecoder>,
+    /// Video packets read but not yet sent to the decoder (`feed`), and their bytes.
+    ahead: VecDeque<ff::Packet>,
+    ahead_bytes: usize,
+    /// Nothing more to read this pass: the input's end, or `read_error`, which `feed` returns once
+    /// the packets read before it are sent.
+    read_end: bool,
+    read_error: Option<anyhow::Error>,
     /// The file's length.
     pub duration: Duration,
     /// Trim: frames before `trim_in` are decoded but not returned, and with `trim_out` set the
@@ -239,6 +252,10 @@ impl Decoder {
             flushing: false,
             sws: None,
             audio,
+            ahead: VecDeque::new(),
+            ahead_bytes: 0,
+            read_end: false,
+            read_error: None,
             duration: Duration::from_secs_f64(seconds),
             trim_in: Duration::ZERO,
             trim_out: None,
@@ -302,6 +319,8 @@ impl Decoder {
             audio.rewind();
         }
         (self.flushing, self.last_pts) = (false, None);
+        (self.ahead_bytes, self.read_end, self.read_error) = (0, false, None);
+        self.ahead.clear();
         Ok(())
     }
 
@@ -322,27 +341,69 @@ impl Decoder {
         self.rewind()
     }
 
-    /// Sends the decoder its next packet, or end-of-stream.
+    /// Sends the decoder its next packet, or end-of-stream. With audio, first reads on until the
+    /// audio has caught up with that packet (up to `AHEAD_SECONDS` / `AHEAD_BYTES`): files often
+    /// store audio well after its video (a second is common), further than the frame queue runs
+    /// ahead of the clock, and audio that reaches the tap late is dropped (`AudioTap::sync`).
     fn feed(&mut self) -> anyhow::Result<()> {
-        let mut packet = ff::Packet::empty();
-        loop {
-            match packet.read(&mut self.input) {
-                Ok(()) if packet.stream() == self.stream => return Ok(self.decoder.send_packet(&packet)?),
-                Ok(()) => {
-                    if let Some(audio) = &mut self.audio {
-                        audio.packet(&packet); // errors go to the tap; the video plays on
-                    }
-                }
-                Err(ff::Error::Eof) => {
-                    self.flushing = true;
-                    if let Some(audio) = &mut self.audio {
-                        audio.eof();
-                    }
-                    return Ok(self.decoder.send_eof()?);
-                }
-                Err(e) => return Err(e).context("read"),
+        while self.ahead.is_empty() && !self.read_end {
+            self.read();
+        }
+        if let Some(due) = self.ahead.front().and_then(|p| self.seconds(p)) {
+            while self.audio_behind(due) {
+                self.read();
             }
         }
+        match self.ahead.pop_front() {
+            Some(packet) => {
+                self.ahead_bytes -= packet.size();
+                Ok(self.decoder.send_packet(&packet)?)
+            }
+            None => match self.read_error.take() {
+                Some(e) => Err(e),
+                None => {
+                    self.flushing = true;
+                    Ok(self.decoder.send_eof()?)
+                }
+            },
+        }
+    }
+
+    /// Reads one packet: video into `ahead`, audio to its decoder.
+    fn read(&mut self) {
+        let mut packet = ff::Packet::empty();
+        match packet.read(&mut self.input) {
+            Ok(()) if packet.stream() == self.stream => {
+                self.ahead_bytes += packet.size();
+                self.ahead.push_back(packet);
+            }
+            Ok(()) => {
+                if let Some(audio) = &mut self.audio {
+                    audio.packet(&packet); // errors go to the tap; the video plays on
+                }
+            }
+            Err(ff::Error::Eof) => {
+                self.read_end = true;
+                if let Some(audio) = &mut self.audio {
+                    audio.eof();
+                }
+            }
+            Err(e) => (self.read_end, self.read_error) = (true, Some(anyhow::Error::new(e).context("read"))),
+        }
+    }
+
+    /// The audio read so far ends before `due` (the next video packet's time) and reading on for
+    /// it is still allowed. Capture devices have no audio here, so a live input never waits.
+    fn audio_behind(&self, due: f64) -> bool {
+        let Some(audio) = &self.audio else { return false };
+        let span = self.ahead.back().and_then(|p| self.seconds(p)).map_or(0., |last| last - due);
+        !self.read_end && audio.read_to() < due && span < AHEAD_SECONDS && self.ahead_bytes < AHEAD_BYTES
+    }
+
+    /// A video packet's decode time in seconds on the file's clock, which both streams share (not
+    /// rebased to `start`).
+    fn seconds(&self, packet: &ff::Packet) -> Option<f64> {
+        packet.dts().or(packet.pts()).map(|t| t as f64 * self.time_base)
     }
 
     /// `decoded`'s time in the file (a frame without one follows the last).

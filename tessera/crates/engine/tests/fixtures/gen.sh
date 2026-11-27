@@ -43,6 +43,11 @@ rm trunc_full.mp4
 # h264_64.mp4 with every AAC packet corrupted (deterministic): audio errors must not stop the video.
 ffmpeg $F -i h264_64.mp4 -c copy -bsf:a noise=amount=2 h264_badaudio_64.mp4
 
+# H.264 3 s 24 fps + AAC tone in 1 s fragments, each its 24 frames then its second of audio: a
+# frame's audio comes up to 1 s after it in the file, further than the decoder's frame queue.
+ffmpeg $F -f lavfi -i testsrc2=s=64x64:r=24:d=3 -f lavfi -i sine=f=440:d=3 \
+  -c:v libx264 -g 24 -pix_fmt yuv420p $TAGS -c:a aac -b:a 64k -movflags +frag_keyframe+empty_moov h264_late_audio_64.mp4
+
 # FFV1 planar YUV, quadrants red | blue / green | white: the software path that interleaves U and V
 # into the YUV shader's planes (no RGBA conversion).
 QUADS="color=c=red:s=64x64:r=30:d=1,drawbox=x=32:y=0:w=32:h=32:color=blue:t=fill,drawbox=x=0:y=32:w=32:h=32:color=0x00FF00:t=fill,drawbox=x=32:y=32:w=32:h=32:color=white:t=fill"
@@ -50,4 +55,4 @@ for fmt in yuv420p yuv422p10le yuv444p yuv444p10le; do
   ffmpeg $F -f lavfi -i "$QUADS" -c:v ffv1 -pix_fmt $fmt $TAGS ffv1_${fmt}_64.mkv
 done
 
-ls -l h264_64.mp4 h264_64x40.mp4 prores4444_64.mov hevc10_64.mp4 ffv1_alpha_64.mkv prores422hq_64.mov h264_trunc_64.mp4 h264_badaudio_64.mp4 ffv1_yuv*_64.mkv
+ls -l h264_64.mp4 h264_64x40.mp4 prores4444_64.mov hevc10_64.mp4 ffv1_alpha_64.mkv prores422hq_64.mov h264_trunc_64.mp4 h264_badaudio_64.mp4 h264_late_audio_64.mp4 ffv1_yuv*_64.mkv
