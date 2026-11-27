@@ -431,6 +431,40 @@ fn corrupt_audio_keeps_video() {
     }
 }
 
+/// h264_late_audio_64.mp4 (gen.sh) is muxed in 1 s fragments, each its video then its audio, so a
+/// frame's audio is up to a second after it in the file: further than the frame queue reaches.
+/// Played in real time across a Loop wrap (3 s), a device mixing every 10 ms and the render loop
+/// syncing every frame, the tone must play throughout. Reading audio only as far as the video got
+/// starved the tap, and `sync` then dropped each second's audio as late: bursts of tone, then gaps.
+#[test]
+fn audio_late_in_the_file_plays_throughout() {
+    let gpu = gpu();
+    let mut player = Player::open(&gpu, &fixture("h264_late_audio_64.mp4"), Playback::Loop, AUDIO).unwrap();
+    let tap = player.audio().unwrap();
+    frame(&mut player, &gpu, Instant::now()).unwrap(); // opened, first frame decoded
+    let t0 = Instant::now();
+    player.play(t0);
+    let (mut next_mix, mut heard, mut total) = (t0, 0, 0);
+    let mut out = [0f32; 960]; // 10 ms at 48 kHz stereo
+    while next_mix < t0 + ms(4500) {
+        let now = Instant::now();
+        player.current_frame(&gpu, now, PERIOD); // and the tap's sync
+        while next_mix <= now {
+            out.fill(0.);
+            tap.mix(&mut out, 1.);
+            if next_mix >= t0 + ms(200) {
+                // A gap is exact silence; the tone is never exactly 0 at two samples in a row.
+                heard += out.chunks(4).filter(|f| f.iter().any(|&s| s != 0.)).count();
+                total += out.len() / 4;
+            }
+            next_mix += ms(10);
+        }
+        std::thread::sleep(ms(1));
+    }
+    let heard = heard as f64 / total as f64;
+    assert!(heard > 0.95, "only {:.0} % of 0.2–4.5 s was audio", heard * 100.);
+}
+
 /// Writes a w×h PNG whose every pixel is `rgba` (straight alpha) and returns its path.
 fn png(w: u32, h: u32, rgba: [u8; 4]) -> PathBuf {
     let path = std::env::temp_dir().join(format!("tessera-test-{}.png", Uuid::new_v4()));
